@@ -13,6 +13,9 @@ Expected values are never adjusted to match a runtime.
 upgrade with a deliberate change that also updates their declarations. Every report records the
 fixture set version it ran.
 
+Pushing a `v<VERSION>` tag publishes `aerospike-client-conformance-<VERSION>.zip` to JFrog
+(`database-generic-dev-local`); client CI downloads that release rather than reading this repository.
+
 - patch: wording only (`because`, `description`, README)
 - minor: new rows, new files or new optional keys
 - major: a changed expectation, a removed or renamed row, or an incompatible schema change
