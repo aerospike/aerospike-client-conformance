@@ -6,15 +6,11 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: [v*]
   pull_request:
     branches: [main]
+  # Manual runs publish the existing tag for VERSION on the selected branch.
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing release tag to publish, e.g. v0.1.0
-        type: string
-        required: true
 
 permissions:
   contents: read
@@ -43,12 +39,11 @@ jobs:
         id: resolve
         env:
           EVENT: ${{ github.event_name }}
-          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           case "$EVENT" in
             push) ref="$GITHUB_REF_NAME" ;;
-            workflow_dispatch) ref="$INPUT_TAG" ;;
+            workflow_dispatch) ref="v$(tr -d '[:space:]' < VERSION)" ;;
             *) ref="$GITHUB_SHA" ;;
           esac
           if [ "$EVENT" != pull_request ]; then
