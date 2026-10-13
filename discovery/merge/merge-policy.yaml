@@ -1,0 +1,188 @@
+kind: merge
+description: >-
+  discovery.mergePolicy. Each discovery result is applied in order; the first is
+  the result at client initialization and each later one a refresh. snapshots[i] is the exact seed
+  list after result i. Duplicates (same host and port) are removed keeping the first occurrence.
+rows:
+  - case: merge-is-default
+    because: With no mergePolicy configured the policy is merge.
+    config:
+      seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+    input:
+      discoveryResults:
+        - [{ host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+        - [{ host: 10.0.1.2, port: 3000 }]
+    expect:
+      snapshots:
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }, { host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+
+  - case: merge-static-then-discovered
+    because: merge tries static seeds first, then discovered, at init and on every refresh.
+    config:
+      discovery: { mergePolicy: merge }
+      seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+    input:
+      discoveryResults:
+        - [{ host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+        - [{ host: 10.0.1.2, port: 3000 }, { host: 10.0.1.3, port: 3000 }]
+    expect:
+      snapshots:
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }, { host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }, { host: 10.0.1.2, port: 3000 }, { host: 10.0.1.3, port: 3000 }]
+
+  - case: merge-empty-result-leaves-static
+    because: An empty discovery result under merge leaves only the static seeds.
+    config:
+      discovery: { mergePolicy: merge }
+      seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+    input:
+      discoveryResults:
+        - []
+        - [{ host: 10.0.1.1, port: 3000 }]
+        - []
+    expect:
+      snapshots:
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }, { host: 10.0.1.1, port: 3000 }]
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+
+  - case: merge-duplicates-keep-first
+    because: A discovered seed equal to an earlier one (same host and port) is dropped, keeping the first.
+    config:
+      discovery: { mergePolicy: merge }
+      seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+    input:
+      discoveryResults:
+        - [{ host: 10.0.1.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }, { host: 10.0.1.2, port: 3000 }, { host: 10.0.1.1, port: 3000 }]
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+    expect:
+      snapshots:
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }, { host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+
+  - case: merge-same-host-other-port-kept
+    because: A seed is a duplicate only when both host and port are equal.
+    config:
+      discovery: { mergePolicy: merge }
+      seeds: [{ host: 10.0.0.1, port: 3000 }]
+    input:
+      discoveryResults:
+        - [{ host: 10.0.0.1, port: 3100 }, { host: 10.0.0.1, port: 3000 }]
+    expect:
+      snapshots:
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.1, port: 3100 }]
+
+  - case: replace-drops-static-after-init
+    because: replace merges static and discovered at init, then uses only discovered seeds.
+    config:
+      discovery: { mergePolicy: replace }
+      seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+    input:
+      discoveryResults:
+        - [{ host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+        - [{ host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+        - [{ host: 10.0.1.3, port: 3000 }]
+    expect:
+      snapshots:
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }, { host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+        - [{ host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+        - [{ host: 10.0.1.3, port: 3000 }]
+
+  - case: replace-empty-refresh-keeps-previous
+    because: An empty result after init under replace keeps the previous snapshot.
+    config:
+      discovery: { mergePolicy: replace }
+      seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+    input:
+      discoveryResults:
+        - [{ host: 10.0.1.1, port: 3000 }]
+        - [{ host: 10.0.1.2, port: 3000 }]
+        - []
+    expect:
+      snapshots:
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }, { host: 10.0.1.1, port: 3000 }]
+        - [{ host: 10.0.1.2, port: 3000 }]
+        - [{ host: 10.0.1.2, port: 3000 }]
+
+  - case: replace-empty-at-init-keeps-static
+    because: An empty result at init under replace leaves the static seeds, and a later empty result keeps them.
+    config:
+      discovery: { mergePolicy: replace }
+      seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+    input:
+      discoveryResults:
+        - []
+        - []
+    expect:
+      snapshots:
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+
+  - case: replace-duplicates-keep-first
+    because: replace removes duplicates keeping the first occurrence, at init and on refresh.
+    config:
+      discovery: { mergePolicy: replace }
+      seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+    input:
+      discoveryResults:
+        - [{ host: 10.0.1.1, port: 3000 }, { host: 10.0.0.1, port: 3000 }, { host: 10.0.1.1, port: 3000 }]
+        - [{ host: 10.0.1.2, port: 3000 }, { host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+    expect:
+      snapshots:
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }, { host: 10.0.1.1, port: 3000 }]
+        - [{ host: 10.0.1.2, port: 3000 }, { host: 10.0.1.1, port: 3000 }]
+
+  - case: discovery-only-uses-discovered
+    because: discovery-only never tries static seeds while discovery returns seeds.
+    config:
+      discovery: { mergePolicy: discovery-only }
+      seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+    input:
+      discoveryResults:
+        - [{ host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+        - [{ host: 10.0.1.2, port: 3000 }]
+    expect:
+      snapshots:
+        - [{ host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
+        - [{ host: 10.0.1.2, port: 3000 }]
+
+  - case: discovery-only-empty-at-init-falls-back
+    because: discovery-only uses static seeds when discovery is empty at init.
+    config:
+      discovery: { mergePolicy: discovery-only }
+      seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+    input:
+      discoveryResults:
+        - []
+        - [{ host: 10.0.1.1, port: 3000 }]
+    expect:
+      snapshots:
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+        - [{ host: 10.0.1.1, port: 3000 }]
+
+  - case: discovery-only-empty-refresh-falls-back
+    because: discovery-only uses static seeds when a refresh is empty.
+    config:
+      discovery: { mergePolicy: discovery-only }
+      seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+    input:
+      discoveryResults:
+        - [{ host: 10.0.1.1, port: 3000 }]
+        - []
+    expect:
+      snapshots:
+        - [{ host: 10.0.1.1, port: 3000 }]
+        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+
+  - case: discovery-only-duplicates-keep-first
+    because: discovery-only removes duplicates keeping the first occurrence.
+    config:
+      discovery: { mergePolicy: discovery-only }
+      seeds: [{ host: 10.0.0.1, port: 3000 }]
+    input:
+      discoveryResults:
+        - [{ host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }, { host: 10.0.1.1, port: 3000 }]
+    expect:
+      snapshots:
+        - [{ host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]

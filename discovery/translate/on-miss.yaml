@@ -1,0 +1,100 @@
+kind: translate
+description: >-
+  translation.onMiss. The default is passThrough: an endpoint the translator has
+  no entry for is used as advertised. strict fails instead, with an error naming the node, the
+  advertised endpoint and the translator.
+rows:
+  - case: no-translator-default-pass-through
+    because: With no translator configured an unmapped endpoint is used as advertised.
+    config:
+      legacyHostMap: { "10.0.0.1": "203.0.113.1" }
+    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 10.0.0.9, port: 3000, sourceList: standard }
+    expect: { host: 10.0.0.9, port: 3000, tlsName: db2.example.com }
+
+  - case: static-map-default-pass-through
+    because: The onMiss default is passThrough for static-map.
+    config:
+      translation: { provider: static-map, staticMap: { "10.0.0.1": "203.0.113.1" } }
+    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 10.0.0.9, port: 3000, sourceList: standard }
+    expect: { host: 10.0.0.9, port: 3000, tlsName: db2.example.com }
+
+  - case: static-map-default-pass-through-null-tls-name
+    because: A passed-through endpoint keeps a null tlsName.
+    config:
+      translation: { provider: static-map, staticMap: { "10.0.0.1": "203.0.113.1" } }
+    input: { nodeName: BB9030011AC4202, tlsName: null, host: 10.0.0.9, port: 3000, sourceList: standard }
+    expect: { host: 10.0.0.9, port: 3000, tlsName: null }
+
+  - case: static-map-explicit-pass-through
+    because: passThrough may be set explicitly and behaves as the default.
+    config:
+      translation: { provider: static-map, onMiss: passThrough, staticMap: { "10.0.0.1": "203.0.113.1" } }
+    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 10.0.0.9, port: 3000, sourceList: standard }
+    expect: { host: 10.0.0.9, port: 3000, tlsName: db2.example.com }
+
+  - case: static-map-strict-hit-translates
+    because: strict changes only the miss; a mapped endpoint still translates.
+    config:
+      translation: { provider: static-map, onMiss: strict, staticMap: { "10.0.0.1": "203.0.113.1" } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 3000, sourceList: standard }
+    expect: { host: 203.0.113.1, port: 3000, tlsName: db1.example.com }
+
+  - case: static-map-strict-miss-fails
+    because: Under strict a miss fails, naming the node, the advertised endpoint and the translator.
+    config:
+      translation: { provider: static-map, onMiss: strict, staticMap: { "10.0.0.1": "203.0.113.1" } }
+    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 10.0.0.9, port: 3000, sourceList: standard }
+    expect:
+      error:
+        category: translation-miss
+        messageContains: { nodeName: BB9030011AC4202, host: 10.0.0.9, port: 3000, translator: static-map }
+
+  - case: static-map-strict-empty-map-fails
+    because: Under strict an empty map fails on the first endpoint.
+    config:
+      translation: { provider: static-map, onMiss: strict, staticMap: {} }
+    input: { nodeName: BB9020011AC4202, tlsName: null, host: "2001:db8::10", port: 3000, sourceList: standard }
+    expect:
+      error:
+        category: translation-miss
+        messageContains: { nodeName: BB9020011AC4202, host: "2001:db8::10", port: 3000, translator: static-map }
+
+  - case: port-map-default-pass-through
+    because: The onMiss default is passThrough for port-map.
+    config:
+      translation:
+        provider: port-map
+        portMap:
+          - { match: { host: 10.0.0.1, port: 3000 }, target: { host: lb.example.com, port: 30001 } }
+    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 10.0.0.9, port: 3000, sourceList: standard }
+    expect: { host: 10.0.0.9, port: 3000, tlsName: db2.example.com }
+
+  - case: port-map-strict-miss-fails
+    because: Under strict a port-map miss fails, naming the node, the advertised endpoint and the translator.
+    config:
+      translation:
+        provider: port-map
+        onMiss: strict
+        portMap:
+          - { match: { nodeName: BB9020011AC4202 }, target: { host: lb.example.com, port: 30001 } }
+    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 10.0.0.9, port: 3000, sourceList: standard }
+    expect:
+      error:
+        category: translation-miss
+        messageContains: { nodeName: BB9030011AC4202, host: 10.0.0.9, port: 3000, translator: port-map }
+
+  - case: endpoint-port-map-default-pass-through
+    because: The onMiss default applies to endpoint-port-map; what counts as a miss waits on its port function.
+    state: blocked
+    blockedBy: no agreed default port function
+    config:
+      translation: { provider: endpoint-port-map, endpoint: { hostname: as.example.com, portBase: 30000 } }
+    input: { nodeName: BB9020011AC4202, tlsName: cluster.example.com, host: 10.0.1.7, port: 3000, sourceList: standard }
+
+  - case: endpoint-port-map-strict-miss-fails
+    because: Under strict an endpoint-port-map miss fails with the same error content.
+    state: blocked
+    blockedBy: no agreed default port function
+    config:
+      translation: { provider: endpoint-port-map, onMiss: strict, endpoint: { hostname: as.example.com, portBase: 30000 } }
+    input: { nodeName: BB9020011AC4202, tlsName: cluster.example.com, host: 10.0.1.7, port: 3000, sourceList: standard }

@@ -1,0 +1,203 @@
+kind: tls
+description: >-
+  Server certificate name matching. The reference identifier is the node tlsName. A DNS-ID
+  matches a dNSName SAN only, an IP-ID an iPAddress SAN only, comparison is case-insensitive, the
+  only wildcard is a single left-most label, and the subject CN is never an identifier.
+shapes:
+  dns: { subjectCN: unrelated.example.org, san: ["DNS:db1.example.com"] }
+  ip: { subjectCN: unrelated.example.org, san: ["IP:10.0.0.1", "IP:2001:db8::1", "IP:127.0.0.1"] }
+  ip-link-local: { subjectCN: unrelated.example.org, san: ["IP:fe80::1"] }
+  wildcard: { subjectCN: unrelated.example.org, san: ["DNS:*.example.com"] }
+  wildcard-partial: { subjectCN: unrelated.example.org, san: ["DNS:a*.example.com"] }
+  wildcard-multi: { subjectCN: unrelated.example.org, san: ["DNS:*.*.example.com"] }
+  wildcard-inner: { subjectCN: unrelated.example.org, san: ["DNS:foo.*.example.com"] }
+  wildcard-ip: { subjectCN: unrelated.example.org, san: ["DNS:*.0.0.1"] }
+  cn-only: { subjectCN: db1.example.com, san: [] }
+  cn-only-mixed-case: { subjectCN: DB1.Example.com, san: [] }
+  cn-dns-mismatch: { subjectCN: db1.example.com, san: ["DNS:db2.example.com"] }
+  ip-as-dns: { subjectCN: unrelated.example.org, san: ["DNS:10.0.0.1"] }
+  ci-shape: { subjectCN: aerospike-tls, san: ["DNS:aerospike-1", "DNS:localhost", "DNS:docker", "IP:127.0.0.1"] }
+  ci-shape-fixed: { subjectCN: aerospike-tls, san: ["DNS:aerospike-1", "DNS:localhost", "DNS:docker", "IP:127.0.0.1", "DNS:aerospike-tls"] }
+
+rows:
+  - case: dns-id-equals-dns-name
+    because: A DNS-ID equal to a dNSName SAN is the basic match.
+    input:
+      tlsName: db1.example.com
+      shape: dns
+    expect: { outcome: accept }
+
+  - case: dns-id-differs-only-in-case
+    because: DNS-ID comparison is case-insensitive.
+    input:
+      tlsName: DB1.Example.COM
+      shape: dns
+    expect: { outcome: accept }
+
+  - case: dns-id-with-non-matching-cn
+    because: A tlsName present as a dNSName is accepted whatever the CN says.
+    input:
+      tlsName: db1.example.com
+      shape: dns
+    expect: { outcome: accept }
+
+  - case: ipv4-id-equals-ip-address
+    because: An IPv4 IP-ID matches an equal iPAddress SAN.
+    input:
+      tlsName: 10.0.0.1
+      shape: ip
+    expect: { outcome: accept }
+
+  - case: ipv6-id-equals-ip-address
+    because: An IPv6 IP-ID matches an equal iPAddress SAN.
+    input:
+      tlsName: "2001:db8::1"
+      shape: ip
+    expect: { outcome: accept }
+
+  - case: ipv6-id-differently-spelled
+    because: IP-IDs compare as addresses, so an equivalent IPv6 spelling matches.
+    input:
+      tlsName: "2001:0DB8:0:0:0:0:0:0001"
+      shape: ip
+    expect: { outcome: accept }
+
+  - case: dns-id-only-ip-addresses
+    because: A DNS-ID matches dNSName only, never an iPAddress SAN.
+    input:
+      tlsName: db1.example.com
+      shape: ip
+    expect: { outcome: reject }
+
+  - case: dns-id-resolving-to-ip-address
+    because: A DNS-ID is not resolved to match an iPAddress SAN.
+    input:
+      tlsName: localhost
+      shape: ip
+    expect: { outcome: reject }
+
+  - case: wildcard-matches-one-label
+    because: A left-most wildcard label matches exactly one label.
+    input:
+      tlsName: a.example.com
+      shape: wildcard
+    expect: { outcome: accept }
+
+  - case: wildcard-matches-case-insensitively
+    because: Wildcard matching is case-insensitive.
+    input:
+      tlsName: A.Example.COM
+      shape: wildcard
+    expect: { outcome: accept }
+
+  - case: wildcard-does-not-match-parent
+    because: A wildcard needs a label to match; the parent domain has none.
+    input:
+      tlsName: example.com
+      shape: wildcard
+    expect: { outcome: reject }
+
+  - case: wildcard-does-not-match-two-labels
+    because: A wildcard matches one label only.
+    input:
+      tlsName: a.b.example.com
+      shape: wildcard
+    expect: { outcome: reject }
+
+  - case: partial-label-wildcard-rejected
+    because: A wildcard that is not the whole left-most label is not a wildcard.
+    input:
+      tlsName: ab.example.com
+      shape: wildcard-partial
+    expect: { outcome: reject }
+
+  - case: multiple-wildcards-rejected
+    because: Only a single wildcard label is allowed.
+    input:
+      tlsName: a.b.example.com
+      shape: wildcard-multi
+    expect: { outcome: reject }
+
+  - case: inner-label-wildcard-rejected
+    because: The wildcard must be the left-most label.
+    input:
+      tlsName: foo.bar.example.com
+      shape: wildcard-inner
+    expect: { outcome: reject }
+
+  - case: ip-id-against-wildcard
+    because: An IP-ID matches iPAddress only, so a wildcard dNSName never matches it.
+    input:
+      tlsName: 10.0.0.1
+      shape: wildcard-ip
+    expect: { outcome: reject }
+
+  - case: cn-only-no-san
+    because: The subject CN is never an identifier, even when the certificate has no SAN.
+    input:
+      tlsName: db1.example.com
+      shape: cn-only
+    expect: { outcome: reject }
+
+  - case: cn-differs-only-in-case-no-san
+    because: A CN-only certificate is rejected even when the CN differs from tlsName only in case.
+    input:
+      tlsName: db1.example.com
+      shape: cn-only-mixed-case
+    expect: { outcome: reject }
+
+  - case: cn-equal-dns-name-differs
+    because: A CN equal to tlsName does not rescue a non-matching dNSName.
+    input:
+      tlsName: db1.example.com
+      shape: cn-dns-mismatch
+    expect: { outcome: reject }
+
+  - case: ip-id-only-as-dns-name
+    because: An IP-ID matches iPAddress only, not a dNSName spelling the same address.
+    input:
+      tlsName: 10.0.0.1
+      shape: ip-as-dns
+    expect: { outcome: reject }
+
+  - case: ci-server-certificate-shape
+    because: >-
+      The server certificate from shared-workflows setup-aerospike-server v5.0.0 carries aerospike-tls
+      only as the CN, so it is rejected.
+    input:
+      tlsName: aerospike-tls
+      shape: ci-shape
+    expect: { outcome: reject }
+
+  - case: ci-server-certificate-shape-fixed
+    because: >-
+      The same CI certificate with DNS:aerospike-tls added (shared-workflows #338) matches on the
+      dNSName.
+    input:
+      tlsName: aerospike-tls
+      shape: ci-shape-fixed
+    expect: { outcome: accept }
+
+  - case: ipv6-id-bracketed
+    because: A bracketed IPv6 literal is either an IP-ID for the address or a DNS-ID that matches nothing.
+    state: blocked
+    blockedBy: undecided whether a bracketed IPv6 tlsName is an IP-ID
+    input:
+      tlsName: "[2001:db8::1]"
+      shape: ip
+
+  - case: ipv6-id-with-zone
+    because: A zone index is not part of an iPAddress SAN, so the comparison needs a rule.
+    state: blocked
+    blockedBy: undecided how a scoped IPv6 tlsName (fe80::1%en0) compares
+    input:
+      tlsName: "fe80::1%en0"
+      shape: ip-link-local
+
+  - case: ipv4-id-with-leading-zeros
+    because: Leading zeros are read as decimal, octal or not an address depending on the parser.
+    state: blocked
+    blockedBy: undecided whether 127.000.0.1 is an IP-ID
+    input:
+      tlsName: 127.000.0.1
+      shape: ip

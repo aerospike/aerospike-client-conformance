@@ -1,0 +1,88 @@
+kind: translate
+description: >-
+  static-map translator. The map is keyed by advertised host only; a mapped host is
+  replaced and the advertised port kept. tlsName is never changed.
+rows:
+  - case: mapped-host-replaced-port-kept
+    because: A mapped host is replaced and the advertised port is kept.
+    config:
+      translation: { provider: static-map, staticMap: { "10.0.0.1": "203.0.113.1" } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 3000, sourceList: standard }
+    expect: { host: 203.0.113.1, port: 3000, tlsName: db1.example.com }
+
+  - case: mapped-host-tls-port-kept
+    because: The advertised TLS port is kept and tlsName is not replaced by the mapped host.
+    config:
+      translation: { provider: static-map, staticMap: { "10.0.0.1": "203.0.113.1" } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 4333, sourceList: standard }
+    expect: { host: 203.0.113.1, port: 4333, tlsName: db1.example.com }
+
+  - case: mapped-host-null-tls-name
+    because: A null tlsName stays null after translation.
+    config:
+      translation: { provider: static-map, staticMap: { "10.0.0.1": "203.0.113.1" } }
+    input: { nodeName: BB9020011AC4202, tlsName: null, host: 10.0.0.1, port: 3000, sourceList: standard }
+    expect: { host: 203.0.113.1, port: 3000, tlsName: null }
+
+  - case: mapped-to-hostname
+    because: The target may be a hostname, which is passed on unresolved.
+    config:
+      translation: { provider: static-map, staticMap: { "10.0.0.1": "node1.public.example.com" } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 3000, sourceList: standard }
+    expect: { host: node1.public.example.com, port: 3000, tlsName: db1.example.com }
+
+  - case: mapped-from-hostname
+    because: An advertised hostname is a key like an address.
+    config:
+      translation: { provider: static-map, staticMap: { "node1.internal": "203.0.113.1" } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: node1.internal, port: 3000, sourceList: standard }
+    expect: { host: 203.0.113.1, port: 3000, tlsName: db1.example.com }
+
+  - case: unmapped-host-passes-through
+    because: A host with no entry passes through unchanged under the default onMiss.
+    config:
+      translation: { provider: static-map, staticMap: { "10.0.0.1": "203.0.113.1" } }
+    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 10.0.0.2, port: 3000, sourceList: standard }
+    expect: { host: 10.0.0.2, port: 3000, tlsName: db2.example.com }
+
+  - case: empty-map-passes-through
+    because: An empty map translates nothing.
+    config:
+      translation: { provider: static-map, staticMap: {} }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 3000, sourceList: standard }
+    expect: { host: 10.0.0.1, port: 3000, tlsName: db1.example.com }
+
+  - case: host-port-key-does-not-match
+    because: The map applies to the host only, so a host:port key never matches.
+    config:
+      translation: { provider: static-map, staticMap: { "10.0.0.1:3000": "203.0.113.1" } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 3000, sourceList: standard }
+    expect: { host: 10.0.0.1, port: 3000, tlsName: db1.example.com }
+
+  - case: ipv6-literal-mapped
+    because: An IPv6 literal host is a key like any other host.
+    config:
+      translation: { provider: static-map, staticMap: { "2001:db8::10": "2001:db8:ffff::10" } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: "2001:db8::10", port: 3000, sourceList: standard }
+    expect: { host: "2001:db8:ffff::10", port: 3000, tlsName: db1.example.com }
+
+  - case: ipv6-literal-mapped-to-ipv4
+    because: The mapping may change address family.
+    config:
+      translation: { provider: static-map, staticMap: { "2001:db8::10": "203.0.113.1" } }
+    input: { nodeName: BB9020011AC4202, tlsName: null, host: "2001:db8::10", port: 3000, sourceList: standard }
+    expect: { host: 203.0.113.1, port: 3000, tlsName: null }
+
+  - case: ipv6-literal-unmapped
+    because: An unmapped IPv6 literal passes through unchanged.
+    config:
+      translation: { provider: static-map, staticMap: { "2001:db8::10": "2001:db8:ffff::10" } }
+    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: "2001:db8::11", port: 3000, sourceList: standard }
+    expect: { host: "2001:db8::11", port: 3000, tlsName: db2.example.com }
+
+  - case: alternate-source-list-mapped
+    because: static-map is keyed by host only, whichever list advertised it.
+    config:
+      translation: { provider: static-map, staticMap: { "198.51.100.1": "203.0.113.1" } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 198.51.100.1, port: 3000, sourceList: alternate }
+    expect: { host: 203.0.113.1, port: 3000, tlsName: db1.example.com }

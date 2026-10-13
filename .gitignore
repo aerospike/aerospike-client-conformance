@@ -70,3 +70,7 @@ target/
 .trunk/logs/
 .trunk/notifications/
 .trunk/plugins/
+
+# Private keys
+*.key
+*.p12

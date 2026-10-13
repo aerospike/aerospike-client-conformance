@@ -1,0 +1,125 @@
+kind: translate
+description: >-
+  port-map translator. Entries are keyed by advertised (host, port) or by nodeName and
+  replace both host and port. Keys are read against the list the endpoint came from (sourceList),
+  so a map authored against one list misses every key of the other, and the miss is surfaced.
+rows:
+  - case: host-port-key-hit
+    because: An endpoint matching a (host, port) key takes the entry's host and port.
+    config:
+      translation:
+        provider: port-map
+        portMap:
+          - { match: { host: 10.0.0.1, port: 3000 }, target: { host: lb.example.com, port: 30001 } }
+          - { match: { host: 10.0.0.2, port: 3000 }, target: { host: lb.example.com, port: 30002 } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 3000, sourceList: standard }
+    expect: { host: lb.example.com, port: 30001, tlsName: db1.example.com }
+
+  - case: host-port-key-null-tls-name
+    because: A null tlsName stays null through a port-map hit.
+    config:
+      translation:
+        provider: port-map
+        portMap:
+          - { match: { host: 10.0.0.2, port: 3000 }, target: { host: lb.example.com, port: 30002 } }
+    input: { nodeName: BB9030011AC4202, tlsName: null, host: 10.0.0.2, port: 3000, sourceList: standard }
+    expect: { host: lb.example.com, port: 30002, tlsName: null }
+
+  - case: host-port-key-other-port-misses
+    because: The key is the (host, port) pair, so the same host on another port misses and passes through.
+    config:
+      translation:
+        provider: port-map
+        portMap:
+          - { match: { host: 10.0.0.1, port: 3000 }, target: { host: lb.example.com, port: 30001 } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 4333, sourceList: standard }
+    expect: { host: 10.0.0.1, port: 4333, tlsName: db1.example.com }
+
+  - case: node-name-key-hit
+    because: An endpoint whose node matches a nodeName key takes the entry's host and port.
+    config:
+      translation:
+        provider: port-map
+        portMap:
+          - { match: { nodeName: BB9020011AC4202 }, target: { host: lb.example.com, port: 30001 } }
+          - { match: { nodeName: BB9030011AC4202 }, target: { host: lb.example.com, port: 30002 } }
+    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 10.0.0.2, port: 3000, sourceList: standard }
+    expect: { host: lb.example.com, port: 30002, tlsName: db2.example.com }
+
+  - case: node-name-key-any-advertised-address
+    because: A nodeName key matches whatever address the node advertises.
+    config:
+      translation:
+        provider: port-map
+        portMap:
+          - { match: { nodeName: BB9020011AC4202 }, target: { host: lb.example.com, port: 30001 } }
+    input: { nodeName: BB9020011AC4202, tlsName: null, host: "2001:db8::10", port: 3000, sourceList: alternate }
+    expect: { host: lb.example.com, port: 30001, tlsName: null }
+
+  - case: node-name-key-misses-other-node
+    because: A node with no entry passes through under the default onMiss.
+    config:
+      translation:
+        provider: port-map
+        portMap:
+          - { match: { nodeName: BB9020011AC4202 }, target: { host: lb.example.com, port: 30001 } }
+    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 10.0.0.2, port: 3000, sourceList: standard }
+    expect: { host: 10.0.0.2, port: 3000, tlsName: db2.example.com }
+
+  - case: ipv6-host-port-key-hit
+    because: An IPv6 literal host is a key like any other host.
+    config:
+      translation:
+        provider: port-map
+        portMap:
+          - { match: { host: "2001:db8::10", port: 3000 }, target: { host: lb.example.com, port: 30001 } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: "2001:db8::10", port: 3000, sourceList: standard }
+    expect: { host: lb.example.com, port: 30001, tlsName: db1.example.com }
+
+  - case: standard-map-alternate-endpoint-first-node
+    because: A map authored against the standard list misses on alternate endpoints and the miss is surfaced.
+    config:
+      translation:
+        provider: port-map
+        portMap:
+          - { match: { host: 10.0.0.1, port: 3000 }, target: { host: lb.example.com, port: 30001 } }
+          - { match: { host: 10.0.0.2, port: 3000 }, target: { host: lb.example.com, port: 30002 } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 198.51.100.1, port: 3000, sourceList: alternate }
+    expect:
+      host: 198.51.100.1
+      port: 3000
+      tlsName: db1.example.com
+      diagnostic:
+        category: translation-miss
+        messageContains: { nodeName: BB9020011AC4202, host: 198.51.100.1, port: 3000, translator: port-map }
+
+  - case: standard-map-alternate-endpoint-second-node
+    because: Every alternate endpoint misses a standard-list map, not just one.
+    config:
+      translation:
+        provider: port-map
+        portMap:
+          - { match: { host: 10.0.0.1, port: 3000 }, target: { host: lb.example.com, port: 30001 } }
+          - { match: { host: 10.0.0.2, port: 3000 }, target: { host: lb.example.com, port: 30002 } }
+    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 198.51.100.2, port: 3000, sourceList: alternate }
+    expect:
+      host: 198.51.100.2
+      port: 3000
+      tlsName: db2.example.com
+      diagnostic:
+        category: translation-miss
+        messageContains: { nodeName: BB9030011AC4202, host: 198.51.100.2, port: 3000, translator: port-map }
+
+  - case: standard-map-alternate-endpoint-strict
+    because: Under strict the alternate-list miss fails instead of passing through.
+    config:
+      translation:
+        provider: port-map
+        onMiss: strict
+        portMap:
+          - { match: { host: 10.0.0.1, port: 3000 }, target: { host: lb.example.com, port: 30001 } }
+    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 198.51.100.1, port: 3000, sourceList: alternate }
+    expect:
+      error:
+        category: translation-miss
+        messageContains: { nodeName: BB9020011AC4202, host: 198.51.100.1, port: 3000, translator: port-map }

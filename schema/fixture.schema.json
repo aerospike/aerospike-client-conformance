@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aerospike.com/conformance/schema/fixture.schema.json",
+  "title": "Conformance fixture file",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "rows"],
+  "properties": {
+    "kind": { "enum": ["translate", "merge", "tls"] },
+    "description": { "type": "string" },
+    "shapes": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]*$" },
+      "additionalProperties": { "$ref": "#/$defs/shape" }
+    },
+    "rows": { "type": "array", "minItems": 1 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "translate" } } },
+      "then": { "properties": { "rows": { "items": { "$ref": "#/$defs/translateRow" } } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "merge" } } },
+      "then": { "properties": { "rows": { "items": { "$ref": "#/$defs/mergeRow" } } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "tls" } } },
+      "then": { "required": ["shapes"], "properties": { "rows": { "items": { "$ref": "#/$defs/tlsRow" } } } },
+      "else": { "not": { "required": ["shapes"] } }
+    }
+  ],
+  "$defs": {
+    "row": {
+      "type": "object",
+      "required": ["case", "because", "input"],
+      "properties": {
+        "case": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "because": { "type": "string", "minLength": 1 },
+        "state": { "const": "blocked" },
+        "blockedBy": { "type": "string", "minLength": 1 }
+      },
+      "if": { "required": ["state"] },
+      "then": { "required": ["blockedBy"], "not": { "required": ["expect"] } },
+      "else": { "required": ["expect"], "not": { "required": ["blockedBy"] } }
+    },
+    "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subjectCN", "san"],
+      "properties": {
+        "subjectCN": { "type": "string" },
+        "san": { "type": "array", "items": { "type": "string", "pattern": "^(DNS|IP):.+$" } }
+      }
+    },
+    "hostMap": { "type": "object", "additionalProperties": { "type": "string" } },
+    "seed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "port"],
+      "properties": { "host": { "type": "string" }, "port": { "$ref": "#/$defs/port" } }
+    },
+    "seedList": { "type": "array", "items": { "$ref": "#/$defs/seed" } },
+    "missFacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["category", "messageContains"],
+      "properties": {
+        "category": { "const": "translation-miss" },
+        "messageContains": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["nodeName", "host", "port", "translator"],
+          "properties": {
+            "nodeName": { "type": "string" },
+            "host": { "type": "string" },
+            "port": { "$ref": "#/$defs/port" },
+            "translator": { "enum": ["static-map", "port-map", "endpoint-port-map"] }
+          }
+        }
+      }
+    },
+    "portMapEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["match", "target"],
+      "properties": {
+        "match": {
+          "type": "object",
+          "additionalProperties": false,
+          "oneOf": [
+            { "required": ["host", "port"], "not": { "required": ["nodeName"] } },
+            { "required": ["nodeName"], "not": { "anyOf": [{ "required": ["host"] }, { "required": ["port"] }] } }
+          ],
+          "properties": {
+            "host": { "type": "string" },
+            "port": { "$ref": "#/$defs/port" },
+            "nodeName": { "type": "string" }
+          }
+        },
+        "target": { "$ref": "#/$defs/seed" }
+      }
+    },
+    "translateRow": {
+      "$ref": "#/$defs/row",
+      "unevaluatedProperties": false,
+      "properties": {
+        "config": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "legacyHostMap": { "$ref": "#/$defs/hostMap" },
+            "translation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["provider"],
+              "properties": {
+                "provider": { "enum": ["static-map", "port-map", "endpoint-port-map"] },
+                "onMiss": { "enum": ["passThrough", "strict"] },
+                "staticMap": { "$ref": "#/$defs/hostMap" },
+                "portMap": { "type": "array", "items": { "$ref": "#/$defs/portMapEntry" } },
+                "endpoint": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["hostname", "portBase"],
+                  "properties": {
+                    "hostname": { "type": "string" },
+                    "portBase": { "$ref": "#/$defs/port" }
+                  }
+                }
+              },
+              "allOf": [
+                {
+                  "if": { "properties": { "provider": { "const": "static-map" } } },
+                  "then": { "required": ["staticMap"], "not": { "anyOf": [{ "required": ["portMap"] }, { "required": ["endpoint"] }] } }
+                },
+                {
+                  "if": { "properties": { "provider": { "const": "port-map" } } },
+                  "then": { "required": ["portMap"], "not": { "anyOf": [{ "required": ["staticMap"] }, { "required": ["endpoint"] }] } }
+                },
+                {
+                  "if": { "properties": { "provider": { "const": "endpoint-port-map" } } },
+                  "then": { "required": ["endpoint"], "not": { "anyOf": [{ "required": ["staticMap"] }, { "required": ["portMap"] }] } }
+                }
+              ]
+            }
+          },
+          "not": { "required": ["legacyHostMap", "translation"] }
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["nodeName", "tlsName", "host", "port", "sourceList"],
+          "properties": {
+            "nodeName": { "type": "string" },
+            "tlsName": { "type": ["string", "null"] },
+            "host": { "type": "string" },
+            "port": { "$ref": "#/$defs/port" },
+            "sourceList": { "enum": ["standard", "alternate"] }
+          }
+        },
+        "expect": {
+          "type": "object",
+          "additionalProperties": false,
+          "oneOf": [
+            { "required": ["host", "port", "tlsName"], "not": { "required": ["error"] } },
+            { "required": ["error"], "not": { "anyOf": [{ "required": ["host"] }, { "required": ["port"] }, { "required": ["tlsName"] }, { "required": ["diagnostic"] }] } }
+          ],
+          "properties": {
+            "host": { "type": "string" },
+            "port": { "$ref": "#/$defs/port" },
+            "tlsName": { "type": ["string", "null"] },
+            "diagnostic": { "$ref": "#/$defs/missFacts" },
+            "error": { "$ref": "#/$defs/missFacts" }
+          }
+        }
+      },
+      "required": ["config"]
+    },
+    "mergeRow": {
+      "$ref": "#/$defs/row",
+      "unevaluatedProperties": false,
+      "required": ["config"],
+      "properties": {
+        "config": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["seeds"],
+          "properties": {
+            "seeds": { "$ref": "#/$defs/seedList" },
+            "discovery": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": { "mergePolicy": { "enum": ["merge", "replace", "discovery-only"] } }
+            }
+          }
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["discoveryResults"],
+          "properties": {
+            "discoveryResults": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/seedList" } }
+          }
+        },
+        "expect": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["snapshots"],
+          "properties": {
+            "snapshots": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/seedList" } }
+          }
+        }
+      }
+    },
+    "tlsRow": {
+      "$ref": "#/$defs/row",
+      "unevaluatedProperties": false,
+      "properties": {
+        "config": false,
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tlsName", "shape"],
+          "properties": {
+            "tlsName": { "type": "string" },
+            "shape": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" }
+          }
+        },
+        "expect": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outcome"],
+          "properties": { "outcome": { "enum": ["accept", "reject"] } }
+        }
+      }
+    }
+  }
+}

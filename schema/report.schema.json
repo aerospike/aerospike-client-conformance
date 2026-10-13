@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aerospike.com/conformance/schema/report.schema.json",
+  "title": "Conformance report written by one runtime",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runtime", "clientVersion", "fixtureSetVersion", "counts", "rows"],
+  "properties": {
+    "runtime": { "type": "string", "minLength": 1 },
+    "clientVersion": { "type": "string", "minLength": 1 },
+    "fixtureSetVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pass", "fail", "unsupported", "blocked"],
+      "properties": {
+        "pass": { "type": "integer", "minimum": 0 },
+        "fail": { "type": "integer", "minimum": 0 },
+        "unsupported": { "type": "integer", "minimum": 0 },
+        "blocked": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "case", "result"],
+        "properties": {
+          "file": { "type": "string", "pattern": "^([a-z0-9-]+/)+[a-z0-9-]+\\.yaml$" },
+          "case": { "type": "string", "minLength": 1 },
+          "result": { "enum": ["pass", "fail", "unsupported", "blocked"] },
+          "reason": { "type": "string", "minLength": 1 },
+          "detail": { "type": "string" }
+        },
+        "if": { "properties": { "result": { "enum": ["fail", "unsupported", "blocked"] } } },
+        "then": { "required": ["reason"] }
+      }
+    }
+  }
+}
