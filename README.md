@@ -17,6 +17,9 @@ fixture set version it ran.
 - minor: new rows, new files or new optional keys
 - major: a changed expectation, a removed or renamed row, or an incompatible schema change
 
+Pushing a `v<VERSION>` tag publishes `aerospike-client-conformance-<VERSION>.zip` to JFrog
+(`database-generic-dev-local`); client CI downloads that release rather than reading this repository.
+
 ## Layout
 
 ```
