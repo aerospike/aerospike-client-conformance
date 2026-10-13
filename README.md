@@ -39,13 +39,13 @@ declarations.
 A fixture file has `kind`, an optional `description` and `rows`; a `tls` file also has `shapes`.
 Every row has:
 
-| Key | |
-|---|---|
-| `case` | Name, unique within its file |
-| `because` | One line |
-| `config` | Configuration, using the public configuration surface |
-| `input` | The input to the code under test |
-| `expect` | The expected output. Absent on a blocked row |
+| Key                  |                                                                   |
+| -------------------- | ----------------------------------------------------------------- |
+| `case`               | Name, unique within its file                                      |
+| `because`            | One line                                                          |
+| `config`             | Configuration, using the public configuration surface             |
+| `input`              | The input to the code under test                                  |
+| `expect`             | The expected output. Absent on a blocked row                      |
 | `state`, `blockedBy` | Optional. `state: blocked` with a reason; the row has no `expect` |
 
 Values are strings, integers, booleans, null, lists and maps only.
@@ -77,19 +77,19 @@ against the schema and checks what the schema cannot: case names are unique with
 certificate has a shape, and a merge row has one snapshot per discovery result. A released
 fixture set has passed it, so runners can trust the format and only read the rows.
 
-```
+```sh
 pip install -r scripts/requirements.txt
 python scripts/validate-fixtures.py
 ```
 
 ## Results
 
-| Result | Meaning |
-|---|---|
-| `pass` | The runtime produced the expected output |
-| `fail` | It did not |
+| Result        | Meaning                                                                  |
+| ------------- | ------------------------------------------------------------------------ |
+| `pass`        | The runtime produced the expected output                                 |
+| `fail`        | It did not                                                               |
 | `unsupported` | The runtime does not implement the translator or option; reason required |
-| `blocked` | Copied from the fixture row; the row is not run |
+| `blocked`     | Copied from the fixture row; the row is not run                          |
 
 A runtime declares the result it expects for each row, with a one-line reason naming the owning
 ticket or decision for every non-`pass` declaration. A row with no declaration is declared
@@ -105,14 +105,14 @@ reason.
 
 These keys are not final. They are used consistently here and may be renamed:
 
-| Key | Fixtures | Meaning |
-|---|---|---|
-| `legacyHostMap` | legacy-ip-map, on-miss | The pre-existing client host-to-host map, applied when no translator is configured |
-| `translation.staticMap` | static-map, on-miss | `static-map` entries: advertised host to host |
-| `translation.portMap` | port-map, on-miss | `port-map` entries, a list of `{match, target}` |
-| `translation.portMap[].match.host`, `.match.port`, `.match.nodeName` | port-map, on-miss | Entry key: `(host, port)` or `nodeName` |
-| `translation.portMap[].target.host`, `.target.port` | port-map, on-miss | Endpoint to connect to on a hit |
-| `seeds` (`host`, `port`) | merge-policy | The static seed list |
+| Key                                                                  | Fixtures               | Meaning                                                                            |
+| -------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------- |
+| `legacyHostMap`                                                      | legacy-ip-map, on-miss | The pre-existing client host-to-host map, applied when no translator is configured |
+| `translation.staticMap`                                              | static-map, on-miss    | `static-map` entries: advertised host to host                                      |
+| `translation.portMap`                                                | port-map, on-miss      | `port-map` entries, a list of `{match, target}`                                    |
+| `translation.portMap[].match.host`, `.match.port`, `.match.nodeName` | port-map, on-miss      | Entry key: `(host, port)` or `nodeName`                                            |
+| `translation.portMap[].target.host`, `.target.port`                  | port-map, on-miss      | Endpoint to connect to on a hit                                                    |
+| `seeds` (`host`, `port`)                                             | merge-policy           | The static seed list                                                               |
 
 ## Contributing
 
