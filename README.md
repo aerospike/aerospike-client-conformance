@@ -2,8 +2,8 @@
 
 Expectations as data for behaviour every Aerospike client runtime must share: pluggable
 discovery, address translation and certificate name matching. Every runtime runs
-these rows unchanged and reports one result per row. The repository holds data and schemas only;
-each client keeps its own runner and its own declarations.
+these rows unchanged and reports one result per row. The repository holds data, schemas and the
+check that keeps them consistent; each client keeps its own runner and its own declarations.
 
 Expected values are never adjusted to match a runtime.
 
@@ -28,6 +28,7 @@ discovery/merge/*.yaml            seed merge policy (kind: merge)
 tls/name-matching.yaml            certificate name matching (kind: tls)
 tls/certs/<shape>.pem             one certificate per shape in name-matching.yaml (no private keys)
 tls/generate-certs.sh             regenerates tls/certs from the shapes (openssl, yq)
+scripts/validate-fixtures.py      the CI check for every fixture file (see Validation)
 ```
 
 A file's path from the repository root, for example `tls/name-matching.yaml`, is its name in reports and
@@ -60,13 +61,26 @@ Values are strings, integers, booleans, null, lists and maps only.
 - **tls**: `shapes` maps a shape name to a certificate's subject CN and SAN list (`DNS:` /
   `IP:`); the certificate for shape `x` is `certs/x.pem`. `input.tlsName` is the reference
   identifier and `input.shape` names the server certificate. `expect.outcome` is `accept` or
-  `reject`. A runner must check each certificate matches its shape. Integration harnesses that
+  `reject`. Integration harnesses that
   run against a real server generate one certificate per shape at run time from the same map
   and start one server per shape, so cases sharing a shape share a server.
 
 An expected error is a category plus the facts its message must contain, never an exception
 type. `translation-miss` must name the node, the advertised host and port,
 and the translator.
+
+## Validation
+
+CI runs `scripts/validate-fixtures.py` on every pull request. It validates each fixture file
+against the schema and checks what the schema cannot: case names are unique within a file, every
+`input.shape` is defined, every shape has a certificate whose CN and SAN match it, every
+certificate has a shape, and a merge row has one snapshot per discovery result. A released
+fixture set has passed it, so runners can trust the format and only read the rows.
+
+```
+pip install -r scripts/requirements.txt
+python scripts/validate-fixtures.py
+```
 
 ## Results
 
