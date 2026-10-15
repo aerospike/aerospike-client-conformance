@@ -19,6 +19,18 @@ def canonical_san(name):
     return f"IP:{ipaddress.ip_address(value)}" if kind == "IP" else name
 
 
+def host_port_error(value):
+    host, _, port = value.rpartition(":")
+    if not 0 <= int(port) <= 65535:
+        return f"port {port} out of range"
+    if host.startswith("["):
+        try:
+            ipaddress.IPv6Address(host[1:-1])
+        except ValueError:
+            return f"{host} is not a bracketed IPv6 address"
+    return None
+
+
 def cert_names(path):
     cert = x509.load_pem_x509_certificate(path.read_bytes())
     cn = [a.value for a in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)]
@@ -51,6 +63,14 @@ def check_file(path, validator):
         if row["case"] in seen:
             errors.append(f"{row['case']}: duplicate case")
         seen.add(row["case"])
+
+    if doc["kind"] == "translate":
+        for row in doc["rows"]:
+            port_map = row["config"].get("translation", {}).get("port_map", {})
+            for key, value in port_map.items():
+                for kind, text in (("key", key), ("value", value)):
+                    if (kind == "value" or ":" in text) and (error := host_port_error(text)):
+                        errors.append(f"{row['case']}: port_map {kind} {text}: {error}")
 
     if doc["kind"] == "merge":
         for row in doc["rows"]:

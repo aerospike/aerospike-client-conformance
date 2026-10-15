@@ -77,32 +77,12 @@
             "nodeName": { "type": "string" },
             "host": { "type": "string" },
             "port": { "$ref": "#/$defs/port" },
-            "translator": { "enum": ["static-map", "port-map", "endpoint-port-map"] }
+            "translator": { "enum": ["static-map", "port-map"] }
           }
         }
       }
     },
-    "portMapEntry": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["match", "target"],
-      "properties": {
-        "match": {
-          "type": "object",
-          "additionalProperties": false,
-          "oneOf": [
-            { "required": ["host", "port"], "not": { "required": ["nodeName"] } },
-            { "required": ["nodeName"], "not": { "anyOf": [{ "required": ["host"] }, { "required": ["port"] }] } }
-          ],
-          "properties": {
-            "host": { "type": "string" },
-            "port": { "$ref": "#/$defs/port" },
-            "nodeName": { "type": "string" }
-          }
-        },
-        "target": { "$ref": "#/$defs/seed" }
-      }
-    },
+    "hostPort": { "type": "string", "pattern": "^(\\[[0-9A-Fa-f:.]+\\]|[^\\[\\]:]+):[0-9]+$" },
     "translateRow": {
       "$ref": "#/$defs/row",
       "unevaluatedProperties": false,
@@ -111,43 +91,38 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "legacyHostMap": { "$ref": "#/$defs/hostMap" },
+            "ip_map": { "$ref": "#/$defs/hostMap" },
             "translation": {
               "type": "object",
               "additionalProperties": false,
               "required": ["provider"],
               "properties": {
-                "provider": { "enum": ["static-map", "port-map", "endpoint-port-map"] },
-                "onMiss": { "enum": ["passThrough", "strict"] },
-                "staticMap": { "$ref": "#/$defs/hostMap" },
-                "portMap": { "type": "array", "items": { "$ref": "#/$defs/portMapEntry" } },
-                "endpoint": {
+                "provider": { "enum": ["static-map", "port-map", "pass-through"] },
+                "on_miss": { "enum": ["pass_through", "strict"] },
+                "static_map": { "$ref": "#/$defs/hostMap" },
+                "port_map": {
                   "type": "object",
-                  "additionalProperties": false,
-                  "required": ["hostname", "portBase"],
-                  "properties": {
-                    "hostname": { "type": "string" },
-                    "portBase": { "$ref": "#/$defs/port" }
-                  }
+                  "propertyNames": { "pattern": "^(\\[[0-9A-Fa-f:.]+\\]:[0-9]+|[^\\[\\]:]+:[0-9]+|[0-9A-Fa-f]+)$" },
+                  "additionalProperties": { "$ref": "#/$defs/hostPort" }
                 }
               },
               "allOf": [
                 {
                   "if": { "properties": { "provider": { "const": "static-map" } } },
-                  "then": { "required": ["staticMap"], "not": { "anyOf": [{ "required": ["portMap"] }, { "required": ["endpoint"] }] } }
+                  "then": { "required": ["static_map"], "not": { "required": ["port_map"] } }
                 },
                 {
                   "if": { "properties": { "provider": { "const": "port-map" } } },
-                  "then": { "required": ["portMap"], "not": { "anyOf": [{ "required": ["staticMap"] }, { "required": ["endpoint"] }] } }
+                  "then": { "required": ["port_map"], "not": { "required": ["static_map"] } }
                 },
                 {
-                  "if": { "properties": { "provider": { "const": "endpoint-port-map" } } },
-                  "then": { "required": ["endpoint"], "not": { "anyOf": [{ "required": ["staticMap"] }, { "required": ["portMap"] }] } }
+                  "if": { "properties": { "provider": { "const": "pass-through" } } },
+                  "then": { "not": { "anyOf": [{ "required": ["static_map"] }, { "required": ["port_map"] }] } }
                 }
               ]
             }
           },
-          "not": { "required": ["legacyHostMap", "translation"] }
+          "not": { "required": ["ip_map", "translation"] }
         },
         "input": {
           "type": "object",
@@ -166,13 +141,12 @@
           "additionalProperties": false,
           "oneOf": [
             { "required": ["host", "port", "tlsName"], "not": { "required": ["error"] } },
-            { "required": ["error"], "not": { "anyOf": [{ "required": ["host"] }, { "required": ["port"] }, { "required": ["tlsName"] }, { "required": ["diagnostic"] }] } }
+            { "required": ["error"], "not": { "anyOf": [{ "required": ["host"] }, { "required": ["port"] }, { "required": ["tlsName"] }] } }
           ],
           "properties": {
             "host": { "type": "string" },
             "port": { "$ref": "#/$defs/port" },
             "tlsName": { "type": ["string", "null"] },
-            "diagnostic": { "$ref": "#/$defs/missFacts" },
             "error": { "$ref": "#/$defs/missFacts" }
           }
         }
@@ -193,7 +167,7 @@
             "discovery": {
               "type": "object",
               "additionalProperties": false,
-              "properties": { "mergePolicy": { "enum": ["merge", "replace", "discovery-only"] } }
+              "properties": { "merge_policy": { "enum": ["merge", "replace", "discovery_only"] } }
             }
           }
         },

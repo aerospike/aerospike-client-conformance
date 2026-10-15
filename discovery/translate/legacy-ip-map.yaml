@@ -1,6 +1,6 @@
 kind: translate
 description: >-
-  No translator configured: the pre-existing client host map (legacyHostMap) is applied exactly as
+  No translator configured: the pre-existing client host map (ip_map) is applied exactly as
   before pluggable translation. Each row pins one behaviour of the default path.
 rows:
   - case: no-map-configured
@@ -18,55 +18,55 @@ rows:
   - case: mapped-host-replaced-port-kept
     because: A mapped host is replaced and the advertised port kept, as today.
     config:
-      legacyHostMap: { "10.0.0.1": "203.0.113.1" }
+      ip_map: { "10.0.0.1": "203.0.113.1" }
     input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 3000, sourceList: standard }
     expect: { host: 203.0.113.1, port: 3000, tlsName: db1.example.com }
 
   - case: mapped-host-null-tls-name
     because: A null tlsName stays null when the host is mapped.
     config:
-      legacyHostMap: { "10.0.0.1": "203.0.113.1" }
+      ip_map: { "10.0.0.1": "203.0.113.1" }
     input: { nodeName: BB9020011AC4202, tlsName: null, host: 10.0.0.1, port: 3000, sourceList: standard }
     expect: { host: 203.0.113.1, port: 3000, tlsName: null }
 
   - case: mapped-host-tls-name-kept
     because: The advertised tlsName survives a host mapping on the default path.
     config:
-      legacyHostMap: { "10.0.0.1": "node1.public.example.com" }
+      ip_map: { "10.0.0.1": "node1.public.example.com" }
     input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 4333, sourceList: standard }
     expect: { host: node1.public.example.com, port: 4333, tlsName: db1.example.com }
 
   - case: unmapped-host-passes-through
     because: A host with no entry is used as advertised, as today.
     config:
-      legacyHostMap: { "10.0.0.1": "203.0.113.1" }
+      ip_map: { "10.0.0.1": "203.0.113.1" }
     input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 10.0.0.2, port: 3000, sourceList: standard }
     expect: { host: 10.0.0.2, port: 3000, tlsName: db2.example.com }
 
   - case: empty-map-passes-through
     because: An empty map translates nothing.
     config:
-      legacyHostMap: {}
+      ip_map: {}
     input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 3000, sourceList: standard }
     expect: { host: 10.0.0.1, port: 3000, tlsName: db1.example.com }
 
   - case: host-port-key-does-not-match
     because: The map is keyed by host only, so a host:port key never matches.
     config:
-      legacyHostMap: { "10.0.0.1:3000": "203.0.113.1" }
+      ip_map: { "10.0.0.1:3000": "203.0.113.1" }
     input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 3000, sourceList: standard }
     expect: { host: 10.0.0.1, port: 3000, tlsName: db1.example.com }
 
   - case: ipv6-literal-mapped
     because: An IPv6 literal host is mapped like any other host.
     config:
-      legacyHostMap: { "2001:db8::10": "2001:db8:ffff::10" }
+      ip_map: { "2001:db8::10": "2001:db8:ffff::10" }
     input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: "2001:db8::10", port: 3000, sourceList: standard }
     expect: { host: "2001:db8:ffff::10", port: 3000, tlsName: db1.example.com }
 
   - case: alternate-source-list-mapped
     because: The map applies whichever list advertised the endpoint, as today.
     config:
-      legacyHostMap: { "198.51.100.1": "203.0.113.1" }
+      ip_map: { "198.51.100.1": "203.0.113.1" }
     input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 198.51.100.1, port: 3000, sourceList: alternate }
     expect: { host: 203.0.113.1, port: 3000, tlsName: db1.example.com }
