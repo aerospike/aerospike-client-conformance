@@ -4,20 +4,42 @@ description: >-
   matches a dNSName SAN only, an IP-ID an iPAddress SAN only, comparison is case-insensitive, the
   only wildcard is a single left-most label, and the subject CN is never an identifier.
 shapes:
-  dns: { subjectCN: unrelated.example.org, san: ["DNS:db1.example.com"] }
-  ip: { subjectCN: unrelated.example.org, san: ["IP:10.0.0.1", "IP:2001:db8::1", "IP:127.0.0.1"] }
-  ip-link-local: { subjectCN: unrelated.example.org, san: ["IP:fe80::1"] }
-  wildcard: { subjectCN: unrelated.example.org, san: ["DNS:*.example.com"] }
-  wildcard-partial: { subjectCN: unrelated.example.org, san: ["DNS:a*.example.com"] }
-  wildcard-multi: { subjectCN: unrelated.example.org, san: ["DNS:*.*.example.com"] }
-  wildcard-inner: { subjectCN: unrelated.example.org, san: ["DNS:foo.*.example.com"] }
-  wildcard-ip: { subjectCN: unrelated.example.org, san: ["DNS:*.0.0.1"] }
+  dns: { subjectCN: unrelated.example.org, san: [DNS:db1.example.com] }
+  ip:
+    {
+      subjectCN: unrelated.example.org,
+      san: [IP:10.0.0.1, IP:2001:db8::1, IP:127.0.0.1],
+    }
+  ip-link-local: { subjectCN: unrelated.example.org, san: [IP:fe80::1] }
+  wildcard: { subjectCN: unrelated.example.org, san: [DNS:*.example.com] }
+  wildcard-partial:
+    { subjectCN: unrelated.example.org, san: [DNS:a*.example.com] }
+  wildcard-multi:
+    { subjectCN: unrelated.example.org, san: [DNS:*.*.example.com] }
+  wildcard-inner:
+    { subjectCN: unrelated.example.org, san: [DNS:foo.*.example.com] }
+  wildcard-ip: { subjectCN: unrelated.example.org, san: [DNS:*.0.0.1] }
   cn-only: { subjectCN: db1.example.com, san: [] }
   cn-only-mixed-case: { subjectCN: DB1.Example.com, san: [] }
-  cn-dns-mismatch: { subjectCN: db1.example.com, san: ["DNS:db2.example.com"] }
-  ip-as-dns: { subjectCN: unrelated.example.org, san: ["DNS:10.0.0.1"] }
-  ci-shape: { subjectCN: aerospike-tls, san: ["DNS:aerospike-1", "DNS:localhost", "DNS:docker", "IP:127.0.0.1"] }
-  ci-shape-fixed: { subjectCN: aerospike-tls, san: ["DNS:aerospike-1", "DNS:localhost", "DNS:docker", "IP:127.0.0.1", "DNS:aerospike-tls"] }
+  cn-dns-mismatch: { subjectCN: db1.example.com, san: [DNS:db2.example.com] }
+  ip-as-dns: { subjectCN: unrelated.example.org, san: [DNS:10.0.0.1] }
+  ci-shape:
+    {
+      subjectCN: aerospike-tls,
+      san: [DNS:aerospike-1, DNS:localhost, DNS:docker, IP:127.0.0.1],
+    }
+  ci-shape-fixed:
+    {
+      subjectCN: aerospike-tls,
+      san:
+        [
+          DNS:aerospike-1,
+          DNS:localhost,
+          DNS:docker,
+          IP:127.0.0.1,
+          DNS:aerospike-tls,
+        ],
+    }
 
 rows:
   - case: dns-id-equals-dns-name
@@ -51,14 +73,14 @@ rows:
   - case: ipv6-id-equals-ip-address
     because: An IPv6 IP-ID matches an equal iPAddress SAN.
     input:
-      tlsName: "2001:db8::1"
+      tlsName: 2001:db8::1
       shape: ip
     expect: { outcome: accept }
 
   - case: ipv6-id-differently-spelled
     because: IP-IDs compare as addresses, so an equivalent IPv6 spelling matches.
     input:
-      tlsName: "2001:0DB8:0:0:0:0:0:0001"
+      tlsName: 2001:0DB8:0:0:0:0:0:0001
       shape: ip
     expect: { outcome: accept }
 
@@ -191,7 +213,7 @@ rows:
     state: blocked
     blockedBy: undecided how a scoped IPv6 tlsName (fe80::1%en0) compares
     input:
-      tlsName: "fe80::1%en0"
+      tlsName: fe80::1%en0
       shape: ip-link-local
 
   - case: ipv4-id-with-leading-zeros

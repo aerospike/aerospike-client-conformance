@@ -22,7 +22,7 @@ Pushing a `v<VERSION>` tag publishes `aerospike-client-conformance-<VERSION>.zip
 
 ## Layout
 
-```
+```text
 VERSION
 schema/fixture.schema.json        every fixture file validates against this (JSON Schema 2020-12)
 schema/report.schema.json         the report each runtime writes

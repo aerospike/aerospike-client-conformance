@@ -10,8 +10,19 @@ rows:
     config:
       translation:
         provider: port-map
-        port_map: { "10.0.0.1:3000": "lb.example.com:30001", "10.0.0.2:3000": "lb.example.com:30002" }
-    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 3000, sourceList: standard }
+        port_map:
+          {
+            "10.0.0.1:3000": lb.example.com:30001,
+            "10.0.0.2:3000": lb.example.com:30002,
+          }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: db1.example.com,
+        host: 10.0.0.1,
+        port: 3000,
+        sourceList: standard,
+      }
     expect: { host: lb.example.com, port: 30001, tlsName: db1.example.com }
 
   - case: host-port-key-null-tls-name
@@ -19,8 +30,15 @@ rows:
     config:
       translation:
         provider: port-map
-        port_map: { "10.0.0.2:3000": "lb.example.com:30002" }
-    input: { nodeName: BB9030011AC4202, tlsName: null, host: 10.0.0.2, port: 3000, sourceList: standard }
+        port_map: { "10.0.0.2:3000": lb.example.com:30002 }
+    input:
+      {
+        nodeName: BB9030011AC4202,
+        tlsName: null,
+        host: 10.0.0.2,
+        port: 3000,
+        sourceList: standard,
+      }
     expect: { host: lb.example.com, port: 30002, tlsName: null }
 
   - case: host-port-key-other-port-misses
@@ -28,8 +46,15 @@ rows:
     config:
       translation:
         provider: port-map
-        port_map: { "10.0.0.1:3000": "lb.example.com:30001" }
-    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 4333, sourceList: standard }
+        port_map: { "10.0.0.1:3000": lb.example.com:30001 }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: db1.example.com,
+        host: 10.0.0.1,
+        port: 4333,
+        sourceList: standard,
+      }
     expect: { host: 10.0.0.1, port: 4333, tlsName: db1.example.com }
 
   - case: node-name-key-hit
@@ -37,8 +62,19 @@ rows:
     config:
       translation:
         provider: port-map
-        port_map: { BB9020011AC4202: "lb.example.com:30001", BB9030011AC4202: "lb.example.com:30002" }
-    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 10.0.0.2, port: 3000, sourceList: standard }
+        port_map:
+          {
+            BB9020011AC4202: lb.example.com:30001,
+            BB9030011AC4202: lb.example.com:30002,
+          }
+    input:
+      {
+        nodeName: BB9030011AC4202,
+        tlsName: db2.example.com,
+        host: 10.0.0.2,
+        port: 3000,
+        sourceList: standard,
+      }
     expect: { host: lb.example.com, port: 30002, tlsName: db2.example.com }
 
   - case: node-name-key-any-advertised-address
@@ -46,8 +82,15 @@ rows:
     config:
       translation:
         provider: port-map
-        port_map: { BB9020011AC4202: "lb.example.com:30001" }
-    input: { nodeName: BB9020011AC4202, tlsName: null, host: "2001:db8::10", port: 3000, sourceList: alternate }
+        port_map: { BB9020011AC4202: lb.example.com:30001 }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: null,
+        host: 2001:db8::10,
+        port: 3000,
+        sourceList: alternate,
+      }
     expect: { host: lb.example.com, port: 30001, tlsName: null }
 
   - case: node-name-key-misses-other-node
@@ -55,8 +98,15 @@ rows:
     config:
       translation:
         provider: port-map
-        port_map: { BB9020011AC4202: "lb.example.com:30001" }
-    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 10.0.0.2, port: 3000, sourceList: standard }
+        port_map: { BB9020011AC4202: lb.example.com:30001 }
+    input:
+      {
+        nodeName: BB9030011AC4202,
+        tlsName: db2.example.com,
+        host: 10.0.0.2,
+        port: 3000,
+        sourceList: standard,
+      }
     expect: { host: 10.0.0.2, port: 3000, tlsName: db2.example.com }
 
   - case: ipv6-host-port-key-hit
@@ -64,8 +114,15 @@ rows:
     config:
       translation:
         provider: port-map
-        port_map: { "[2001:db8::10]:3000": "lb.example.com:30001" }
-    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: "2001:db8::10", port: 3000, sourceList: standard }
+        port_map: { "[2001:db8::10]:3000": lb.example.com:30001 }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: db1.example.com,
+        host: 2001:db8::10,
+        port: 3000,
+        sourceList: standard,
+      }
     expect: { host: lb.example.com, port: 30001, tlsName: db1.example.com }
 
   - case: host-port-and-node-name-keys-both-match
@@ -75,16 +132,38 @@ rows:
     config:
       translation:
         provider: port-map
-        port_map: { "10.0.0.1:3000": "lb.example.com:30001", BB9020011AC4202: "lb.example.com:30002" }
-    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 10.0.0.1, port: 3000, sourceList: standard }
+        port_map:
+          {
+            "10.0.0.1:3000": lb.example.com:30001,
+            BB9020011AC4202: lb.example.com:30002,
+          }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: db1.example.com,
+        host: 10.0.0.1,
+        port: 3000,
+        sourceList: standard,
+      }
 
   - case: standard-map-alternate-endpoint-first-node
     because: A map authored against the standard list misses on alternate endpoints, which pass through unchanged.
     config:
       translation:
         provider: port-map
-        port_map: { "10.0.0.1:3000": "lb.example.com:30001", "10.0.0.2:3000": "lb.example.com:30002" }
-    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 198.51.100.1, port: 3000, sourceList: alternate }
+        port_map:
+          {
+            "10.0.0.1:3000": lb.example.com:30001,
+            "10.0.0.2:3000": lb.example.com:30002,
+          }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: db1.example.com,
+        host: 198.51.100.1,
+        port: 3000,
+        sourceList: alternate,
+      }
     expect: { host: 198.51.100.1, port: 3000, tlsName: db1.example.com }
 
   - case: standard-map-alternate-endpoint-second-node
@@ -92,8 +171,19 @@ rows:
     config:
       translation:
         provider: port-map
-        port_map: { "10.0.0.1:3000": "lb.example.com:30001", "10.0.0.2:3000": "lb.example.com:30002" }
-    input: { nodeName: BB9030011AC4202, tlsName: db2.example.com, host: 198.51.100.2, port: 3000, sourceList: alternate }
+        port_map:
+          {
+            "10.0.0.1:3000": lb.example.com:30001,
+            "10.0.0.2:3000": lb.example.com:30002,
+          }
+    input:
+      {
+        nodeName: BB9030011AC4202,
+        tlsName: db2.example.com,
+        host: 198.51.100.2,
+        port: 3000,
+        sourceList: alternate,
+      }
     expect: { host: 198.51.100.2, port: 3000, tlsName: db2.example.com }
 
   - case: standard-map-alternate-endpoint-strict
@@ -102,9 +192,22 @@ rows:
       translation:
         provider: port-map
         on_miss: strict
-        port_map: { "10.0.0.1:3000": "lb.example.com:30001" }
-    input: { nodeName: BB9020011AC4202, tlsName: db1.example.com, host: 198.51.100.1, port: 3000, sourceList: alternate }
+        port_map: { "10.0.0.1:3000": lb.example.com:30001 }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: db1.example.com,
+        host: 198.51.100.1,
+        port: 3000,
+        sourceList: alternate,
+      }
     expect:
       error:
         category: translation-miss
-        messageContains: { nodeName: BB9020011AC4202, host: 198.51.100.1, port: 3000, translator: port-map }
+        messageContains:
+          {
+            nodeName: BB9020011AC4202,
+            host: 198.51.100.1,
+            port: 3000,
+            translator: port-map,
+          }
