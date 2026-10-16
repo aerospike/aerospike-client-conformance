@@ -1,25 +1,25 @@
 validations:
   validate-fixtures:
-    description: "Fixture files validate against the schema and the cross-file rules (CI validate-fixtures.yml)"
-    command: "python3 -m venv venv && venv/bin/pip install -q -r scripts/requirements.txt && venv/bin/python scripts/validate-fixtures.py"
+    description: Fixture files validate against the schema and the cross-file rules (CI validate-fixtures.yml)
+    command: python3 -m venv venv && venv/bin/pip install -q -r scripts/requirements.txt && venv/bin/python scripts/validate-fixtures.py
     critical: true
     timeout: 300
-    test_count: "(\\d+) fixture files checked"
+    test_count: (\d+) fixture files checked
 
   schemas-well-formed:
-    description: "Both JSON Schemas are valid Draft 2020-12 schemas (report.schema.json is otherwise unchecked)"
-    command: "python3 -m venv venv && venv/bin/pip install -q -r scripts/requirements.txt && venv/bin/python -c \"import json,sys; from jsonschema import Draft202012Validator as V; [V.check_schema(json.load(open(p))) for p in sys.argv[1:]]\" schema/fixture.schema.json schema/report.schema.json"
+    description: Both JSON Schemas are valid Draft 2020-12 schemas (report.schema.json is otherwise unchecked)
+    command: python3 -m venv venv && venv/bin/pip install -q -r scripts/requirements.txt && venv/bin/python -c "import json,sys; from jsonschema import Draft202012Validator as V; [V.check_schema(json.load(open(p))) for p in sys.argv[1:]]" schema/fixture.schema.json schema/report.schema.json
     critical: true
     timeout: 300
 
   no-private-keys:
-    description: "No private key material is committed under the published directories"
+    description: No private key material is committed under the published directories
     command: "! grep -rl 'PRIVATE KEY' tls discovery schema"
     critical: true
     timeout: 30
 
   expectations-not-bent:
-    description: "No existing expect value was changed to match a client runtime's behaviour; any changed expectation is justified by a spec decision and stated in the change"
+    description: No existing expect value was changed to match a client runtime's behaviour; any changed expectation is justified by a spec decision and stated in the change
     critical: true
 
   version-bump:
@@ -31,9 +31,9 @@ validations:
     critical: false
 
   tls-certs-regenerated:
-    description: "Any added or changed TLS shape has a matching tls/certs/<shape>.pem produced by tls/generate-certs.sh, and removed shapes have their cert removed"
+    description: Any added or changed TLS shape has a matching tls/certs/<shape>.pem produced by tls/generate-certs.sh, and removed shapes have their cert removed
     critical: false
 
   published-layout:
-    description: "New fixture content lives under schema/, discovery/ or tls/ (the only directories release.yml ships), and README Layout is updated for new files"
+    description: New fixture content lives under schema/, discovery/ or tls/ (the only directories release.yml ships), and README Layout is updated for new files
     critical: false

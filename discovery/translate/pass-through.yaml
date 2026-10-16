@@ -1,0 +1,105 @@
+kind: translate
+description: >-
+  pass-through translator, the identity case of FR-2. Every endpoint is returned with its
+  advertised host and port unchanged, from either list, and tlsName is never rewritten (FR-40).
+  An identity translator has an answer for every endpoint, so it never misses.
+rows:
+  - case: ipv4-standard-unchanged
+    because: An IPv4 endpoint from the standard list is returned unchanged.
+    config:
+      translation: { provider: pass-through }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: db1.example.com,
+        host: 10.0.0.1,
+        port: 3000,
+        sourceList: standard,
+      }
+    expect: { host: 10.0.0.1, port: 3000, tlsName: db1.example.com }
+
+  - case: alternate-shared-host-per-node-port
+    because: A shared alternate hostname with a per-node port (Branch B) is returned unchanged.
+    config:
+      translation: { provider: pass-through }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: db1.example.com,
+        host: as.priv.example.com,
+        port: 31002,
+        sourceList: alternate,
+      }
+    expect: { host: as.priv.example.com, port: 31002, tlsName: db1.example.com }
+
+  - case: alternate-host-per-node-default-port
+    because: A distinct alternate hostname per node on the default port (Branch A) is returned unchanged.
+    config:
+      translation: { provider: pass-through }
+    input:
+      {
+        nodeName: BB9030011AC4202,
+        tlsName: db2.example.com,
+        host: node2.priv.example.com,
+        port: 3000,
+        sourceList: alternate,
+      }
+    expect:
+      { host: node2.priv.example.com, port: 3000, tlsName: db2.example.com }
+
+  - case: tls-name-differs-from-host-kept
+    because: A tlsName that differs from the advertised host is kept and never replaced by the host.
+    config:
+      translation: { provider: pass-through }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: cluster.example.com,
+        host: node1.priv.example.com,
+        port: 4333,
+        sourceList: alternate,
+      }
+    expect:
+      { host: node1.priv.example.com, port: 4333, tlsName: cluster.example.com }
+
+  - case: null-tls-name-kept
+    because: A null tlsName stays null.
+    config:
+      translation: { provider: pass-through }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: null,
+        host: 10.0.0.1,
+        port: 3000,
+        sourceList: standard,
+      }
+    expect: { host: 10.0.0.1, port: 3000, tlsName: null }
+
+  - case: ipv6-literal-unchanged
+    because: An IPv6 literal host is returned unchanged.
+    config:
+      translation: { provider: pass-through }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: db1.example.com,
+        host: 2001:db8::10,
+        port: 3000,
+        sourceList: standard,
+      }
+    expect: { host: 2001:db8::10, port: 3000, tlsName: db1.example.com }
+
+  - case: strict-never-misses
+    because: Under strict the endpoint is still returned unchanged, because an identity translator has an answer for every endpoint and never misses.
+    config:
+      translation: { provider: pass-through, on_miss: strict }
+    input:
+      {
+        nodeName: BB9030011AC4202,
+        tlsName: db2.example.com,
+        host: 10.0.0.2,
+        port: 3000,
+        sourceList: standard,
+      }
+    expect: { host: 10.0.0.2, port: 3000, tlsName: db2.example.com }

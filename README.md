@@ -22,7 +22,7 @@ Pushing a `v<VERSION>` tag publishes `aerospike-client-conformance-<VERSION>.zip
 
 ## Layout
 
-```
+```text
 VERSION
 schema/fixture.schema.json        every fixture file validates against this (JSON Schema 2020-12)
 schema/report.schema.json         the report each runtime writes
@@ -53,11 +53,16 @@ Every row has:
 
 Values are strings, integers, booleans, null, lists and maps only.
 
+Config keys are the public configuration surface named by the PRD and the tech spec: `ip_map`,
+`seeds`, `discovery.merge_policy` (`merge` | `replace` | `discovery_only`), `translation.provider`
+(`static-map` | `port-map` | `pass-through`), `translation.on_miss` (`pass_through` | `strict`),
+`translation.static_map` and `translation.port_map`. A row sets `ip_map` or `translation`, never
+both.
+
 - **translate**: `input` is the advertised endpoint (`nodeName`, `tlsName`, `host`, `port`,
   `sourceList` = `standard` | `alternate`). `expect` is the endpoint to connect to (`host`,
   `port`, `tlsName`), or `error`. `tlsName` is in every input and every expected endpoint, so
-  every row checks that translation never changes it. An optional `diagnostic` means the
-  runtime must surface the miss (log or event) while still returning the endpoint.
+  every row checks that translation never changes it.
 - **merge**: `config.seeds` are the static seeds, `input.discoveryResults` are applied in order
   (the first at client initialization, each later one as a refresh) and `expect.snapshots[i]` is
   the exact seed list after result `i`. Seeds compare by host and port.
@@ -106,16 +111,15 @@ reason.
 
 ## Unnamed config keys
 
-These keys are not final. They are used consistently here and may be renamed:
+The tech spec defines `translation.port_map` as "Keys are host:port and node name. Values are
+host:port." It does not state the grammar below, which the fixtures use until the spec owner
+ratifies or replaces it:
 
-| Key                                                                  | Fixtures               | Meaning                                                                            |
-| -------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------- |
-| `legacyHostMap`                                                      | legacy-ip-map, on-miss | The pre-existing client host-to-host map, applied when no translator is configured |
-| `translation.staticMap`                                              | static-map, on-miss    | `static-map` entries: advertised host to host                                      |
-| `translation.portMap`                                                | port-map, on-miss      | `port-map` entries, a list of `{match, target}`                                    |
-| `translation.portMap[].match.host`, `.match.port`, `.match.nodeName` | port-map, on-miss      | Entry key: `(host, port)` or `nodeName`                                            |
-| `translation.portMap[].target.host`, `.target.port`                  | port-map, on-miss      | Endpoint to connect to on a hit                                                    |
-| `seeds` (`host`, `port`)                                             | merge-policy           | The static seed list                                                               |
+| `translation.port_map` | Fixtures          | Rule                                                                                                                              |
+| ---------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Key                    | port-map, on-miss | A key containing `:` outside brackets, or a bracketed key, is `host:port`; any other key is a node name (hex, never contains `:`) |
+| Value                  | port-map, on-miss | Always `host:port`                                                                                                                |
+| IPv6 host              | port-map, on-miss | Written in brackets, in keys and values: `[2001:db8::10]:3000`                                                                    |
 
 ## Contributing
 
