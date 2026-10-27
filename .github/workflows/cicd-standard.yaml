@@ -54,6 +54,11 @@ jobs:
     if: false
     runs-on: ubuntu-latest
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
       - run: true
 # -------- REPLACE THE ABOVE WITH THE PIPELINE BELOW TO ENABLE --------
 #
