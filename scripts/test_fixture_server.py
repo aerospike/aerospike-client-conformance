@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests for discovery/providers/fixture-server.py, run against the server as a separate process."""
+import http.client
 import ipaddress
 import json
 import socket
@@ -7,9 +8,7 @@ import struct
 import subprocess
 import sys
 import unittest
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 SERVER = Path(__file__).resolve().parent.parent / "discovery/providers/fixture-server.py"
@@ -65,7 +64,6 @@ class FixtureServerTest(unittest.TestCase):
     def setUpClass(cls):
         cls.process = subprocess.Popen([sys.executable, str(SERVER)], stdout=subprocess.PIPE, text=True)
         cls.ports = json.loads(cls.process.stdout.readline())
-        cls.base = f"http://127.0.0.1:{cls.ports['http']}"
 
     @classmethod
     def tearDownClass(cls):
@@ -75,9 +73,17 @@ class FixtureServerTest(unittest.TestCase):
 
     def select(self, refresh, region=None):
         body = json.dumps({"refresh": refresh, "region": region}).encode()
-        request = urllib.request.Request(self.base + "/fixture/select", data=body, method="POST")
-        with urllib.request.urlopen(request, timeout=5) as response:
-            self.assertEqual(200, response.status)
+        status, _ = self.post("/fixture/select", body)
+        self.assertEqual(200, status)
+
+    def post(self, path, body, headers=None, timeout=5):
+        connection = http.client.HTTPConnection("127.0.0.1", self.ports["http"], timeout=timeout)
+        try:
+            connection.request("POST", path, body, headers or {})
+            response = connection.getresponse()
+            return response.status, response.read().decode()
+        finally:
+            connection.close()
 
     def udp(self, name, qtype, timeout=2):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -98,12 +104,7 @@ class FixtureServerTest(unittest.TestCase):
     def ec2(self, params, authorization=AUTH, timeout=5):
         body = urllib.parse.urlencode(params).encode()
         headers = {"Authorization": authorization, "X-Amz-Date": "20261028T000000Z"}
-        request = urllib.request.Request(self.base + "/", data=body, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.status, response.read().decode()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read().decode()
+        return self.post("/", body, headers, timeout)
 
     def test_a_and_aaaa_answers(self):
         self.select({"records": [
@@ -203,10 +204,8 @@ class FixtureServerTest(unittest.TestCase):
         self.select(self.instances(), "us-east-1")
 
     def test_select_rejects_a_refresh_that_is_not_an_object(self):
-        request = urllib.request.Request(self.base + "/fixture/select", data=b'{"refresh": 3}', method="POST")
-        with self.assertRaises(urllib.error.HTTPError) as e:
-            urllib.request.urlopen(request, timeout=5)
-        self.assertEqual(400, e.exception.code)
+        status, _ = self.post("/fixture/select", b'{"refresh": 3}')
+        self.assertEqual(400, status)
 
 
 if __name__ == "__main__":

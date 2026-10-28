@@ -2,6 +2,7 @@
 """Serve dns and aws-tags fixture refreshes to a runner. See README.md, Provider fixtures."""
 
 import argparse
+import html
 import ipaddress
 import json
 import re
@@ -10,13 +11,16 @@ import struct
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from xml.sax.saxutils import escape
 
 TYPE_A, TYPE_AAAA, TYPE_SRV = 1, 28, 33
 TYPES = {"A": TYPE_A, "AAAA": TYPE_AAAA, "SRV": TYPE_SRV}
 RCODE_SERVFAIL, RCODE_NXDOMAIN = 2, 3
 EC2_VERSION = "2016-11-15"
 UNANSWERED_HOLD = 60
+
+
+def escape(text):
+    return html.escape(text, quote=False)
 
 
 class State:
