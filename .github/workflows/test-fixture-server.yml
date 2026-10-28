@@ -1,0 +1,34 @@
+name: Test fixture server
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - discovery/providers/fixture-server.py
+      - scripts/test_fixture_server.py
+      - .github/workflows/test-fixture-server.yml
+  push:
+    branches: [main]
+    paths:
+      - discovery/providers/fixture-server.py
+      - scripts/test_fixture_server.py
+      - .github/workflows/test-fixture-server.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Test the fixture server
+        run: python3 scripts/test_fixture_server.py -v

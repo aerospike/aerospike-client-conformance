@@ -49,6 +49,47 @@ def cert_names(path):
     return cn, san
 
 
+def host_key(host):
+    return (host["host"], host["port"], host.get("tlsName"))
+
+
+def check_provider_row(row):
+    errors = []
+    refreshes = row["input"]["refreshes"]
+    expected = row["expect"]["refreshes"]
+    if len(expected) != len(refreshes):
+        errors.append("expect.refreshes count differs from input.refreshes count")
+        return errors
+    if "error" in expected[0]:
+        errors.append("refresh 0 runs at client initialization and must return hosts")
+    options = row["config"]["discovery"].get("dns") or row["config"]["discovery"].get("aws")
+    if any(r.get("unanswered") for r in refreshes) and "timeout_ms" not in options:
+        errors.append("a row with an unanswered refresh must set timeout_ms")
+    previous = []
+    for i, step in enumerate(expected):
+        seeds = sorted(map(host_key, step["seeds"]))
+        if "error" in step or (i > 0 and not step["hosts"]):
+            if seeds != previous:
+                errors.append(f"refresh {i}: seeds must be the previous seeds when the refresh returns no host")
+        elif seeds != sorted(map(host_key, step["hosts"])):
+            errors.append(f"refresh {i}: seeds must equal hosts")
+        previous = seeds
+    for i, refresh in enumerate(refreshes):
+        for record in refresh.get("records", []):
+            if record["type"] in ("A", "AAAA"):
+                try:
+                    address = ipaddress.ip_address(record["address"])
+                except ValueError:
+                    errors.append(f"refresh {i}: {record['name']}: {record['address']} is not an IP address")
+                    continue
+                if (address.version == 4) != (record["type"] == "A"):
+                    errors.append(f"refresh {i}: {record['name']}: {record['address']} is not a {record['type']} address")
+        ids = [instance["id"] for instance in refresh.get("instances", [])]
+        if len(ids) != len(set(ids)):
+            errors.append(f"refresh {i}: duplicate instance id")
+    return errors
+
+
 def check_file(path, validator):
     errors = []
     doc = yaml.safe_load(path.read_text())
@@ -76,6 +117,11 @@ def check_file(path, validator):
         for row in doc["rows"]:
             if "expect" in row and len(row["expect"]["snapshots"]) != len(row["input"]["discoveryResults"]):
                 errors.append(f"{row['case']}: snapshot count differs from discoveryResults count")
+
+    if doc["kind"] in ("dns", "aws-tags"):
+        for row in doc["rows"]:
+            if "expect" in row:
+                errors += [f"{row['case']}: {error}" for error in check_provider_row(row)]
 
     if doc["kind"] == "tls":
         shapes = doc["shapes"]

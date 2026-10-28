@@ -1,0 +1,299 @@
+kind: dns
+description: >-
+  The dns seed provider. input.refreshes[i] is what the DNS server answers on refresh i, the first
+  at client initialization and each later one a periodic refresh. expect.refreshes[i] is what the
+  provider returns on that refresh (hosts) or how it fails (error), and the seed list in effect after
+  it (seeds). Hosts and seeds compare by host, port and tlsName, in any order.
+rows:
+  - case: a-records
+    because: Each A address of the name is a seed host, with the configured port.
+    config:
+      discovery:
+        provider: dns
+        dns: { names: [seeds.dns.test], record_type: a, port: 3100 }
+    input:
+      refreshes:
+        - records:
+            - { name: seeds.dns.test, type: A, address: 192.0.2.11 }
+            - { name: seeds.dns.test, type: A, address: 192.0.2.12 }
+    expect:
+      refreshes:
+        - hosts:
+            [{ host: 192.0.2.11, port: 3100 }, { host: 192.0.2.12, port: 3100 }]
+          seeds:
+            [{ host: 192.0.2.11, port: 3100 }, { host: 192.0.2.12, port: 3100 }]
+
+  - case: aaaa-records
+    because: record_type a covers AAAA, and each AAAA address is a seed host.
+    config:
+      discovery:
+        provider: dns
+        dns: { names: [seeds.dns.test], record_type: a, port: 3000 }
+    input:
+      refreshes:
+        - records:
+            - { name: seeds.dns.test, type: AAAA, address: 2001:db8::11 }
+    expect:
+      refreshes:
+        - hosts: [{ host: 2001:db8::11, port: 3000 }]
+          seeds: [{ host: 2001:db8::11, port: 3000 }]
+
+  - case: a-and-aaaa-records
+    because: A name with both A and AAAA records yields one host per address.
+    config:
+      discovery:
+        provider: dns
+        dns: { names: [seeds.dns.test], record_type: a, port: 3000 }
+    input:
+      refreshes:
+        - records:
+            - { name: seeds.dns.test, type: A, address: 192.0.2.11 }
+            - { name: seeds.dns.test, type: AAAA, address: 2001:db8::11 }
+    expect:
+      refreshes:
+        - hosts:
+            [
+              { host: 192.0.2.11, port: 3000 },
+              { host: 2001:db8::11, port: 3000 },
+            ]
+          seeds:
+            [
+              { host: 192.0.2.11, port: 3000 },
+              { host: 2001:db8::11, port: 3000 },
+            ]
+
+  - case: duplicate-addresses-once
+    because: Two names that resolve to the same address yield that host once.
+    config:
+      discovery:
+        provider: dns
+        dns: { names: [a.dns.test, b.dns.test], record_type: a, port: 3000 }
+    input:
+      refreshes:
+        - records:
+            - { name: a.dns.test, type: A, address: 192.0.2.11 }
+            - { name: b.dns.test, type: A, address: 192.0.2.11 }
+            - { name: b.dns.test, type: A, address: 192.0.2.12 }
+    expect:
+      refreshes:
+        - hosts:
+            [{ host: 192.0.2.11, port: 3000 }, { host: 192.0.2.12, port: 3000 }]
+          seeds:
+            [{ host: 192.0.2.11, port: 3000 }, { host: 192.0.2.12, port: 3000 }]
+
+  - case: srv-targets-resolved-to-addresses
+    because: Each SRV target is resolved within the refresh and returned as an address with the record's port, never as a hostname.
+    config:
+      discovery:
+        provider: dns
+        dns: { names: [_aerospike._tcp.dns.test], record_type: srv }
+    input:
+      refreshes:
+        - records:
+            - {
+                name: _aerospike._tcp.dns.test,
+                type: SRV,
+                priority: 10,
+                weight: 10,
+                port: 3101,
+                target: node-a.dns.test,
+              }
+            - {
+                name: _aerospike._tcp.dns.test,
+                type: SRV,
+                priority: 10,
+                weight: 10,
+                port: 3102,
+                target: node-b.dns.test,
+              }
+            - { name: node-a.dns.test, type: A, address: 192.0.2.21 }
+            - { name: node-b.dns.test, type: A, address: 192.0.2.22 }
+    expect:
+      refreshes:
+        - hosts:
+            [{ host: 192.0.2.21, port: 3101 }, { host: 192.0.2.22, port: 3102 }]
+          seeds:
+            [{ host: 192.0.2.21, port: 3101 }, { host: 192.0.2.22, port: 3102 }]
+
+  - case: srv-target-with-only-aaaa
+    because: An SRV target with no A record resolves through its AAAA record.
+    config:
+      discovery:
+        provider: dns
+        dns: { names: [_aerospike._tcp.dns.test], record_type: srv }
+    input:
+      refreshes:
+        - records:
+            - {
+                name: _aerospike._tcp.dns.test,
+                type: SRV,
+                priority: 10,
+                weight: 10,
+                port: 3101,
+                target: node-a.dns.test,
+              }
+            - { name: node-a.dns.test, type: AAAA, address: 2001:db8::21 }
+    expect:
+      refreshes:
+        - hosts: [{ host: 2001:db8::21, port: 3101 }]
+          seeds: [{ host: 2001:db8::21, port: 3101 }]
+
+  - case: srv-unresolved-target-dropped
+    because: An SRV target that does not resolve is dropped, so no hostname is ever returned as a seed.
+    config:
+      discovery:
+        provider: dns
+        dns: { names: [_aerospike._tcp.dns.test], record_type: srv }
+    input:
+      refreshes:
+        - records:
+            - {
+                name: _aerospike._tcp.dns.test,
+                type: SRV,
+                priority: 10,
+                weight: 10,
+                port: 3101,
+                target: node-a.dns.test,
+              }
+            - {
+                name: _aerospike._tcp.dns.test,
+                type: SRV,
+                priority: 10,
+                weight: 10,
+                port: 3102,
+                target: gone.dns.test,
+              }
+            - { name: node-a.dns.test, type: A, address: 192.0.2.21 }
+    expect:
+      refreshes:
+        - hosts: [{ host: 192.0.2.21, port: 3101 }]
+          seeds: [{ host: 192.0.2.21, port: 3101 }]
+
+  - case: record-change-reaches-seeds
+    because: A changed record is returned by the next refresh and replaces the seed list.
+    config:
+      discovery:
+        provider: dns
+        dns: { names: [_change._tcp.dns.test], record_type: srv }
+    input:
+      refreshes:
+        - records:
+            - {
+                name: _change._tcp.dns.test,
+                type: SRV,
+                priority: 10,
+                weight: 10,
+                port: 3101,
+                target: node-a.dns.test,
+              }
+            - {
+                name: _change._tcp.dns.test,
+                type: SRV,
+                priority: 10,
+                weight: 10,
+                port: 3102,
+                target: node-b.dns.test,
+              }
+            - { name: node-a.dns.test, type: A, address: 192.0.2.21 }
+            - { name: node-b.dns.test, type: A, address: 192.0.2.22 }
+        - records:
+            - {
+                name: _change._tcp.dns.test,
+                type: SRV,
+                priority: 10,
+                weight: 10,
+                port: 3103,
+                target: node-c.dns.test,
+              }
+            - { name: node-c.dns.test, type: A, address: 192.0.2.23 }
+    expect:
+      refreshes:
+        - hosts:
+            [{ host: 192.0.2.21, port: 3101 }, { host: 192.0.2.22, port: 3102 }]
+          seeds:
+            [{ host: 192.0.2.21, port: 3101 }, { host: 192.0.2.22, port: 3102 }]
+        - hosts: [{ host: 192.0.2.23, port: 3103 }]
+          seeds: [{ host: 192.0.2.23, port: 3103 }]
+
+  - case: some-names-resolve
+    because: When some names fail, the hosts of the names that resolve are returned.
+    config:
+      discovery:
+        provider: dns
+        dns:
+          {
+            names: [seeds.dns.test, missing.dns.test],
+            record_type: a,
+            port: 3000,
+          }
+    input:
+      refreshes:
+        - records:
+            - { name: seeds.dns.test, type: A, address: 192.0.2.11 }
+    expect:
+      refreshes:
+        - hosts: [{ host: 192.0.2.11, port: 3000 }]
+          seeds: [{ host: 192.0.2.11, port: 3000 }]
+
+  - case: nxdomain-keeps-previous-seeds
+    because: When every name is NXDOMAIN the refresh fails, names the failing name, and the previous seed list is kept.
+    config:
+      discovery:
+        provider: dns
+        dns: { names: [seeds.dns.test], record_type: a, port: 3000 }
+    input:
+      refreshes:
+        - records:
+            - { name: seeds.dns.test, type: A, address: 192.0.2.11 }
+        - records: []
+    expect:
+      refreshes:
+        - hosts: [{ host: 192.0.2.11, port: 3000 }]
+          seeds: [{ host: 192.0.2.11, port: 3000 }]
+        - error:
+            { category: discovery-failed, messageContains: [seeds.dns.test] }
+          seeds: [{ host: 192.0.2.11, port: 3000 }]
+
+  - case: servfail-keeps-previous-seeds
+    because: When the server answers SERVFAIL for every name the refresh fails and the previous seed list is kept.
+    config:
+      discovery:
+        provider: dns
+        dns: { names: [seeds.dns.test], record_type: a, port: 3000 }
+    input:
+      refreshes:
+        - records:
+            - { name: seeds.dns.test, type: A, address: 192.0.2.11 }
+        - rcode: SERVFAIL
+    expect:
+      refreshes:
+        - hosts: [{ host: 192.0.2.11, port: 3000 }]
+          seeds: [{ host: 192.0.2.11, port: 3000 }]
+        - error:
+            { category: discovery-failed, messageContains: [seeds.dns.test] }
+          seeds: [{ host: 192.0.2.11, port: 3000 }]
+
+  - case: unanswered-keeps-previous-seeds
+    because: When the server does not answer, the refresh fails within its timeout and the previous seed list is kept.
+    config:
+      discovery:
+        provider: dns
+        dns:
+          {
+            names: [seeds.dns.test],
+            record_type: a,
+            port: 3000,
+            timeout_ms: 200,
+          }
+    input:
+      refreshes:
+        - records:
+            - { name: seeds.dns.test, type: A, address: 192.0.2.11 }
+        - unanswered: true
+    expect:
+      refreshes:
+        - hosts: [{ host: 192.0.2.11, port: 3000 }]
+          seeds: [{ host: 192.0.2.11, port: 3000 }]
+        - error:
+            { category: discovery-failed, messageContains: [seeds.dns.test] }
+          seeds: [{ host: 192.0.2.11, port: 3000 }]
