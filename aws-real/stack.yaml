@@ -100,13 +100,33 @@ Resources:
         - Key: aws-tags-real-run
           Value: !Ref AWS::StackName
 
-  ClusterIngress:
+  ClusterServiceIngress:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
       GroupId: !Ref ClusterSecurityGroup
-      Description: Aerospike service, fabric and heartbeat from inside the group
+      Description: Aerospike service from inside the group
       IpProtocol: tcp
       FromPort: 3000
+      ToPort: 3000
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+
+  ClusterFabricIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecurityGroup
+      Description: Aerospike fabric from inside the group
+      IpProtocol: tcp
+      FromPort: 3001
+      ToPort: 3001
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+
+  ClusterHeartbeatIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecurityGroup
+      Description: Aerospike heartbeat from inside the group
+      IpProtocol: tcp
+      FromPort: 3002
       ToPort: 3002
       SourceSecurityGroupId: !Ref ClusterSecurityGroup
 
@@ -284,6 +304,7 @@ Resources:
     DependsOn: DefaultRoute
     Properties:
       ImageId: !Ref AmiId
+      Monitoring: true
       InstanceType: t3.small
       SubnetId: !Ref Subnet
       PrivateIpAddress: 10.71.1.11
@@ -306,6 +327,7 @@ Resources:
     DependsOn: DefaultRoute
     Properties:
       ImageId: !Ref AmiId
+      Monitoring: true
       InstanceType: t3.small
       SubnetId: !Ref Subnet
       PrivateIpAddress: 10.71.1.12
@@ -328,6 +350,7 @@ Resources:
     DependsOn: DefaultRoute
     Properties:
       ImageId: !Ref AmiId
+      Monitoring: true
       InstanceType: t3.small
       SubnetId: !Ref Subnet
       PrivateIpAddress: 10.71.1.13
@@ -350,6 +373,7 @@ Resources:
     DependsOn: DefaultRoute
     Properties:
       ImageId: !Ref AmiId
+      Monitoring: true
       InstanceType: t3.micro
       SubnetId: !Ref Subnet
       PrivateIpAddress: 10.71.1.21
@@ -370,6 +394,7 @@ Resources:
     DependsOn: DefaultRoute
     Properties:
       ImageId: !Ref AmiId
+      Monitoring: true
       InstanceType: t3.micro
       SubnetId: !Ref Subnet
       PrivateIpAddress: 10.71.1.22
@@ -392,6 +417,7 @@ Resources:
     DependsOn: DefaultRoute
     Properties:
       ImageId: !Ref AmiId
+      Monitoring: true
       InstanceType: t3.small
       SubnetId: !Ref Subnet
       PrivateIpAddress: 10.71.1.30
