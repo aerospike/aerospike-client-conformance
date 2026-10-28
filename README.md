@@ -9,7 +9,7 @@ Expected values are never adjusted to match a runtime.
 
 ## Versioning
 
-`VERSION` is the fixture set version, one for the whole repository. Clients pin a release and
+`VERSION` is the fixture set version, one for the whole repository. Clients pin a `v<VERSION>` tag and
 upgrade with a deliberate change that also updates their declarations. Every report records the
 fixture set version it ran.
 
@@ -17,8 +17,17 @@ fixture set version it ran.
 - minor: new rows, new files or new optional keys
 - major: a changed expectation, a removed or renamed row, or an incompatible schema change
 
-Pushing a `v<VERSION>` tag publishes `aerospike-client-conformance-<VERSION>.zip` to JFrog
-(`database-generic-dev-local`); client CI downloads that release rather than reading this repository.
+The repository is public, so client CI checks it out at a pinned tag or commit with `actions/checkout`
+and passes that directory to its runner; nothing is published elsewhere. A `v<VERSION>` tag must match
+`VERSION` at that commit, and `release.yml` checks that and the fixtures when the tag is pushed.
+
+```yaml
+- uses: actions/checkout@<sha>
+  with:
+    repository: aerospike/aerospike-client-conformance
+    ref: v1.1.0
+    path: conformance
+```
 
 ## Layout
 
