@@ -1,0 +1,434 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  aws-tags seed discovery against real AWS for any client: three community Aerospike nodes tagged
+  aerospike-cluster=<stack name>, an untagged and a to-be-stopped tagged instance, and a runner whose
+  instance profile allows only ec2:DescribeInstances. Created and deleted by run.sh.
+
+Parameters:
+  OperatorCidr:
+    Type: String
+    Description: The operator's current public IP as a /32, the only SSH source for the runner.
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/32$'
+  PermissionsBoundaryArn:
+    Type: String
+    Description: Permissions boundary set on both roles.
+    AllowedPattern: "^arn:aws[a-z-]*:iam::[0-9]{12}:policy/.+$"
+  CreatorArn:
+    Type: String
+    Description: IAM ARN of the principal creating the stack, the only principal allowed to assume the no-policy role.
+    AllowedPattern: "^arn:aws[a-z-]*:iam::[0-9]{12}:(role|user)/.+$"
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  AerospikeImage:
+    Type: String
+    Default: aerospike/aerospike-server:8.2.0.1
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.71.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.71.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aerospike service, fabric and heartbeat ports, open only inside this group
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-cluster"
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  ClusterIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecurityGroup
+      Description: Aerospike service, fabric and heartbeat from inside the group
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3002
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+
+  RunnerSshSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSH to the runner from the operator only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: SSH from the operator
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref OperatorCidr
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-runner-ssh"
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  RunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: aws-tags runner instance profile, the minimum policy only
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: aws-tags-describe-instances
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+      Tags:
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  RunnerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref RunnerRole
+
+  DeniedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: aws-tags refusal check, no policy
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref CreatorArn
+            Action: sts:AssumeRole
+      Tags:
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+            IP=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+            dnf install -y docker
+            systemctl enable --now docker
+            mkdir -p /opt/aerospike/etc
+            cat > /opt/aerospike/etc/aerospike.conf <<EOF
+            service {
+                cluster-name ${AWS::StackName}
+            }
+            logging {
+                console {
+                    context any info
+                }
+            }
+            network {
+                service {
+                    address any
+                    port 3000
+                    access-address $IP
+                }
+                heartbeat {
+                    mode mesh
+                    address $IP
+                    port 3002
+                    mesh-seed-address-port 10.71.1.11 3002
+                    mesh-seed-address-port 10.71.1.12 3002
+                    mesh-seed-address-port 10.71.1.13 3002
+                    interval 150
+                    timeout 10
+                }
+                fabric {
+                    port 3001
+                }
+            }
+            namespace test {
+                replication-factor 2
+                storage-engine memory {
+                    data-size 1G
+                }
+            }
+            EOF
+            docker run -d --name aerospike --net host --restart unless-stopped --ulimit nofile=65536:65536 \
+              -v /opt/aerospike/etc:/opt/aerospike/etc ${AerospikeImage} --config-file /opt/aerospike/etc/aerospike.conf
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: aws-tags-real-run
+              Value: !Ref AWS::StackName
+
+  RunnerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 16
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            set -euxo pipefail
+            echo 'AcceptEnv AWS_REAL_DENIED_ACCESS_KEY_ID AWS_REAL_DENIED_SECRET_ACCESS_KEY AWS_REAL_DENIED_SESSION_TOKEN' \
+              > /etc/ssh/sshd_config.d/50-aws-tags-real.conf
+            systemctl reload sshd
+            fallocate -l 2G /swapfile
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            dnf install -y git python3 jq
+            touch /var/tmp/aws-tags-real-ready
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: aws-tags-real-run
+              Value: !Ref AWS::StackName
+
+  ExtraLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: aws-tags-real-run
+              Value: !Ref AWS::StackName
+
+  Node1:
+    Type: AWS::EC2::Instance
+    DependsOn: DefaultRoute
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: t3.small
+      SubnetId: !Ref Subnet
+      PrivateIpAddress: 10.71.1.11
+      SecurityGroupIds:
+        - !Ref ClusterSecurityGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      PropagateTagsToVolumeOnCreation: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-node1"
+        - Key: aerospike-cluster
+          Value: !Ref AWS::StackName
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  Node2:
+    Type: AWS::EC2::Instance
+    DependsOn: DefaultRoute
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: t3.small
+      SubnetId: !Ref Subnet
+      PrivateIpAddress: 10.71.1.12
+      SecurityGroupIds:
+        - !Ref ClusterSecurityGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      PropagateTagsToVolumeOnCreation: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-node2"
+        - Key: aerospike-cluster
+          Value: !Ref AWS::StackName
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  Node3:
+    Type: AWS::EC2::Instance
+    DependsOn: DefaultRoute
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: t3.small
+      SubnetId: !Ref Subnet
+      PrivateIpAddress: 10.71.1.13
+      SecurityGroupIds:
+        - !Ref ClusterSecurityGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      PropagateTagsToVolumeOnCreation: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-node3"
+        - Key: aerospike-cluster
+          Value: !Ref AWS::StackName
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  UntaggedInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: DefaultRoute
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref Subnet
+      PrivateIpAddress: 10.71.1.21
+      SecurityGroupIds:
+        - !Ref ClusterSecurityGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ExtraLaunchTemplate
+        Version: !GetAtt ExtraLaunchTemplate.LatestVersionNumber
+      PropagateTagsToVolumeOnCreation: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-untagged"
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  StoppedInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: DefaultRoute
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref Subnet
+      PrivateIpAddress: 10.71.1.22
+      SecurityGroupIds:
+        - !Ref ClusterSecurityGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ExtraLaunchTemplate
+        Version: !GetAtt ExtraLaunchTemplate.LatestVersionNumber
+      PropagateTagsToVolumeOnCreation: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-stopped"
+        - Key: aerospike-cluster
+          Value: !Ref AWS::StackName
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+  Runner:
+    Type: AWS::EC2::Instance
+    DependsOn: DefaultRoute
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: t3.small
+      SubnetId: !Ref Subnet
+      PrivateIpAddress: 10.71.1.30
+      IamInstanceProfile: !Ref RunnerInstanceProfile
+      SecurityGroupIds:
+        - !Ref ClusterSecurityGroup
+        - !Ref RunnerSshSecurityGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref RunnerLaunchTemplate
+        Version: !GetAtt RunnerLaunchTemplate.LatestVersionNumber
+      PropagateTagsToVolumeOnCreation: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-runner"
+        - Key: aws-tags-real-run
+          Value: !Ref AWS::StackName
+
+Outputs:
+  NodeIps:
+    Value:
+      !Join [
+        ",",
+        [
+          !GetAtt Node1.PrivateIp,
+          !GetAtt Node2.PrivateIp,
+          !GetAtt Node3.PrivateIp,
+        ],
+      ]
+  UntaggedInstanceId:
+    Value: !Ref UntaggedInstance
+  StoppedInstanceId:
+    Value: !Ref StoppedInstance
+  RunnerInstanceId:
+    Value: !Ref Runner
+  RunnerPublicIp:
+    Value: !GetAtt Runner.PublicIp
+  RunnerRoleName:
+    Value: !Ref RunnerRole
+  DeniedRoleArn:
+    Value: !GetAtt DeniedRole.Arn

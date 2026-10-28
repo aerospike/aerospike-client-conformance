@@ -32,6 +32,7 @@ tls/name-matching.yaml            certificate name matching (kind: tls)
 tls/certs/<shape>.pem             one certificate per shape in name-matching.yaml (no private keys)
 tls/generate-certs.sh             regenerates tls/certs from the shapes (openssl, yq)
 scripts/validate-fixtures.py      the CI check for every fixture file (see Validation)
+aws-real/                         aws-tags against real AWS for any client (aws-real/README.md); not part of the fixture set
 ```
 
 A file's path from the repository root, for example `tls/name-matching.yaml`, is its name in reports and
