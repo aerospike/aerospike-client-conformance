@@ -46,6 +46,7 @@ tls/generate-certs.sh             regenerates tls/certs from the shapes (openssl
 scripts/validate-fixtures.py      the CI check for every fixture file (see Validation)
 scripts/test_fixture_server.py    tests for the fixture server
 .github/actions/<name>/           actions every client workflow can use; not part of the fixture set
+aws-real/                         aws-tags against real AWS for any client (aws-real/README.md); not part of the fixture set
 ```
 
 A file's path from the repository root, for example `tls/name-matching.yaml`, is its name in reports and
