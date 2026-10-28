@@ -1,0 +1,50 @@
+name: Discovery node server
+description: >
+  Start a background server that starts and stops Aerospike nodes while a discovery test runs.
+  Tests write request files to control-dir and read the ack files back. The server keeps running
+  through the later steps of the job and stops when the job ends.
+
+inputs:
+  control-dir:
+    description: Directory the tests write requests to; created if missing. It must be visible to the tests, for example a bind mount into a client container.
+    required: true
+  network-name:
+    description: Docker network of the Aerospike nodes (the network-name output of setup-aerospike-server)
+    required: true
+  parked-container:
+    description: A node setup-aerospike-server created but did not start, named <prefix>-<index>. Each start clones it as <prefix>-<index + 1>, then <index + 2>, and so on.
+    required: true
+  config-container:
+    description: A running node that mounts the config volume; new nodes' configs are copied in through it
+    required: true
+  alternate-host:
+    description: Hostname a start with alternate-port=<port> advertises as alternate-access-address
+    required: false
+    default: ""
+  ready-timeout:
+    description: Seconds to wait for the server to be ready
+    required: false
+    default: "30"
+
+outputs:
+  log-file:
+    description: The server's log, one line per node started or removed
+    value: ${{ steps.start.outputs.log-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Start the discovery node server
+      id: start
+      shell: bash
+      env:
+        CONTROL_DIR: ${{ inputs.control-dir }}
+        NETWORK_NAME: ${{ inputs.network-name }}
+        PARKED_CONTAINER: ${{ inputs.parked-container }}
+        CONFIG_CONTAINER: ${{ inputs.config-container }}
+        ALTERNATE_HOST: ${{ inputs.alternate-host }}
+        READY_TIMEOUT: ${{ inputs.ready-timeout }}
+        LOG_FILE: ${{ runner.temp }}/discovery-node-server.log
+      run: |
+        "$GITHUB_ACTION_PATH/start-server.sh"
+        echo "log-file=$LOG_FILE" >> "$GITHUB_OUTPUT"

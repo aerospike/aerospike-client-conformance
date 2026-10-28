@@ -1,0 +1,184 @@
+name: Discovery L2 topology
+description: >
+  Build the L2 discovery topology for one profile: an Aerospike cluster behind Toxiproxy on a
+  separate client network, the profile's changes to the nodes and proxies, and the discovery node
+  server when the profile adds nodes mid-test. The caller runs its client tests on client-network
+  with env-file.
+
+inputs:
+  profile:
+    description: >-
+      default, reachable, pass-through-names, pass-through-ports, port-map-range, cn-only, low-mtu,
+      port-range or idle-reset
+    required: false
+    default: default
+  subset:
+    description: ce or ee
+    required: true
+  server-edition:
+    description: community or enterprise
+    required: true
+  server-container-repo:
+    description: Aerospike image repository path
+    required: true
+  server-tag:
+    description: Aerospike image tag
+    required: true
+  enable-tls:
+    description: Enable server TLS and TLS proxy listeners
+    required: false
+    default: "false"
+  tls-listen-port-base:
+    description: First TLS proxy listen port. Empty skips TLS proxies.
+    required: false
+    default: ""
+  features-content:
+    description: Enterprise feature-key file contents
+    required: false
+    default: ""
+  oidc-provider:
+    description: JFrog OIDC provider name
+    required: true
+  oidc-audience:
+    description: JFrog OIDC audience
+    required: true
+  control-dir:
+    description: Directory the tests write node requests to, for profiles that add nodes mid-test. The client must see it, for example through a workspace bind mount.
+    required: false
+    default: ${{ github.workspace }}/.discovery-control
+
+outputs:
+  client-network:
+    description: Docker network to run the client on
+    value: ${{ steps.topology.outputs.client-network-name }}
+  env-file:
+    description: KEY=VALUE file of the topology settings for docker run --env-file
+    value: ${{ steps.env.outputs.env-file }}
+  client-hosts:
+    description: Comma-separated host:ip entries the client needs as --add-host; empty when none
+    value: ${{ steps.apply.outputs.client-hosts }}
+  tls-cert-dir:
+    description: Directory with the server CA certificate (ca.crt) when TLS is enabled
+    value: ${{ steps.aerospike.outputs.tls-cert-dir }}
+  node-server-log:
+    description: Log of the discovery node server; empty when the profile adds no nodes
+    value: ${{ steps.env.outputs.node-server-log }}
+
+runs:
+  using: composite
+  steps:
+    - name: Require JFrog OIDC
+      shell: bash
+      env:
+        OIDC_PROVIDER: ${{ inputs.oidc-provider }}
+        OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
+      run: |
+        if [[ -z "$OIDC_PROVIDER" || -z "$OIDC_AUDIENCE" ]]; then
+          echo "::error::oidc-provider and oidc-audience are required to pull the Aerospike image."
+          exit 1
+        fi
+
+    - name: Profile settings
+      id: profile
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+        SUBSET: ${{ inputs.subset }}
+      run: |
+        set -euo pipefail
+        "$GITHUB_ACTION_PATH/profile-settings.sh" "$PROFILE" "$SUBSET" >> "$GITHUB_OUTPUT"
+
+    - name: Setup Aerospike cluster
+      id: aerospike
+      uses: aerospike/shared-workflows/.github/actions/setup-aerospike-server@e64947badd946277316f1a1b59b0851d05f305e7 # main
+      with:
+        server-edition: ${{ inputs.server-edition }}
+        server-container-repo: ${{ inputs.server-container-repo }}
+        server-tag: ${{ inputs.server-tag }}
+        num-nodes: ${{ steps.profile.outputs.num-nodes }}
+        start-nodes: "3"
+        extra-hosts: ${{ steps.profile.outputs.extra-hosts }}
+        network-subnet: ${{ steps.profile.outputs.network-subnet }}
+        container-name-prefix: discovery-as
+        network-name: discovery-aerospike-net
+        publish-ports: "false"
+        startup-timeout: "60"
+        enable-tls: ${{ inputs.enable-tls }}
+        include-tls-name-san: ${{ steps.profile.outputs.include-tls-name-san }}
+        tls-cert-cn: ${{ steps.profile.outputs.tls-cert-cn }}
+        features-content: ${{ inputs.features-content }}
+        oidc-provider: ${{ inputs.oidc-provider }}
+        oidc-audience: ${{ inputs.oidc-audience }}
+
+    - name: Split running and parked nodes
+      id: nodes
+      shell: bash
+      env:
+        CONTAINER_NAMES: ${{ steps.aerospike.outputs.container-names }}
+      run: |
+        set -euo pipefail
+        echo "running=$(cut -d, -f1-3 <<< "$CONTAINER_NAMES")" >> "$GITHUB_OUTPUT"
+        echo "parked=$(cut -s -d, -f4- <<< "$CONTAINER_NAMES")" >> "$GITHUB_OUTPUT"
+
+    - name: Setup discovery topology
+      id: topology
+      uses: aerospike/shared-workflows/.github/actions/setup-discovery-topology@308f37e0cd5c7a6386a99ea7afc379d5a4ea9256 # v5.1.0
+      with:
+        container-names: ${{ steps.nodes.outputs.running }}
+        aerospike-network-name: ${{ steps.aerospike.outputs.network-name }}
+        tls-listen-port-base: ${{ inputs.tls-listen-port-base }}
+        client-network-mtu: ${{ steps.profile.outputs.client-network-mtu }}
+        proxy-sysctls: ${{ steps.profile.outputs.proxy-sysctls }}
+
+    - name: Apply profile
+      id: apply
+      if: ${{ contains(fromJSON('["reachable", "pass-through-names", "pass-through-ports", "port-map-range", "low-mtu"]'), inputs.profile) }}
+      shell: bash
+      env:
+        L2_PROFILE: ${{ inputs.profile }}
+        AEROSPIKE_CONTAINER_NAMES: ${{ steps.nodes.outputs.running }}
+        AEROSPIKE_NETWORK: ${{ steps.aerospike.outputs.network-name }}
+        DISCOVERY_PROXY_MAP: ${{ steps.topology.outputs.proxy-name-port-map }}
+        CLIENT_NETWORK: ${{ steps.topology.outputs.client-network-name }}
+        TOXIPROXY_HOST: ${{ steps.topology.outputs.toxiproxy-container-name }}
+        TOXIPROXY_URL: ${{ steps.topology.outputs.toxiproxy-url }}
+      run: '"$GITHUB_ACTION_PATH/apply-profile.sh"'
+
+    - name: Start the discovery node server
+      if: ${{ steps.profile.outputs.control == 'true' }}
+      shell: bash
+      env:
+        CONTROL_DIR: ${{ inputs.control-dir }}
+        NETWORK_NAME: ${{ steps.aerospike.outputs.network-name }}
+        PARKED_CONTAINER: ${{ steps.nodes.outputs.parked }}
+        CONFIG_CONTAINER: discovery-as-1
+        ALTERNATE_HOST: ${{ steps.profile.outputs.alternate-host }}
+        LOG_FILE: ${{ runner.temp }}/discovery-node-server.log
+      run: '"$GITHUB_ACTION_PATH/../discovery-node-server/start-server.sh"'
+
+    - name: Write the client environment
+      id: env
+      shell: bash
+      env:
+        CONTROL: ${{ steps.profile.outputs.control }}
+        CONTROL_DIR: ${{ inputs.control-dir }}
+        NODE_SERVER_LOG: ${{ runner.temp }}/discovery-node-server.log
+        L2_PROFILE: ${{ inputs.profile }}
+        DISCOVERY_SUBSET: ${{ inputs.subset }}
+        DISCOVERY_ENDPOINT_HOSTNAME: ${{ steps.topology.outputs.endpoint-hostname }}
+        DISCOVERY_ENDPOINT_PORT_BASE: ${{ steps.topology.outputs.listen-port-base }}
+        DISCOVERY_ENDPOINT_PORTS: ${{ steps.topology.outputs.endpoint-ports }}
+        DISCOVERY_TLS_ENDPOINT_PORTS: ${{ steps.topology.outputs.tls-endpoint-ports }}
+        DISCOVERY_PROXY_MAP: ${{ steps.topology.outputs.proxy-name-port-map }}
+        TOXIPROXY_URL: ${{ steps.topology.outputs.toxiproxy-url }}
+        TOXIPROXY_HOST: ${{ steps.topology.outputs.toxiproxy-container-name }}
+        AEROSPIKE_CONTAINER_NAMES: ${{ steps.nodes.outputs.running }}
+        DISCOVERY_REACHABLE_NODE: ${{ steps.apply.outputs.reachable-node }}
+        DISCOVERY_PASS_THROUGH_BRANCH: ${{ steps.apply.outputs.pass-through-branch }}
+        DISCOVERY_PORT_MAP_RANGE: ${{ steps.apply.outputs.port-map-range }}
+        DISCOVERY_PORT_MAP_PORT_BASE: ${{ steps.apply.outputs.port-map-port-base }}
+        DISCOVERY_TLS_CERT_SHAPE: ${{ steps.profile.outputs.cert-shape }}
+        DISCOVERY_CLIENT_NETWORK_MTU: ${{ steps.profile.outputs.client-network-mtu }}
+        DISCOVERY_PROXY_PORT_RANGE: ${{ steps.profile.outputs.proxy-port-range }}
+        DISCOVERY_IDLE_RESET: ${{ steps.profile.outputs.idle-reset }}
+      run: '"$GITHUB_ACTION_PATH/write-env.sh"'
