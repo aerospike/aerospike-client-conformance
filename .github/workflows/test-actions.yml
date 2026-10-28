@@ -1,0 +1,35 @@
+name: Test actions
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/actions/**
+      - .github/workflows/test-actions.yml
+  push:
+    branches: [main]
+    paths:
+      - .github/actions/**
+      - .github/workflows/test-actions.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bats:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+
+      - name: Run action tests
+        run: bats .github/actions/*/tests/

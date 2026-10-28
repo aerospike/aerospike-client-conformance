@@ -35,5 +35,5 @@ validations:
     critical: false
 
   published-layout:
-    description: New fixture content lives under schema/, discovery/ or tls/ (the only directories release.yml ships), and README Layout is updated for new files
+    description: New fixture content lives under schema/, discovery/ or tls/ (the directories client runners read), and README Layout is updated for new files
     critical: false
