@@ -1,0 +1,304 @@
+kind: aws-tags
+description: >-
+  The aws-tags seed provider against the EC2 Query API. input.refreshes[i] is what EC2 holds or
+  answers on refresh i, the first at client initialization and each later one a periodic refresh:
+  the account's instances, which the server filters by the request's filters and pages by page_size
+  as EC2 does, an error response, or no answer. expect.refreshes[i] is what the provider returns on
+  that refresh (hosts) or how it fails (error), and the seed list in effect after it (seeds). Hosts
+  and seeds compare by host, port and tlsName, in any order.
+rows:
+  - case: tagged-running-instances
+    because: Running instances that carry the tag are seed hosts; an untagged and a stopped instance are not.
+    config:
+      discovery:
+        provider: aws-tags
+        aws:
+          region: us-east-1
+          filters: [{ name: tag:aerospike-cluster, values: [prod-a] }]
+          port: 3000
+    input:
+      refreshes:
+        - instances:
+            - {
+                id: i-0000000000000001,
+                state: running,
+                private_ip: 10.0.0.1,
+                tags: { aerospike-cluster: prod-a },
+              }
+            - {
+                id: i-0000000000000002,
+                state: running,
+                private_ip: 10.0.0.2,
+                tags: { aerospike-cluster: prod-a },
+              }
+            - {
+                id: i-0000000000000003,
+                state: running,
+                private_ip: 10.0.0.3,
+                tags: { Name: web },
+              }
+            - {
+                id: i-0000000000000004,
+                state: stopped,
+                private_ip: 10.0.0.4,
+                tags: { aerospike-cluster: prod-a },
+              }
+    expect:
+      refreshes:
+        - hosts:
+            [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+          seeds:
+            [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+
+  - case: tag-value-must-match
+    because: An instance with the tag key but another value is not a seed host.
+    config:
+      discovery:
+        provider: aws-tags
+        aws:
+          region: us-east-1
+          filters: [{ name: tag:aerospike-cluster, values: [prod-a] }]
+          port: 3000
+    input:
+      refreshes:
+        - instances:
+            - {
+                id: i-0000000000000001,
+                state: running,
+                private_ip: 10.0.0.1,
+                tags: { aerospike-cluster: prod-a },
+              }
+            - {
+                id: i-0000000000000002,
+                state: running,
+                private_ip: 10.0.0.2,
+                tags: { aerospike-cluster: prod-b },
+              }
+    expect:
+      refreshes:
+        - hosts: [{ host: 10.0.0.1, port: 3000 }]
+          seeds: [{ host: 10.0.0.1, port: 3000 }]
+
+  - case: pagination-follows-next-token
+    because: Every page is read within the refresh by following NextToken.
+    config:
+      discovery:
+        provider: aws-tags
+        aws:
+          region: us-east-1
+          filters: [{ name: tag:aerospike-cluster, values: [prod-a] }]
+          port: 3000
+    input:
+      refreshes:
+        - page_size: 1
+          instances:
+            - {
+                id: i-0000000000000001,
+                state: running,
+                private_ip: 10.0.0.1,
+                tags: { aerospike-cluster: prod-a },
+              }
+            - {
+                id: i-0000000000000002,
+                state: running,
+                private_ip: 10.0.0.2,
+                tags: { aerospike-cluster: prod-a },
+              }
+            - {
+                id: i-0000000000000003,
+                state: running,
+                private_ip: 10.0.0.3,
+                tags: { aerospike-cluster: prod-a },
+              }
+    expect:
+      refreshes:
+        - hosts:
+            [
+              { host: 10.0.0.1, port: 3000 },
+              { host: 10.0.0.2, port: 3000 },
+              { host: 10.0.0.3, port: 3000 },
+            ]
+          seeds:
+            [
+              { host: 10.0.0.1, port: 3000 },
+              { host: 10.0.0.2, port: 3000 },
+              { host: 10.0.0.3, port: 3000 },
+            ]
+
+  - case: added-instance-reaches-seeds
+    because: An instance tagged after the first refresh is returned by the next refresh.
+    config:
+      discovery:
+        provider: aws-tags
+        aws:
+          region: us-east-1
+          filters: [{ name: tag:aerospike-cluster, values: [prod-a] }]
+          port: 3000
+    input:
+      refreshes:
+        - instances:
+            - {
+                id: i-0000000000000001,
+                state: running,
+                private_ip: 10.0.0.1,
+                tags: { aerospike-cluster: prod-a },
+              }
+            - {
+                id: i-0000000000000002,
+                state: running,
+                private_ip: 10.0.0.2,
+                tags: { aerospike-cluster: prod-a },
+              }
+        - instances:
+            - {
+                id: i-0000000000000001,
+                state: running,
+                private_ip: 10.0.0.1,
+                tags: { aerospike-cluster: prod-a },
+              }
+            - {
+                id: i-0000000000000002,
+                state: running,
+                private_ip: 10.0.0.2,
+                tags: { aerospike-cluster: prod-a },
+              }
+            - {
+                id: i-0000000000000003,
+                state: running,
+                private_ip: 10.0.0.3,
+                tags: { aerospike-cluster: prod-a },
+              }
+    expect:
+      refreshes:
+        - hosts:
+            [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+          seeds:
+            [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+        - hosts:
+            [
+              { host: 10.0.0.1, port: 3000 },
+              { host: 10.0.0.2, port: 3000 },
+              { host: 10.0.0.3, port: 3000 },
+            ]
+          seeds:
+            [
+              { host: 10.0.0.1, port: 3000 },
+              { host: 10.0.0.2, port: 3000 },
+              { host: 10.0.0.3, port: 3000 },
+            ]
+
+  - case: public-ip-address-field
+    because: address_field public_ip returns each instance's public address, and an instance without one is skipped.
+    config:
+      discovery:
+        provider: aws-tags
+        aws:
+          region: us-east-1
+          filters: [{ name: tag:aerospike-cluster, values: [prod-a] }]
+          address_field: public_ip
+          port: 3000
+    input:
+      refreshes:
+        - instances:
+            - {
+                id: i-0000000000000001,
+                state: running,
+                private_ip: 10.0.0.1,
+                public_ip: 198.51.100.1,
+                tags: { aerospike-cluster: prod-a },
+              }
+            - {
+                id: i-0000000000000002,
+                state: running,
+                private_ip: 10.0.0.2,
+                tags: { aerospike-cluster: prod-a },
+              }
+    expect:
+      refreshes:
+        - hosts: [{ host: 198.51.100.1, port: 3000 }]
+          seeds: [{ host: 198.51.100.1, port: 3000 }]
+
+  - case: no-instance-matches
+    because: No matching instance is not a failure; the refresh returns no host.
+    config:
+      discovery:
+        provider: aws-tags
+        aws:
+          region: us-east-1
+          filters: [{ name: tag:aerospike-cluster, values: [prod-a] }]
+          port: 3000
+    input:
+      refreshes:
+        - instances:
+            - {
+                id: i-0000000000000003,
+                state: running,
+                private_ip: 10.0.0.3,
+                tags: { Name: web },
+              }
+    expect:
+      refreshes:
+        - hosts: []
+          seeds: []
+
+  - case: unauthorized-keeps-previous-seeds
+    because: A policy without ec2:DescribeInstances fails the refresh with a diagnosable error naming the HTTP status, AWS error code and request id, and the previous seed list is kept.
+    config:
+      discovery:
+        provider: aws-tags
+        aws:
+          region: us-east-1
+          filters: [{ name: tag:aerospike-cluster, values: [prod-a] }]
+          port: 3000
+    input:
+      refreshes:
+        - instances:
+            - {
+                id: i-0000000000000001,
+                state: running,
+                private_ip: 10.0.0.1,
+                tags: { aerospike-cluster: prod-a },
+              }
+        - error:
+            status: 403
+            code: UnauthorizedOperation
+            message: You are not authorized to perform this operation.
+            request_id: ea966190-f9aa-478e-9ede-example
+    expect:
+      refreshes:
+        - hosts: [{ host: 10.0.0.1, port: 3000 }]
+          seeds: [{ host: 10.0.0.1, port: 3000 }]
+        - error:
+            {
+              category: aws-error,
+              messageContains:
+                ["403", UnauthorizedOperation, ea966190-f9aa-478e-9ede-example],
+            }
+          seeds: [{ host: 10.0.0.1, port: 3000 }]
+
+  - case: unanswered-times-out-keeps-previous-seeds
+    because: When EC2 does not answer, the refresh fails within its timeout rather than hanging, and the previous seed list is kept.
+    config:
+      discovery:
+        provider: aws-tags
+        aws:
+          region: us-east-1
+          filters: [{ name: tag:aerospike-cluster, values: [prod-a] }]
+          port: 3000
+          timeout_ms: 200
+    input:
+      refreshes:
+        - instances:
+            - {
+                id: i-0000000000000001,
+                state: running,
+                private_ip: 10.0.0.1,
+                tags: { aerospike-cluster: prod-a },
+              }
+        - unanswered: true
+    expect:
+      refreshes:
+        - hosts: [{ host: 10.0.0.1, port: 3000 }]
+          seeds: [{ host: 10.0.0.1, port: 3000 }]
+        - error: { category: timeout, messageContains: [] }
+          seeds: [{ host: 10.0.0.1, port: 3000 }]
