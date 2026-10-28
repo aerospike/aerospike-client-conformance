@@ -9,15 +9,8 @@ matching. There is no library code here. The only executable code is the Python 
 
 ## Build
 
-There is no build. The release artifact is a zip produced by `.github/workflows/release.yml`:
-
-```sh
-git archive --format=zip --prefix="aerospike-client-conformance-$(cat VERSION)/" \
-  -o "dist/aerospike-client-conformance-$(cat VERSION).zip" HEAD VERSION README.md LICENSE schema discovery tls
-```
-
-Only `VERSION`, `README.md`, `LICENSE`, `schema/`, `discovery/` and `tls/` ship. Anything placed
-elsewhere is not published to client CI.
+There is no build and no published artifact. Client CI checks the repository out at a pinned
+`v<VERSION>` tag or commit and reads the fixtures from `schema/`, `discovery/` and `tls/`.
 
 ## Test
 
@@ -58,8 +51,8 @@ shellcheck, actionlint, checkov, trufflehog, dotenv-linter, git-diff-check. Loca
 - `tls/certs/<shape>.pem`: one self-signed cert per shape, certificate only.
 - `tls/generate-certs.sh`: regenerates all of `tls/certs/` from the shapes (needs `yq`, `openssl`).
 - `scripts/validate-fixtures.py`, `scripts/requirements.txt`: the CI check and its pinned deps.
-- `.github/workflows/`: `validate-fixtures.yml`, `trunk.yml`, `release.yml` (JFrog publish on
-  `v*` tag, dry run on PRs), `pr-hygiene.yml`. `cicd-standard.yaml`/`cicd-composable.yaml` are
+- `.github/workflows/`: `validate-fixtures.yml`, `trunk.yml`, `release.yml` (on a `v*` tag,
+  checks the tag matches `VERSION` and validates the fixtures), `pr-hygiene.yml`. `cicd-standard.yaml`/`cicd-composable.yaml` are
   disabled template leftovers.
 
 ## Conventions
