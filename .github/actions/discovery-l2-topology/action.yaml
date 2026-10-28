@@ -90,8 +90,7 @@ runs:
 
     - name: Setup Aerospike cluster
       id: aerospike
-      # start-nodes and network-subnet are in shared-workflows #385; move to its release once merged.
-      uses: aerospike/shared-workflows/.github/actions/setup-aerospike-server@2fe1a0b022720e8ed30e6335ab3612db2b6565a1
+      uses: aerospike/shared-workflows/.github/actions/setup-aerospike-server@e64947badd946277316f1a1b59b0851d05f305e7 # main
       with:
         server-edition: ${{ inputs.server-edition }}
         server-container-repo: ${{ inputs.server-container-repo }}
