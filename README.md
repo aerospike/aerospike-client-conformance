@@ -49,6 +49,9 @@ scripts/test_fixture_server.py    tests for the fixture server
 aws-real/                         aws-tags against real AWS for any client (aws-real/README.md); not part of the fixture set
 ```
 
+The fixture set is every `*.yaml` under `discovery/` and `tls/`. Runners and tools read fixtures only from
+there; other YAML in the repository, such as `aws-real/stack.yaml`, is not a fixture.
+
 A file's path from the repository root, for example `tls/name-matching.yaml`, is its name in reports and
 declarations.
 
@@ -169,7 +172,10 @@ declaration. Declarations live in each client repository, next to its runner.
 
 Each runtime writes a report conforming to `schema/report.schema.json`: runtime, client
 version, fixture set version, counts per result, and per row the file, case, result and
-reason.
+reason. [`collect-conformance-report`](.github/actions/collect-conformance-report) checks reports
+against the fixture set and the declarations in CI, and
+[`report-skipped-layers`](.github/actions/report-skipped-layers) lists the test layers a run could
+not reach.
 
 ## Unnamed config keys
 
