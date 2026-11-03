@@ -73,21 +73,24 @@ The tests must run on `client-network`: they reach the nodes only through the pr
 
 In `ee`, every profile except `cn-only` uses a SAN-only certificate whose CN is not the tls-name, so only SAN matching can pass.
 
+`reachable`, `pass-through-names` and `pass-through-ports` map their advertised hostnames to `127.0.0.1` in every server with `extra-hosts`, because a released server must resolve its access addresses to start. With `unresolvable-hostnames: "true"` the servers get no such mapping, and once they are up the step fails if any advertised hostname resolves in a running node, naming the hostname and the container. Use it only with a server that advertises hostnames without resolving them. `client-hosts` is the same either way.
+
 ## Inputs
 
-| Name                    | Required | Default                                      | Description                                  |
-| ----------------------- | -------- | -------------------------------------------- | -------------------------------------------- |
-| `profile`               | No       | `default`                                    | One of the profiles above                    |
-| `subset`                | Yes      |                                              | `ce` or `ee`                                 |
-| `server-edition`        | Yes      |                                              | `community` or `enterprise`                  |
-| `server-container-repo` | Yes      |                                              | Aerospike image repository path              |
-| `server-tag`            | Yes      |                                              | Aerospike image tag                          |
-| `enable-tls`            | No       | `"false"`                                    | Server TLS and TLS proxy listeners           |
-| `tls-listen-port-base`  | No       | `""`                                         | First TLS proxy listen port; empty skips TLS |
-| `features-content`      | No       | `""`                                         | Enterprise feature-key file contents         |
-| `oidc-provider`         | Yes      |                                              | JFrog OIDC provider                          |
-| `oidc-audience`         | Yes      |                                              | JFrog OIDC audience                          |
-| `control-dir`           | No       | `${{ github.workspace }}/.discovery-control` | Node request directory                       |
+| Name                     | Required | Default                                      | Description                                                                  |
+| ------------------------ | -------- | -------------------------------------------- | ---------------------------------------------------------------------------- |
+| `profile`                | No       | `default`                                    | One of the profiles above                                                    |
+| `subset`                 | Yes      |                                              | `ce` or `ee`                                                                 |
+| `server-edition`         | Yes      |                                              | `community` or `enterprise`                                                  |
+| `server-container-repo`  | Yes      |                                              | Aerospike image repository path                                              |
+| `server-tag`             | Yes      |                                              | Aerospike image tag                                                          |
+| `enable-tls`             | No       | `"false"`                                    | Server TLS and TLS proxy listeners                                           |
+| `tls-listen-port-base`   | No       | `""`                                         | First TLS proxy listen port; empty skips TLS                                 |
+| `features-content`       | No       | `""`                                         | Enterprise feature-key file contents                                         |
+| `oidc-provider`          | Yes      |                                              | JFrog OIDC provider                                                          |
+| `oidc-audience`          | Yes      |                                              | JFrog OIDC audience                                                          |
+| `unresolvable-hostnames` | No       | `"false"`                                    | `"true"` maps no advertised hostname in the servers and checks none resolves |
+| `control-dir`            | No       | `${{ github.workspace }}/.discovery-control` | Node request directory                                                       |
 
 ## Outputs
 
@@ -132,4 +135,4 @@ In `ee`, every profile except `cn-only` uses a SAN-only certificate whose CN is 
 bats .github/actions/discovery-l2-topology/tests/
 ```
 
-The tests cover the profile settings and the env file. The profile steps themselves need Docker and a cluster, so they run in a client's L2 workflow.
+The tests cover the profile settings, the env file and the hostname check against a stub `docker`. The profile steps themselves need Docker and a cluster, so they run in a client's L2 workflow.

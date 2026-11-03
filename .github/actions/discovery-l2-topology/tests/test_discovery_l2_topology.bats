@@ -29,6 +29,24 @@ setting() {
   [ "$(setting pass-through-ports ce extra-hosts)" = as-pass-through.test:127.0.0.1 ]
 }
 
+@test "the servers map every advertised hostname unless unresolvable-hostnames is true" {
+  [ "$(setting reachable ce extra-hosts)" = as-reachable.test:127.0.0.1 ]
+  [ "$(setting pass-through-names ce extra-hosts)" = node-1.pass-through.test:127.0.0.1,node-2.pass-through.test:127.0.0.1,node-3.pass-through.test:127.0.0.1 ]
+  for profile in reachable pass-through-names pass-through-ports; do
+    [ -n "$("$DIR/profile-settings.sh" "$profile" ce | sed -n 's/^extra-hosts=//p')" ]
+    [ -z "$("$DIR/profile-settings.sh" "$profile" ce true | sed -n 's/^extra-hosts=//p')" ]
+    [ "$("$DIR/profile-settings.sh" "$profile" ee true | grep -v '^extra-hosts=')" = "$("$DIR/profile-settings.sh" "$profile" ee | grep -v '^extra-hosts=')" ]
+  done
+}
+
+@test "unresolvable-hostnames false keeps every profile's settings" {
+  for profile in default reachable pass-through-names pass-through-ports port-map-range cn-only low-mtu port-range idle-reset; do
+    for subset in ce ee; do
+      [ "$("$DIR/profile-settings.sh" "$profile" "$subset" false)" = "$("$DIR/profile-settings.sh" "$profile" "$subset")" ]
+    done
+  done
+}
+
 @test "port-range sets the proxy source port range" {
   [ "$(setting port-range ce proxy-port-range)" = "40000 40009" ]
   [ "$(setting port-range ce proxy-sysctls)" = "net.ipv4.ip_local_port_range=40000 40009" ]
@@ -53,6 +71,42 @@ setting() {
   run "$DIR/profile-settings.sh" default xx
   [ "$status" -eq 1 ]
   [[ "$output" == *"subset must be ce or ee"* ]]
+  run "$DIR/profile-settings.sh" reachable ce yes
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"unresolvable-hostnames must be true or false"* ]]
+}
+
+fake_docker() {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/docker" << 'EOF'
+#!/usr/bin/env bash
+# docker exec <container> getent hosts <hostname>: RESOLVES lists container/hostname pairs that resolve.
+[[ " ${RESOLVES:-} " == *" $2/$5 "* ]] && { echo "127.0.0.1 $5"; exit 0; }
+exit "${LOOKUP_STATUS:-2}"
+EOF
+  chmod +x "$BATS_TEST_TMPDIR/bin/docker"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+}
+
+@test "check-unresolvable passes when no hostname resolves in any node" {
+  fake_docker
+  run "$DIR/check-unresolvable.sh" discovery-as-1,discovery-as-2 a.test b.test
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"b.test does not resolve in discovery-as-2"* ]]
+}
+
+@test "check-unresolvable fails with the hostname and container that resolves" {
+  fake_docker
+  RESOLVES=discovery-as-2/b.test run "$DIR/check-unresolvable.sh" discovery-as-1,discovery-as-2 a.test b.test
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"b.test resolves in discovery-as-2: 127.0.0.1 b.test"* ]]
+}
+
+@test "check-unresolvable fails when the lookup cannot run" {
+  fake_docker
+  LOOKUP_STATUS=125 run "$DIR/check-unresolvable.sh" discovery-as-1 a.test
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Cannot look up a.test in discovery-as-1 (exit 125)"* ]]
 }
 
 @test "write-env writes every setting and the control dir only when the node server runs" {
