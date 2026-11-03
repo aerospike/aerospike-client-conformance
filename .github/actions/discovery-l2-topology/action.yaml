@@ -42,6 +42,13 @@ inputs:
   oidc-audience:
     description: JFrog OIDC audience
     required: true
+  unresolvable-hostnames:
+    description: >-
+      For reachable, pass-through-names and pass-through-ports, map no advertised hostname in the
+      servers and fail if one resolves in a running node. Needs a server that does not resolve its
+      access addresses.
+    required: false
+    default: "false"
   control-dir:
     description: Directory the tests write node requests to, for profiles that add nodes mid-test. The client must see it, for example through a workspace bind mount.
     required: false
@@ -84,9 +91,10 @@ runs:
       env:
         PROFILE: ${{ inputs.profile }}
         SUBSET: ${{ inputs.subset }}
+        UNRESOLVABLE_HOSTNAMES: ${{ inputs.unresolvable-hostnames }}
       run: |
         set -euo pipefail
-        "$GITHUB_ACTION_PATH/profile-settings.sh" "$PROFILE" "$SUBSET" >> "$GITHUB_OUTPUT"
+        "$GITHUB_ACTION_PATH/profile-settings.sh" "$PROFILE" "$SUBSET" "$UNRESOLVABLE_HOSTNAMES" >> "$GITHUB_OUTPUT"
 
     - name: Setup Aerospike cluster
       id: aerospike
@@ -136,6 +144,7 @@ runs:
       shell: bash
       env:
         L2_PROFILE: ${{ inputs.profile }}
+        UNRESOLVABLE_HOSTNAMES: ${{ inputs.unresolvable-hostnames }}
         AEROSPIKE_CONTAINER_NAMES: ${{ steps.nodes.outputs.running }}
         AEROSPIKE_NETWORK: ${{ steps.aerospike.outputs.network-name }}
         DISCOVERY_PROXY_MAP: ${{ steps.topology.outputs.proxy-name-port-map }}

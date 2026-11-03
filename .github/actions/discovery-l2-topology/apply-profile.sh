@@ -2,9 +2,11 @@
 # Apply an L2 profile after setup-discovery-topology. reachable, pass-through-names
 # and pass-through-ports rewrite each running node's access addresses and restart
 # it; setup-aerospike-server already maps the advertised hostnames with
-# extra-hosts, because the server must resolve them to start. port-map-range adds
-# one listener per address of the node subnet range. low-mtu raises the
-# namespace's max-record-size so a 1 MiB record fits.
+# extra-hosts, because a released server must resolve them to start. With
+# UNRESOLVABLE_HOSTNAMES=true nothing maps them, and the step fails if one
+# resolves in a running node. port-map-range adds one listener per address of
+# the node subnet range. low-mtu raises the namespace's max-record-size so a
+# 1 MiB record fits.
 set -euo pipefail
 
 profile="${L2_PROFILE:?}"
@@ -89,6 +91,9 @@ case "$profile" in
 
     docker restart "${containers[@]}" > /dev/null
     wait_cluster
+    if [[ "${UNRESOLVABLE_HOSTNAMES:-false}" == "true" ]]; then
+      "$(dirname "${BASH_SOURCE[0]}")/check-unresolvable.sh" "${AEROSPIKE_CONTAINER_NAMES}" "${hostnames[@]}"
+    fi
 
     client_hosts=""
     for hostname in "${hostnames[@]}"; do

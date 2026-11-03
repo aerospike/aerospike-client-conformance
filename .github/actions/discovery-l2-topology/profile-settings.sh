@@ -4,6 +4,7 @@ set -euo pipefail
 
 profile="${1:?profile}"
 subset="${2:?subset}"
+unresolvable="${3:-false}"
 
 num_nodes=3
 extra_hosts=""
@@ -22,6 +23,14 @@ case "$subset" in
   ce | ee) ;;
   *)
     echo "Error: subset must be ce or ee (got: $subset)" >&2
+    exit 1
+    ;;
+esac
+
+case "$unresolvable" in
+  true | false) ;;
+  *)
+    echo "Error: unresolvable-hostnames must be true or false (got: $unresolvable)" >&2
     exit 1
     ;;
 esac
@@ -67,6 +76,10 @@ case "$profile" in
     exit 1
     ;;
 esac
+
+if [[ "$unresolvable" == "true" ]]; then
+  extra_hosts=""
+fi
 
 # Outside cn-only the CN must not match the tls-name, so only SAN matching can pass.
 if [[ "$subset" == "ee" && "$profile" != "cn-only" ]]; then
