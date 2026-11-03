@@ -4,7 +4,8 @@
 # named stack, installs AKO 4.6.0 and the AerospikeCluster from the runner with l5ctl, adds one NLB
 # listener per pod NodePort and checks where the endpoint name resolves. On the runner, over EC2
 # Instance Connect, it checks out the client, runs the manifest's setup and build commands and runs
-# the manifest's row command once per row with L5_ROW set. Output goes to results/<stack name>/.
+# each row once: through rows.py with the manifest's driver (L5_DRIVER, DRIVER.md) when it sets one,
+# otherwise the manifest's row command (L5_RUN) with L5_ROW set. Output goes to results/<stack name>/.
 # The stack is always deleted (unless --keep), and the run fails if any resource tagged
 # l5-aws-run=<stack name> is left.
 #
@@ -100,7 +101,7 @@ done
 for cmd in aws ssh ssh-keygen curl jq; do
 	command -v "$cmd" >/dev/null 2>&1 || die "$cmd not found"
 done
-for f in stack.yaml l5ctl aerospike-cluster.yaml teardown.sh; do
+for f in stack.yaml l5ctl rows.py aerospike-cluster.yaml teardown.sh; do
 	[ -f "$SCRIPT_DIR/$f" ] || die "$SCRIPT_DIR/$f is missing"
 done
 export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION" AWS_PAGER=""
@@ -122,6 +123,7 @@ if [ "$PLAN" = "1" ]; then
 	else
 		echo "  client         $CLIENT_REPO $COMMIT $MANIFEST"
 		echo "  rows           ${ROW_LIST[*]}"
+		echo "  row command    rows.py with the manifest's L5_DRIVER when it sets one, otherwise its L5_RUN"
 	fi
 	echo "  after the run  $([ "$KEEP" = "1" ] && echo "stack kept; delete with teardown.sh" || echo "stack deleted, leftovers checked")"
 	exit 0
@@ -266,6 +268,7 @@ for i in $(seq 1 60); do
 done
 
 upload l5/l5ctl <"$SCRIPT_DIR/l5ctl"
+upload l5/rows.py <"$SCRIPT_DIR/rows.py"
 upload l5/aerospike-cluster.yaml <"$SCRIPT_DIR/aerospike-cluster.yaml"
 upload l5/env <"$RESULTS/env"
 upload l5/features.conf <"$FEATURES_CONF_PATH"
@@ -344,19 +347,28 @@ echo "Commit: $(git rev-parse HEAD)"
 set -a
 . "./$3"
 set +a
-for name in L5_SETUP L5_BUILD L5_RUN; do
+for name in L5_SETUP L5_BUILD; do
 	[ -n "${!name:-}" ] || { echo "$name is not set in $3"; exit 1; }
 done
+if [ -n "${L5_DRIVER:-}" ]; then
+	echo "Rows: rows.py with L5_DRIVER"
+elif [ -n "${L5_RUN:-}" ]; then
+	echo "Rows: L5_RUN"
+else
+	echo "neither L5_DRIVER nor L5_RUN is set in $3"
+	exit 1
+fi
 bash -c "$L5_SETUP" </dev/null
 bash -c "$L5_BUILD" </dev/null
 EOF
 build_rc=$?
 set -e
 [ "$build_rc" -eq 0 ] || { tail -40 "$RESULTS/build.log" >&2; die "client setup or build failed; see build.log"; }
-grep '^Commit: ' "$RESULTS/build.log"
+grep -E '^(Commit|Rows): ' "$RESULTS/build.log"
 
-# Each row starts on a Completed cluster with a healthy listener per NodePort. The row command runs
-# from the client checkout with the manifest and the environment loaded.
+# Each row starts on a Completed cluster with a healthy listener per NodePort. rows.py with the
+# manifest's L5_DRIVER, or else its L5_RUN, runs from the client checkout with the manifest and the
+# environment loaded.
 failed=0
 for row in "${ROW_LIST[@]}"; do
 	echo "Row $row"
@@ -383,7 +395,11 @@ set -a
 . "./$1"
 set +a
 echo "L5-ROW $L5_ROW seed=$L5_ENDPOINT_NAME:$L5_SEED_PORT control=$L5_CONTROL"
-bash -c "$L5_RUN" </dev/null
+if [ -n "${L5_DRIVER:-}" ]; then
+	python3 "$HOME/l5/rows.py" --row "$L5_ROW" --driver "$L5_DRIVER" </dev/null
+else
+	bash -c "$L5_RUN" </dev/null
+fi
 rc=$?
 echo "L5-ROW $L5_ROW exit=$rc"
 exit $rc

@@ -6,7 +6,7 @@ This document is for the engineer writing a client's driver, and is what the har
 
 Contract version: **1**.
 
-Status: the harness side, which starts drivers and asserts on their output, is not built yet. The rows still run through `L5_RUN` as described in the README.
+Status: the harness side is [`rows.py`](rows.py), which `run.sh` runs for each row when the manifest sets `L5_DRIVER`. A manifest without `L5_DRIVER` still runs its rows through `L5_RUN`, as described in the README.
 
 ## Packaging
 

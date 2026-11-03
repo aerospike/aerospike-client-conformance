@@ -1,6 +1,6 @@
 # Pluggable discovery L5 on AWS
 
-`run.sh` runs one client's L5 rows (W-1, W-2, W-3, W-5) against a real Aerospike cluster on EKS, reached through an NLB published as a PrivateLink endpoint service, from a client in a second VPC. It deletes everything it created. Every client uses the same stack, the same run and the same disruption commands; a client supplies a manifest and tests that call `l5ctl`.
+`run.sh` runs one client's L5 rows (W-1, W-2, W-3, W-5) against a real Aerospike cluster on EKS, reached through an NLB published as a PrivateLink endpoint service, from a client in a second VPC. It deletes everything it created. Every client uses the same stack, the same run and the same disruption commands; a client supplies a manifest and a driver, which `rows.py` runs and asserts on the same way for every client, or its own tests that call `l5ctl`.
 
 ## What the environment is
 
@@ -11,15 +11,18 @@
 
 ## What a client supplies
 
-A manifest file in the client repository, sourced by bash on the runner (Amazon Linux 2023) from the repository root. It sets three commands, each run with `bash -c` from the repository root:
+A manifest file in the client repository, sourced by bash on the runner (Amazon Linux 2023) from the repository root. It sets `L5_SETUP`, `L5_BUILD`, and `L5_DRIVER` or `L5_RUN`, each run with `bash -c` from the repository root:
 
-| Variable   | Runs                                                                          |
-| ---------- | ----------------------------------------------------------------------------- |
-| `L5_SETUP` | Once, to install the client's toolchain (`sudo dnf install ...`)              |
-| `L5_BUILD` | Once, after setup, to build the client and its tests                          |
-| `L5_RUN`   | Once per row, with `L5_ROW` set; exit 0 when every assertion of the row holds |
+| Variable    | Runs                                                                                                                                                                                                     |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `L5_SETUP`  | Once, to install the client's toolchain (`sudo dnf install ...`)                                                                                                                                         |
+| `L5_BUILD`  | Once, after setup, to build the client and its driver or tests                                                                                                                                           |
+| `L5_DRIVER` | Preferred. The client's driver, to the contract in [DRIVER.md](DRIVER.md). Each row runs `rows.py --row <row> --driver "$L5_DRIVER"`, which starts the driver as the row needs and makes every assertion |
+| `L5_RUN`    | When `L5_DRIVER` is not set: once per row, with `L5_ROW` set; exit 0 when every assertion of the row holds                                                                                               |
 
-Environment the row command gets:
+`rows.py` (Python 3.9 standard library, the runner's `python3`) exits 0 when every assertion of the row holds, 1 when one fails, 2 on bad usage or a missing variable, and 3 when the driver breaks the contract. It prints an `L5-CHECK` line per check with its measurement, bound and outcome, and leaves the cluster at the size it found it. `python3 -m unittest l5-aws/test_rows.py` tests it offline against a fake driver and a stub `l5ctl`.
+
+Environment the row command (`rows.py` and the driver it starts, or `L5_RUN`) gets:
 
 | Variable                                                  | Value                                                                                      |
 | --------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
@@ -36,7 +39,7 @@ The cluster is namespace `aerospike`, AerospikeCluster `aerocluster`, size 3, re
 
 ## l5ctl
 
-Tests drive and read the environment through `$L5_CTL`, so a client needs no kubectl or AWS code of its own: the test checks what only the client can see, and `l5ctl` checks the cluster, the servers and AWS. Each command prints `L5-*` lines and exits non-zero on failure. `l5ctl` with no arguments prints the full list.
+Rows drive and read the environment through `$L5_CTL`, so a client needs no kubectl or AWS code of its own: the driver or test reports what only the client can see, and `l5ctl` checks the cluster, the servers and AWS. Each command prints `L5-*` lines and exits non-zero on failure. `l5ctl` with no arguments prints the full list.
 
 | Command                                                   | Use                                                                                                                                                                                                                                                                                                                   |
 | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -86,3 +89,4 @@ One run with `--rows none` has passed (2026-11-02): stack create, Elastic IP and
 - Anything through FIS, which the account's permission simulation did not cover; SCPs were not checked.
 - `update-nodegroup-version` with a new launch template version as the rollout mechanism.
 - The FIS `aws:network:disrupt-connectivity` action also cuts the EKS control plane ENIs in that subnet.
+- `rows.py` against a real driver and cluster; so far only `test_rows.py` has run it, against a fake driver and a stub `l5ctl`.
