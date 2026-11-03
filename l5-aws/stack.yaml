@@ -1,0 +1,821 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Pluggable discovery L5 on AWS for any client: EKS across three AZs running AKO, an internal NLB
+  published as a PrivateLink endpoint service, and a consumer VPC holding the interface endpoint, a
+  private hosted zone for the endpoint name and the runner. NLB listeners and target groups are
+  created per pod NodePort by l5ctl, not here. Created and deleted by run.sh.
+
+Parameters:
+  OperatorCidr:
+    Type: String
+    Description: The operator's current public IP as a /32, the only SSH source for the runner.
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/32$'
+  PermissionsBoundaryArn:
+    Type: String
+    Description: Permissions boundary set on every role.
+    AllowedPattern: "^arn:aws[a-z-]*:iam::[0-9]{12}:policy/.+$"
+  EndpointName:
+    Type: String
+    Description: >-
+      Name the client dials and every pod advertises. It resolves in the consumer VPC only, unless
+      ProducerRecord is true. At most 63 characters, since it is also a node label value.
+    Default: db.l5.aerospike.internal
+    AllowedPattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$
+    MaxLength: 63
+  ProducerRecord:
+    Type: String
+    Description: true also makes EndpointName resolve in the producer VPC, for the control run on a released server.
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  KubernetesVersion:
+    Type: String
+    Default: "1.33"
+  AerospikeInstanceTypes:
+    Type: CommaDelimitedList
+    Description: Spot instance types for the Aerospike node groups, each with 2 vCPUs so one Aerospike pod fits per node.
+    Default: m6i.large,m5.large,m6a.large,m5a.large,m7i.large
+  SystemInstanceType:
+    Type: String
+    Default: m6i.large
+  RunnerInstanceType:
+    Type: String
+    Default: c6i.xlarge
+  RunnerAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  WithProducerRecord: !Equals [!Ref ProducerRecord, "true"]
+
+Resources:
+  # Producer: EKS, AKO and the NLB. Public subnets give the nodes egress without a NAT gateway; the
+  # cluster security group admits nothing from outside the VPC.
+  ProducerVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.72.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-producer"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ProducerGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-producer"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ProducerGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref ProducerVpc
+      InternetGatewayId: !Ref ProducerGateway
+
+  ProducerRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ProducerVpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-producer"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ProducerDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: ProducerGatewayAttachment
+    Properties:
+      RouteTableId: !Ref ProducerRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref ProducerGateway
+
+  ProducerSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProducerVpc
+      CidrBlock: 10.72.0.0/20
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-producer-a"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ProducerSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProducerVpc
+      CidrBlock: 10.72.16.0/20
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-producer-b"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ProducerSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProducerVpc
+      CidrBlock: 10.72.32.0/20
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-producer-c"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ProducerSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProducerSubnetA
+      RouteTableId: !Ref ProducerRouteTable
+
+  ProducerSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProducerSubnetB
+      RouteTableId: !Ref ProducerRouteTable
+
+  ProducerSubnetCRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProducerSubnetC
+      RouteTableId: !Ref ProducerRouteTable
+
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: L5 EKS cluster role
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy"
+      Tags:
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: L5 EKS node role
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Tags:
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  # trunk-ignore(checkov/CKV_AWS_58): no secrets beyond the throwaway admin password; the stack lives for one run
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref AWS::StackName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      AccessConfig:
+        AuthenticationMode: API
+        BootstrapClusterCreatorAdminPermissions: false
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref ProducerSubnetA
+          - !Ref ProducerSubnetB
+          - !Ref ProducerSubnetC
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs:
+          - !Sub "${RunnerEip}/32"
+      Tags:
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  RunnerAccess:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !GetAtt RunnerRole.Arn
+      AccessPolicies:
+        - PolicyArn: !Sub "arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+          AccessScope:
+            Type: cluster
+
+  # The per-pod Services are NodePort with externalTrafficPolicy Local, so the NLB reaches a pod only
+  # through the node it runs on; its health check is what finds that node.
+  NodePortIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt Cluster.ClusterSecurityGroupId
+      Description: NodePorts from the NLB, which reaches targets from inside the producer VPC
+      IpProtocol: tcp
+      FromPort: 30000
+      ToPort: 32767
+      CidrIp: 10.72.0.0/16
+
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: l5-aws-run
+                Value: !Ref AWS::StackName
+          - ResourceType: volume
+            Tags:
+              - Key: l5-aws-run
+                Value: !Ref AWS::StackName
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: l5-aws-run
+              Value: !Ref AWS::StackName
+
+  SystemNodegroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: !Sub "${AWS::StackName}-system"
+      NodeRole: !GetAtt NodeRole.Arn
+      CapacityType: ON_DEMAND
+      InstanceTypes:
+        - !Ref SystemInstanceType
+      Subnets:
+        - !Ref ProducerSubnetA
+        - !Ref ProducerSubnetB
+        - !Ref ProducerSubnetC
+      ScalingConfig:
+        MinSize: 2
+        DesiredSize: 2
+        MaxSize: 3
+      LaunchTemplate:
+        Id: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Labels:
+        l5-aws/role: system
+      Tags:
+        l5-aws-run: !Ref AWS::StackName
+
+  # One Spot node group per AZ, so a pod Pending in one rack's zone gets a node in that zone, and
+  # every Aerospike node carries the endpoint name as AKO's configuredIP label.
+  AerospikeNodegroupA:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: !Sub "${AWS::StackName}-aerospike-a"
+      NodeRole: !GetAtt NodeRole.Arn
+      CapacityType: SPOT
+      InstanceTypes: !Ref AerospikeInstanceTypes
+      Subnets:
+        - !Ref ProducerSubnetA
+      ScalingConfig:
+        MinSize: 0
+        DesiredSize: 1
+        MaxSize: 3
+      UpdateConfig:
+        MaxUnavailable: 1
+      LaunchTemplate:
+        Id: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Labels:
+        l5-aws/role: aerospike
+        aerospike.com/configured-alternate-access-address: !Ref EndpointName
+      Taints:
+        - Key: l5-aws/aerospike
+          Value: "true"
+          Effect: NO_SCHEDULE
+      Tags:
+        l5-aws-run: !Ref AWS::StackName
+
+  AerospikeNodegroupB:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: !Sub "${AWS::StackName}-aerospike-b"
+      NodeRole: !GetAtt NodeRole.Arn
+      CapacityType: SPOT
+      InstanceTypes: !Ref AerospikeInstanceTypes
+      Subnets:
+        - !Ref ProducerSubnetB
+      ScalingConfig:
+        MinSize: 0
+        DesiredSize: 1
+        MaxSize: 3
+      UpdateConfig:
+        MaxUnavailable: 1
+      LaunchTemplate:
+        Id: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Labels:
+        l5-aws/role: aerospike
+        aerospike.com/configured-alternate-access-address: !Ref EndpointName
+      Taints:
+        - Key: l5-aws/aerospike
+          Value: "true"
+          Effect: NO_SCHEDULE
+      Tags:
+        l5-aws-run: !Ref AWS::StackName
+
+  AerospikeNodegroupC:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: !Sub "${AWS::StackName}-aerospike-c"
+      NodeRole: !GetAtt NodeRole.Arn
+      CapacityType: SPOT
+      InstanceTypes: !Ref AerospikeInstanceTypes
+      Subnets:
+        - !Ref ProducerSubnetC
+      ScalingConfig:
+        MinSize: 0
+        DesiredSize: 1
+        MaxSize: 3
+      UpdateConfig:
+        MaxUnavailable: 1
+      LaunchTemplate:
+        Id: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Labels:
+        l5-aws/role: aerospike
+        aerospike.com/configured-alternate-access-address: !Ref EndpointName
+      Taints:
+        - Key: l5-aws/aerospike
+          Value: "true"
+          Effect: NO_SCHEDULE
+      Tags:
+        l5-aws-run: !Ref AWS::StackName
+
+  # Cross-zone is on so a listener whose only healthy target is in another AZ still answers in every
+  # endpoint AZ.
+  # trunk-ignore(checkov/CKV_AWS_91): test traffic only; access logs would need a bucket that outlives the stack
+  Nlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internal
+      Subnets:
+        - !Ref ProducerSubnetA
+        - !Ref ProducerSubnetB
+        - !Ref ProducerSubnetC
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: "true"
+      Tags:
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  # trunk-ignore(checkov/CKV_AWS_123): the only consumer is this stack's own endpoint, created in the same run
+  EndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties:
+      AcceptanceRequired: false
+      NetworkLoadBalancerArns:
+        - !Ref Nlb
+
+  EndpointServicePermissions:
+    Type: AWS::EC2::VPCEndpointServicePermissions
+    Properties:
+      ServiceId: !Ref EndpointService
+      AllowedPrincipals:
+        - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+
+  ProducerZone:
+    Type: AWS::Route53::HostedZone
+    Condition: WithProducerRecord
+    Properties:
+      Name: !Ref EndpointName
+      HostedZoneConfig:
+        Comment: !Sub "${AWS::StackName} control run: endpoint name resolvable in the producer VPC"
+      VPCs:
+        - VPCId: !Ref ProducerVpc
+          VPCRegion: !Ref AWS::Region
+      HostedZoneTags:
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ProducerZoneRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: WithProducerRecord
+    Properties:
+      HostedZoneId: !Ref ProducerZone
+      Name: !Ref EndpointName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Nlb.DNSName
+        HostedZoneId: !GetAtt Nlb.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+  # Consumer: what a Cloud customer has. The endpoint name resolves here only.
+  ConsumerVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.73.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-consumer"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ConsumerGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-consumer"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ConsumerGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      InternetGatewayId: !Ref ConsumerGateway
+
+  ConsumerRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-consumer"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ConsumerDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: ConsumerGatewayAttachment
+    Properties:
+      RouteTableId: !Ref ConsumerRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref ConsumerGateway
+
+  ConsumerSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      CidrBlock: 10.73.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-consumer-a"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ConsumerSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      CidrBlock: 10.73.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-consumer-b"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ConsumerSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      CidrBlock: 10.73.2.0/24
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-consumer-c"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  ConsumerSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ConsumerSubnetA
+      RouteTableId: !Ref ConsumerRouteTable
+
+  ConsumerSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ConsumerSubnetB
+      RouteTableId: !Ref ConsumerRouteTable
+
+  ConsumerSubnetCRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ConsumerSubnetC
+      RouteTableId: !Ref ConsumerRouteTable
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NodePorts on the interface endpoint from the consumer VPC
+      VpcId: !Ref ConsumerVpc
+      SecurityGroupIngress:
+        - Description: NodePorts from the consumer VPC
+          IpProtocol: tcp
+          FromPort: 30000
+          ToPort: 32767
+          CidrIp: 10.73.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-endpoint"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn: EndpointServicePermissions
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.vpce.${AWS::Region}.${EndpointService}"
+      VpcId: !Ref ConsumerVpc
+      SubnetIds:
+        - !Ref ConsumerSubnetA
+        - !Ref ConsumerSubnetB
+        - !Ref ConsumerSubnetC
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: false
+
+  ConsumerZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref EndpointName
+      HostedZoneConfig:
+        Comment: !Sub "${AWS::StackName} endpoint name, consumer VPC only"
+      VPCs:
+        - VPCId: !Ref ConsumerVpc
+          VPCRegion: !Ref AWS::Region
+      HostedZoneTags:
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  # The first DnsEntries item is the regional name, as "<hosted zone id>:<dns name>".
+  ConsumerZoneRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ConsumerZone
+      Name: !Ref EndpointName
+      Type: A
+      AliasTarget:
+        DNSName:
+          !Select [1, !Split [":", !Select [0, !GetAtt Endpoint.DnsEntries]]]
+        HostedZoneId:
+          !Select [0, !Split [":", !Select [0, !GetAtt Endpoint.DnsEntries]]]
+        EvaluateTargetHealth: false
+
+  RunnerSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ConsumerVpc
+      CidrBlock: 10.73.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-runner"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  RunnerSubnetRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref RunnerSubnet
+      RouteTableId: !Ref ConsumerRouteTable
+
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSH to the runner from the operator only
+      VpcId: !Ref ConsumerVpc
+      SecurityGroupIngress:
+        - Description: SSH from the operator
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref OperatorCidr
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-runner"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  FisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: L5 fault injection, Spot interruptions and AZ connectivity loss
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: fis.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSFaultInjectionSimulatorEC2Access"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSFaultInjectionSimulatorNetworkAccess"
+      Tags:
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  # l5ctl on the runner drives the cluster and the disruptions: NLB listeners per NodePort, node
+  # group size and rollout, and FIS experiments.
+  # trunk-ignore(checkov/CKV_AWS_111): l5ctl creates and deletes listeners, target groups and FIS experiments whose ARNs are not known when the stack is created
+  RunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: L5 runner, EKS admin and the disruptions l5ctl drives
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: l5-runner
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListNodegroups
+                  - eks:DescribeNodegroup
+                  - eks:DescribeUpdate
+                  - eks:UpdateNodegroupConfig
+                  - eks:UpdateNodegroupVersion
+                  - elasticloadbalancing:Describe*
+                  - elasticloadbalancing:CreateTargetGroup
+                  - elasticloadbalancing:DeleteTargetGroup
+                  - elasticloadbalancing:ModifyTargetGroupAttributes
+                  - elasticloadbalancing:CreateListener
+                  - elasticloadbalancing:DeleteListener
+                  - elasticloadbalancing:AddTags
+                  - autoscaling:Describe*
+                  - autoscaling:AttachLoadBalancerTargetGroups
+                  - autoscaling:DetachLoadBalancerTargetGroups
+                  - ec2:Describe*
+                  - ec2:CreateLaunchTemplateVersion
+                  - fis:CreateExperimentTemplate
+                  - fis:DeleteExperimentTemplate
+                  - fis:GetExperimentTemplate
+                  - fis:StartExperiment
+                  - fis:StopExperiment
+                  - fis:GetExperiment
+                  - fis:ListExperiments
+                  - fis:TagResource
+                  - tag:GetResources
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt FisRole.Arn
+      Tags:
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  RunnerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref RunnerRole
+
+  RunnerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y git jq tar
+            touch /var/tmp/l5-aws-ready
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: l5-aws-run
+              Value: !Ref AWS::StackName
+
+  RunnerEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-runner"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  Runner:
+    Type: AWS::EC2::Instance
+    DependsOn: ConsumerDefaultRoute
+    Properties:
+      ImageId: !Ref RunnerAmiId
+      InstanceType: !Ref RunnerInstanceType
+      SubnetId: !Ref RunnerSubnet
+      IamInstanceProfile: !Ref RunnerInstanceProfile
+      SecurityGroupIds:
+        - !Ref RunnerSecurityGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref RunnerLaunchTemplate
+        Version: !GetAtt RunnerLaunchTemplate.LatestVersionNumber
+      PropagateTagsToVolumeOnCreation: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-runner"
+        - Key: l5-aws-run
+          Value: !Ref AWS::StackName
+
+  RunnerEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt RunnerEip.AllocationId
+      InstanceId: !Ref Runner
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+  EndpointName:
+    Value: !Ref EndpointName
+  ProducerRecord:
+    Value: !Ref ProducerRecord
+  NlbArn:
+    Value: !Ref Nlb
+  ProducerVpcId:
+    Value: !Ref ProducerVpc
+  EndpointId:
+    Value: !Ref Endpoint
+  AerospikeNodegroups:
+    Description: AZ=node group name, comma separated, one per rack.
+    Value: !Join
+      - ","
+      - - !Sub "${ProducerSubnetA.AvailabilityZone}=${AerospikeNodegroupA.NodegroupName}"
+        - !Sub "${ProducerSubnetB.AvailabilityZone}=${AerospikeNodegroupB.NodegroupName}"
+        - !Sub "${ProducerSubnetC.AvailabilityZone}=${AerospikeNodegroupC.NodegroupName}"
+  ProducerSubnets:
+    Description: AZ=subnet id, comma separated.
+    Value: !Join
+      - ","
+      - - !Sub "${ProducerSubnetA.AvailabilityZone}=${ProducerSubnetA}"
+        - !Sub "${ProducerSubnetB.AvailabilityZone}=${ProducerSubnetB}"
+        - !Sub "${ProducerSubnetC.AvailabilityZone}=${ProducerSubnetC}"
+  ConsumerSubnets:
+    Description: AZ=subnet id of the endpoint subnets, comma separated.
+    Value: !Join
+      - ","
+      - - !Sub "${ConsumerSubnetA.AvailabilityZone}=${ConsumerSubnetA}"
+        - !Sub "${ConsumerSubnetB.AvailabilityZone}=${ConsumerSubnetB}"
+        - !Sub "${ConsumerSubnetC.AvailabilityZone}=${ConsumerSubnetC}"
+  NodeLaunchTemplateId:
+    Value: !Ref NodeLaunchTemplate
+  FisRoleArn:
+    Value: !GetAtt FisRole.Arn
+  RunnerInstanceId:
+    Value: !Ref Runner
+  RunnerPublicIp:
+    Value: !Ref RunnerEip
+  RunnerAz:
+    Value: !GetAtt RunnerSubnet.AvailabilityZone

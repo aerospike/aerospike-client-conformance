@@ -1,0 +1,1017 @@
+#!/usr/bin/env bash
+#
+# Drives the L5 environment that stack.yaml creates: installs AKO and the AerospikeCluster, keeps one
+# NLB listener per pod NodePort, and triggers the disruptions the client tests assert on. run.sh
+# copies it to the runner, where client tests call it; the AWS-only commands also run from the
+# operator's machine. Machine-readable lines start with L5-.
+#
+# Environment: read from $L5_ENV (default: env next to this script) when present. Otherwise set
+# L5_STACK and AWS_REGION, and the rest is read from the stack outputs.
+#
+# Commands:
+#   install --server-image IMAGE --features-conf FILE [--registry-auth FILE] [--size N]
+#           [--expect-start-failure]
+#       Install cert-manager, AKO and the AerospikeCluster (one rack per AZ) and wait for Completed.
+#       With --expect-start-failure, succeed only if the server fails to start.
+#   sync-listeners [--prune]
+#       One TCP listener and target group per per-pod Service NodePort. --prune removes listeners
+#       for NodePorts no Service has.
+#   wait-healthy [--timeout SECONDS]
+#       Wait until every listener's target group has a healthy target.
+#   wait-ready [--timeout SECONDS]
+#       Wait until the AerospikeCluster is Completed at its spec size and every pod is Ready.
+#   scale SIZE
+#       Set the AerospikeCluster size. Does not wait.
+#   pending
+#       Print each Pending Aerospike pod and the AZ of its rack.
+#   pods
+#       Print the AerospikeCluster's spec size and phase, then each Aerospike pod: phase, UID, rack
+#       AZ, worker node, EC2 instance, node ID, node name as the server formats it, and NodePort.
+#   wait-advertised POD [--timeout SECONDS]
+#       Wait until POD runs with a node ID and a NodePort, and every other pod lists it in
+#       peers-clear-alt at the endpoint name and that NodePort alone. Other pods are queried through
+#       the endpoint name, so POD needs no listener.
+#   add-node AZ [--wait]
+#       Add one node to the Aerospike node group in AZ.
+#   set-nodes AZ COUNT [--wait]
+#       Set the Aerospike node group in AZ to COUNT nodes.
+#   spot-interrupt POD [--wait]
+#       Send a real Spot interruption (two-minute notice) to the instance running POD, through FIS.
+#       --wait also waits until POD is recreated on another instance.
+#   rollout AZ|all [--wait]
+#       Replace every node in the Aerospike node group(s) with a new launch template version.
+#       --wait also waits until every pod is recreated on another instance.
+#   az-outage AZ [--duration ISO8601] [--wait-running|--wait]
+#       Cut all traffic in and out of the producer and endpoint subnets in AZ, through FIS
+#       (default PT5M). --wait-running returns once FIS reports the experiment running.
+#   interruptions SINCE
+#       Print each Spot interruption of an Aerospike node since SINCE (UTC, 2026-11-03T03:00:00Z)
+#       that spot-interrupt did not send.
+#   endpoint-zone ADDRESS
+#       Print the AZ of the interface endpoint's network interface that has ADDRESS.
+#   experiment ID [--wait]
+#       Print an FIS experiment's state.
+#   resolve-check [--expect-producer yes|no]
+#       Resolve the endpoint name on this host and from a pod in the producer VPC.
+#   verify
+#       Check each pod's build and advertised addresses, the per-pod Service settings, that each
+#       listener's only healthy target is the pod's node, and that the endpoint name on each
+#       NodePort reaches that pod's server from this host.
+#   status
+#       Nodes, pods, Services, rendered access addresses, listeners and target health.
+#   cleanup
+#       Stop FIS experiments and delete experiment templates, listeners and target groups this
+#       environment created. Run before deleting the stack.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_TAG=l5-aws-run
+NS=aerospike
+CR=aerocluster
+AKO_NS=ako
+AKO_CHART_VERSION=4.6.0
+AKO_HELM_REPO=https://aerospike.github.io/aerospike-kubernetes-enterprise
+CERT_MANAGER_CHART_VERSION=v1.21.3
+CERT_MANAGER_HELM_REPO=https://charts.jetstack.io
+RESOLVE_IMAGE=public.ecr.aws/docker/library/busybox:1.36
+ALTERNATE_ACCESS_LABEL=aerospike.com/configured-alternate-access-address
+SERVICE_PORT=3000
+REPLACED_TIMEOUT=1200
+
+die() {
+	echo "ERROR: $*" >&2
+	exit 2
+}
+
+usage() {
+	sed -n '/^# Commands:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+	exit 2
+}
+
+L5_ENV="${L5_ENV:-$SCRIPT_DIR/env}"
+if [ -f "$L5_ENV" ]; then
+	# shellcheck source=/dev/null
+	. "$L5_ENV"
+fi
+[ -n "${AWS_REGION:-}" ] || die "AWS_REGION is not set"
+[ -n "${L5_STACK:-}" ] || die "L5_STACK is not set"
+export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION" AWS_PAGER=""
+L5_DIR="${L5_DIR:-$HOME/l5}"
+export KUBECONFIG="${L5_KUBECONFIG:-$L5_DIR/kubeconfig}"
+
+output() {
+	aws cloudformation describe-stacks --stack-name "$L5_STACK" \
+		--query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+}
+
+if [ -z "${L5_CLUSTER:-}" ]; then
+	L5_CLUSTER="$(output ClusterName)"
+	L5_ENDPOINT_NAME="$(output EndpointName)"
+	L5_NLB_ARN="$(output NlbArn)"
+	L5_PRODUCER_VPC="$(output ProducerVpcId)"
+	L5_NODEGROUPS="$(output AerospikeNodegroups)"
+	L5_PRODUCER_SUBNETS="$(output ProducerSubnets)"
+	L5_CONSUMER_SUBNETS="$(output ConsumerSubnets)"
+	L5_NODE_LT="$(output NodeLaunchTemplateId)"
+	L5_FIS_ROLE="$(output FisRoleArn)"
+fi
+
+# Value for KEY in a "key=value,key=value" list.
+lookup() {
+	local key="$1" list="$2" entry
+	local -a entries
+	IFS=, read -r -a entries <<<"$list"
+	for entry in "${entries[@]}"; do
+		if [ "${entry%%=*}" = "$key" ]; then
+			echo "${entry#*=}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+zones() {
+	local entry
+	local -a entries
+	IFS=, read -r -a entries <<<"$L5_NODEGROUPS"
+	for entry in "${entries[@]}"; do
+		echo "${entry%%=*}"
+	done
+}
+
+nodegroup_for() {
+	lookup "$1" "$L5_NODEGROUPS" || die "no Aerospike node group in AZ $1 (have: $L5_NODEGROUPS)"
+}
+
+account() {
+	aws sts get-caller-identity --query Account --output text
+}
+
+asgs() {
+	local az ng
+	for az in $(zones); do
+		ng="$(nodegroup_for "$az")"
+		aws eks describe-nodegroup --cluster-name "$L5_CLUSTER" --nodegroup-name "$ng" \
+			--query 'nodegroup.resources.autoScalingGroups[].name' --output text 2>/dev/null | tr '\t' '\n'
+	done | grep -v '^None$' | grep -v '^$' || true
+}
+
+tg_name() {
+	local name="$L5_STACK-$1"
+	[ ${#name} -le 32 ] || die "target group name $name is longer than 32 characters"
+	echo "$name"
+}
+
+# "<service> <nodePort>" for every port of every per-pod Service.
+pod_service_ports() {
+	kubectl -n "$NS" get svc -o json | jq -r '.items[]
+		| select(.spec.type == "NodePort" and .spec.selector["statefulset.kubernetes.io/pod-name"] != null)
+		| .metadata.name as $n | .spec.ports[] | "\($n) \(.nodePort)"'
+}
+
+listeners() {
+	aws elbv2 describe-listeners --load-balancer-arn "$L5_NLB_ARN" \
+		--query 'Listeners[].[Port,ListenerArn,DefaultActions[0].TargetGroupArn]' --output text | grep -v '^None$' || true
+}
+
+ensure_target_group() {
+	local port="$1" name arn
+	name="$(tg_name "$port")"
+	arn="$(aws elbv2 describe-target-groups --names "$name" --query 'TargetGroups[0].TargetGroupArn' \
+		--output text 2>/dev/null || true)"
+	if [ -z "$arn" ] || [ "$arn" = "None" ]; then
+		arn="$(aws elbv2 create-target-group --name "$name" --protocol TCP --port "$port" \
+			--vpc-id "$L5_PRODUCER_VPC" --target-type instance \
+			--health-check-protocol TCP --health-check-interval-seconds 10 \
+			--healthy-threshold-count 2 --unhealthy-threshold-count 2 \
+			--tags "Key=$RUN_TAG,Value=$L5_STACK" \
+			--query 'TargetGroups[0].TargetGroupArn' --output text)"
+		aws elbv2 modify-target-group-attributes --target-group-arn "$arn" \
+			--attributes Key=deregistration_delay.timeout_seconds,Value=30 >/dev/null
+	fi
+	echo "$arn"
+}
+
+attach_to_asgs() {
+	local tg="$1" asg
+	for asg in $(asgs); do
+		aws autoscaling attach-load-balancer-target-groups --auto-scaling-group-name "$asg" \
+			--target-group-arns "$tg"
+	done
+}
+
+detach_from_asgs() {
+	local tg="$1" asg
+	for asg in $(asgs); do
+		aws autoscaling detach-load-balancer-target-groups --auto-scaling-group-name "$asg" \
+			--target-group-arns "$tg" 2>/dev/null || true
+	done
+}
+
+delete_target_group() {
+	local tg="$1" i
+	detach_from_asgs "$tg"
+	for i in $(seq 1 30); do
+		aws elbv2 delete-target-group --target-group-arn "$tg" 2>/dev/null && return 0
+		sleep 10
+	done
+	echo "ERROR: target group $tg not deleted" >&2
+	return 1
+}
+
+cmd_sync_listeners() {
+	local prune=0 port arn tg want have
+	[ "${1:-}" = "--prune" ] && prune=1
+	want="$(pod_service_ports | awk '{print $2}' | sort -u)"
+	[ -n "$want" ] || die "no per-pod Service NodePorts in namespace $NS"
+	have="$(listeners)"
+	for port in $want; do
+		if awk -v p="$port" '$1 == p { found = 1 } END { exit !found }' <<<"$have"; then
+			continue
+		fi
+		tg="$(ensure_target_group "$port")"
+		attach_to_asgs "$tg"
+		aws elbv2 create-listener --load-balancer-arn "$L5_NLB_ARN" --protocol TCP --port "$port" \
+			--default-actions "Type=forward,TargetGroupArn=$tg" \
+			--tags "Key=$RUN_TAG,Value=$L5_STACK" >/dev/null
+		echo "L5-LISTENER added port=$port tg=$tg"
+	done
+	if [ "$prune" = "1" ]; then
+		while read -r port arn tg; do
+			[ -n "$port" ] || continue
+			grep -qx "$port" <<<"$want" && continue
+			aws elbv2 delete-listener --listener-arn "$arn"
+			delete_target_group "$tg"
+			echo "L5-LISTENER removed port=$port"
+		done <<<"$have"
+	fi
+	pod_service_ports | while read -r svc port; do
+		echo "L5-LISTENER service=$svc port=$port"
+	done
+}
+
+cmd_wait_healthy() {
+	local timeout=600 deadline port arn tg healthy waiting
+	[ "${1:-}" = "--timeout" ] && timeout="${2:?--timeout needs seconds}"
+	deadline=$((SECONDS + timeout))
+	while :; do
+		waiting=""
+		while read -r port arn tg; do
+			[ -n "$port" ] || continue
+			healthy="$(aws elbv2 describe-target-health --target-group-arn "$tg" \
+				--query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" --output text)"
+			[ "$healthy" -ge 1 ] || waiting+=" $port"
+		done <<<"$(listeners)"
+		if [ -z "$waiting" ]; then
+			echo "L5-HEALTHY all listeners"
+			return 0
+		fi
+		[ $SECONDS -lt $deadline ] || die "listeners with no healthy target after ${timeout}s:$waiting"
+		sleep 10
+	done
+}
+
+cmd_wait_ready() {
+	local timeout=1200 deadline spec status phase ready
+	[ "${1:-}" = "--timeout" ] && timeout="${2:?--timeout needs seconds}"
+	deadline=$((SECONDS + timeout))
+	while :; do
+		spec="$(kubectl -n "$NS" get aerospikecluster "$CR" -o jsonpath='{.spec.size}')"
+		status="$(kubectl -n "$NS" get aerospikecluster "$CR" -o jsonpath='{.status.size}')"
+		phase="$(kubectl -n "$NS" get aerospikecluster "$CR" -o jsonpath='{.status.phase}')"
+		ready="$(kubectl -n "$NS" get pods -l "aerospike.com/cr=$CR" -o json |
+			jq '[.items[] | select(.status.conditions[]? | .type == "Ready" and .status == "True")] | length')"
+		if [ "$phase" = "Completed" ] && [ "$status" = "$spec" ] && [ "$ready" = "$spec" ]; then
+			echo "L5-READY size=$spec"
+			return 0
+		fi
+		[ $SECONDS -lt $deadline ] || die "not ready after ${timeout}s: phase=$phase spec.size=$spec status.size=$status ready=$ready"
+		sleep 10
+	done
+}
+
+cmd_scale() {
+	local size="${1:?scale needs a size}"
+	[[ "$size" =~ ^[1-9][0-9]*$ ]] || die "size must be a positive integer"
+	kubectl -n "$NS" patch aerospikecluster "$CR" --type merge -p "{\"spec\":{\"size\":$size}}" >/dev/null
+	echo "L5-SCALE size=$size"
+}
+
+cmd_pending() {
+	local racks
+	racks="$(kubectl -n "$NS" get aerospikecluster "$CR" -o json |
+		jq -r '[.spec.rackConfig.racks[] | "\(.id)=\(.zone)"] | join(",")')"
+	kubectl -n "$NS" get pods -l "aerospike.com/cr=$CR" -o json |
+		jq -r '.items[] | select(.status.phase == "Pending") | "\(.metadata.name) \(.metadata.labels["aerospike.com/rack-id"])"' |
+		while read -r pod rack; do
+			echo "L5-PENDING pod=$pod rack=$rack zone=$(lookup "$rack" "$racks" || echo unknown)"
+		done
+}
+
+cmd_pods() {
+	local cr
+	cr="$(kubectl -n "$NS" get aerospikecluster "$CR" -o json)"
+	jq -r '"L5-CLUSTER size=\(.spec.size) phase=\(.status.phase // "")"' <<<"$cr"
+	jq -rn --argjson cr "$cr" --argjson port "$SERVICE_PORT" \
+		--argjson pods "$(kubectl -n "$NS" get pods -l "aerospike.com/cr=$CR" -o json)" \
+		--argjson svcs "$(kubectl -n "$NS" get svc -o json)" \
+		--argjson nodes "$(kubectl get nodes -o json)" '
+		([$cr.spec.rackConfig.racks[] | {key: (.id | tostring), value: .zone}] | from_entries) as $zones
+		| ([$svcs.items[] | select(.spec.type == "NodePort")
+			| {key: .metadata.name, value: ([.spec.ports[] | select(.port == $port) | .nodePort][0] // 0)}]
+			| from_entries) as $nodePorts
+		| ([$nodes.items[] | {key: .metadata.name, value: ((.spec.providerID // "") | split("/") | last // "")}]
+			| from_entries) as $instances
+		| $pods.items | sort_by(.metadata.name)[]
+		| .metadata.name as $p
+		| ($cr.status.pods[$p].aerospike.nodeID // "") as $id
+		| (.spec.nodeName // "") as $worker
+		| "L5-POD pod=\($p) phase=\(.status.phase) uid=\(.metadata.uid)"
+			+ " zone=\($zones[.metadata.labels["aerospike.com/rack-id"] // ""] // "unknown")"
+			+ " worker=\($worker) instance=\($instances[$worker] // "") nodeId=\($id)"
+			+ " node=\($id | ascii_upcase | sub("^0+(?=.)"; "")) nodePort=\($nodePorts[$p] // 0)"'
+}
+
+# Value of KEY in an "L5-* key=value ..." line.
+field() {
+	tr ' ' '\n' <<<"$2" | sed -n "s/^$1=//p"
+}
+
+# "pod uid worker instance" for every Aerospike pod, "-" for a worker or instance it has none of.
+placements() {
+	cmd_pods | awk '$1 == "L5-POD" {
+		delete v
+		for (i = 2; i <= NF; i++) { k = substr($i, 1, index($i, "=") - 1); v[k] = substr($i, length(k) + 2) }
+		print v["pod"], v["uid"], (v["worker"] == "" ? "-" : v["worker"]), (v["instance"] == "" ? "-" : v["instance"])
+	}'
+}
+
+# Wait until each POD is recreated on an instance other than its instance in BEFORE, the output of
+# placements, and print where each was and is.
+wait_replaced() {
+	local before="$1" deadline pod uid worker instance new_uid new_worker new_instance waiting
+	shift
+	deadline=$((SECONDS + REPLACED_TIMEOUT))
+	while :; do
+		local now
+		now="$(placements)"
+		waiting=""
+		for pod in "$@"; do
+			read -r _ uid worker instance <<<"$(awk -v p="$pod" '$1 == p' <<<"$before")"
+			read -r _ new_uid new_worker new_instance <<<"$(awk -v p="$pod" '$1 == p' <<<"$now")"
+			if [ -z "$new_uid" ] || [ "$new_uid" = "$uid" ] || [ "$new_instance" = "-" ] || [ "$new_instance" = "$instance" ]; then
+				waiting+=" $pod"
+			fi
+		done
+		if [ -z "$waiting" ]; then
+			for pod in "$@"; do
+				read -r _ uid worker instance <<<"$(awk -v p="$pod" '$1 == p' <<<"$before")"
+				read -r _ new_uid new_worker new_instance <<<"$(awk -v p="$pod" '$1 == p' <<<"$now")"
+				echo "L5-REPLACED pod=$pod oldWorker=$worker oldInstance=$instance newWorker=$new_worker newInstance=$new_instance"
+			done
+			return 0
+		fi
+		[ $SECONDS -lt $deadline ] || die "not recreated on another instance after ${REPLACED_TIMEOUT}s:$waiting"
+		sleep 5
+	done
+}
+
+# Whether a peers reply lists NODE at the endpoint name and PORT alone.
+advertised_alone() {
+	local peers="$1" node="$2" port="$3" default entry id
+	default="$(cut -d, -f2 <<<"$peers")"
+	while read -r entry; do
+		id="${entry%%,*}"
+		[ "$(tr a-f A-F <<<"${id#[}")" = "$(tr a-f A-F <<<"$node")" ] || continue
+		[[ "$entry" == *",[$L5_ENDPOINT_NAME:$port]]" ]] && return 0
+		[ "$default" = "$port" ] && [[ "$entry" == *",[$L5_ENDPOINT_NAME]]" ]] && return 0
+	done <<<"$(grep -oE '\[[0-9A-Fa-f]+,[^],[]*,\[[^]]*\]\]' <<<"$peers" || true)"
+	return 1
+}
+
+cmd_wait_advertised() {
+	local pod="${1:?wait-advertised needs a pod}" timeout=900 deadline lines line node port other other_port \
+		reply by missing
+	[ "${2:-}" = "--timeout" ] && timeout="${3:?--timeout needs seconds}"
+	deadline=$((SECONDS + timeout))
+	while :; do
+		lines="$(cmd_pods)"
+		line="$(awk -v p="pod=$pod" '$1 == "L5-POD" && $2 == p' <<<"$lines")"
+		node="$(field node "$line")"
+		port="$(field nodePort "$line")"
+		by=""
+		if [ "$(field phase "$line")" != "Running" ] || [ -z "$node" ] || [ "${port:-0}" = "0" ]; then
+			missing=" $pod is not running with a node ID and NodePort"
+		else
+			missing=""
+			while read -r line; do
+				other="$(field pod "$line")"
+				other_port="$(field nodePort "$line")"
+				[ "$other" != "$pod" ] && [ "$(field phase "$line")" = "Running" ] && [ "${other_port:-0}" != "0" ] || continue
+				if reply="$(info "$L5_ENDPOINT_NAME" "$other_port" peers-clear-alt 2>&1)" &&
+					advertised_alone "$(info_value peers-clear-alt <<<"$reply")" "$node" "$port"; then
+					by+="${by:+,}$other"
+				else
+					missing+=" $other"
+				fi
+			done <<<"$(grep '^L5-POD ' <<<"$lines")"
+			[ -n "$by" ] || missing+=" no other running pod"
+		fi
+		if [ -z "$missing" ]; then
+			echo "L5-ADVERTISED pod=$pod node=$node nodePort=$port address=$L5_ENDPOINT_NAME:$port by=$by"
+			return 0
+		fi
+		[ $SECONDS -lt $deadline ] || die "$pod not advertised at $L5_ENDPOINT_NAME:${port:-?} after ${timeout}s by:$missing"
+		sleep 2
+	done
+}
+
+wait_nodegroup() {
+	local ng="$1" update="$2" status i
+	for i in $(seq 1 120); do
+		status="$(aws eks describe-update --name "$L5_CLUSTER" --nodegroup-name "$ng" --update-id "$update" \
+			--query 'update.status' --output text)"
+		case "$status" in
+			Successful) return 0 ;;
+			Failed | Cancelled) die "node group $ng update $update $status" ;;
+		esac
+		sleep 15
+	done
+	die "node group $ng update $update still $status after 30 minutes"
+}
+
+set_nodes() {
+	local az="$1" count="$2" wait="$3" ng max min update
+	ng="$(nodegroup_for "$az")"
+	read -r min max <<<"$(aws eks describe-nodegroup --cluster-name "$L5_CLUSTER" --nodegroup-name "$ng" \
+		--query 'nodegroup.scalingConfig.[minSize,maxSize]' --output text)"
+	[ "$count" -le "$max" ] || max="$count"
+	[ "$count" -ge "$min" ] || min="$count"
+	update="$(aws eks update-nodegroup-config --cluster-name "$L5_CLUSTER" --nodegroup-name "$ng" \
+		--scaling-config "minSize=$min,maxSize=$max,desiredSize=$count" --query 'update.id' --output text)"
+	echo "L5-NODES az=$az nodegroup=$ng desired=$count update=$update"
+	[ "$wait" = "1" ] && wait_nodegroup "$ng" "$update"
+	return 0
+}
+
+cmd_add_node() {
+	local az="${1:?add-node needs an AZ}" wait=0 ng desired
+	[ "${2:-}" = "--wait" ] && wait=1
+	ng="$(nodegroup_for "$az")"
+	desired="$(aws eks describe-nodegroup --cluster-name "$L5_CLUSTER" --nodegroup-name "$ng" \
+		--query 'nodegroup.scalingConfig.desiredSize' --output text)"
+	set_nodes "$az" $((desired + 1)) "$wait"
+}
+
+cmd_set_nodes() {
+	local az="${1:?set-nodes needs an AZ}" count="${2:?set-nodes needs a count}" wait=0
+	[[ "$count" =~ ^[0-9]+$ ]] || die "count must be a non-negative integer"
+	[ "${3:-}" = "--wait" ] && wait=1
+	set_nodes "$az" "$count" "$wait"
+}
+
+# Sets EXPERIMENT.
+start_experiment() {
+	local action="$1" template="$2" id
+	id="$(aws fis create-experiment-template --cli-input-json "$template" \
+		--query 'experimentTemplate.id' --output text)"
+	EXPERIMENT="$(aws fis start-experiment --experiment-template-id "$id" --tags "$RUN_TAG=$L5_STACK" \
+		--query 'experiment.id' --output text)"
+	echo "L5-FIS action=$action experiment=$EXPERIMENT template=$id"
+}
+
+wait_experiment() {
+	local id="$1" status i
+	for i in $(seq 1 120); do
+		status="$(aws fis get-experiment --id "$id" --query 'experiment.state.status' --output text)"
+		case "$status" in
+			completed) echo "L5-FIS experiment=$id status=$status"; return 0 ;;
+			failed | stopped | cancelled)
+				aws fis get-experiment --id "$id" --query 'experiment.state.reason' --output text >&2
+				die "FIS experiment $id $status" ;;
+		esac
+		sleep 10
+	done
+	die "FIS experiment $id still $status after 20 minutes"
+}
+
+wait_running() {
+	local id="$1" status i
+	for i in $(seq 1 24); do
+		status="$(aws fis get-experiment --id "$id" --query 'experiment.state.status' --output text)"
+		case "$status" in
+			running) echo "L5-FIS experiment=$id status=$status"; return 0 ;;
+			completed | failed | stopped | cancelled) die "FIS experiment $id $status before it was seen running" ;;
+		esac
+		sleep 5
+	done
+	die "FIS experiment $id still $status after 2 minutes"
+}
+
+cmd_spot_interrupt() {
+	local pod="${1:?spot-interrupt needs a pod}" wait=0 node provider instance lifecycle arn template before
+	[ "${2:-}" = "--wait" ] && wait=1
+	node="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}')"
+	[ -n "$node" ] || die "pod $pod is not scheduled"
+	provider="$(kubectl get node "$node" -o jsonpath='{.spec.providerID}')"
+	instance="${provider##*/}"
+	[[ "$instance" =~ ^i-[0-9a-f]+$ ]] || die "node $node has providerID '$provider'"
+	lifecycle="$(aws ec2 describe-instances --instance-ids "$instance" \
+		--query 'Reservations[0].Instances[0].InstanceLifecycle' --output text)"
+	[ "$lifecycle" = "spot" ] || die "instance $instance under pod $pod is not Spot ($lifecycle)"
+	arn="arn:aws:ec2:$AWS_REGION:$(account):instance/$instance"
+	template="$(jq -n --arg role "$L5_FIS_ROLE" --arg arn "$arn" --arg tag "$RUN_TAG" --arg stack "$L5_STACK" '{
+		description: "L5 Spot interruption",
+		roleArn: $role,
+		stopConditions: [{source: "none"}],
+		targets: {node: {resourceType: "aws:ec2:spot-instance", resourceArns: [$arn], selectionMode: "ALL"}},
+		actions: {interrupt: {actionId: "aws:ec2:send-spot-instance-interruptions",
+			parameters: {durationBeforeInterruption: "PT2M"}, targets: {SpotInstances: "node"}}},
+		tags: {($tag): $stack}}')"
+	echo "L5-SPOT pod=$pod node=$node instance=$instance"
+	mkdir -p "$L5_DIR"
+	echo "$instance" >>"$L5_DIR/fis-interrupted"
+	before="$(placements)"
+	start_experiment spot-interrupt "$template"
+	if [ "$wait" = "1" ]; then
+		wait_experiment "$EXPERIMENT"
+		wait_replaced "$before" "$pod"
+	fi
+	return 0
+}
+
+cmd_rollout() {
+	local target="${1:?rollout needs an AZ or all}" wait=0 version az ng update before pods
+	local -a groups=() updates=()
+	[ "${2:-}" = "--wait" ] && wait=1
+	if [ "$target" = "all" ]; then
+		for az in $(zones); do groups+=("$(nodegroup_for "$az")"); done
+	else
+		groups+=("$(nodegroup_for "$target")")
+	fi
+	before="$(placements)"
+	pods="$(rollout_pods "$target")"
+	# shellcheck disable=SC2016 # $Latest is the launch template version keyword
+	version="$(aws ec2 create-launch-template-version --launch-template-id "$L5_NODE_LT" --source-version '$Latest' \
+		--launch-template-data "$(jq -n --arg tag "$RUN_TAG" --arg stack "$L5_STACK" --arg at "$(date -u +%Y%m%dT%H%M%SZ)" '{
+			TagSpecifications: [
+				{ResourceType: "instance", Tags: [{Key: $tag, Value: $stack}, {Key: "l5-aws-rollout", Value: $at}]},
+				{ResourceType: "volume", Tags: [{Key: $tag, Value: $stack}]}]}')" \
+		--query 'LaunchTemplateVersion.VersionNumber' --output text)"
+	for ng in "${groups[@]}"; do
+		update="$(aws eks update-nodegroup-version --cluster-name "$L5_CLUSTER" --nodegroup-name "$ng" \
+			--launch-template "id=$L5_NODE_LT,version=$version" --query 'update.id' --output text)"
+		echo "L5-ROLLOUT nodegroup=$ng launch-template-version=$version update=$update"
+		updates+=("$ng=$update")
+	done
+	if [ "$wait" = "1" ]; then
+		for update in "${updates[@]}"; do
+			wait_nodegroup "${update%%=*}" "${update#*=}"
+			echo "L5-ROLLOUT nodegroup=${update%%=*} done"
+		done
+		# shellcheck disable=SC2086 # one pod name per word
+		wait_replaced "$before" $pods
+	fi
+}
+
+# Pods whose rack is in AZ, or every pod for "all".
+rollout_pods() {
+	cmd_pods | awk -v az="$1" '$1 == "L5-POD" {
+		for (i = 2; i <= NF; i++) { k = substr($i, 1, index($i, "=") - 1); v[k] = substr($i, length(k) + 2) }
+		if (az == "all" || v["zone"] == az) print v["pod"]
+	}'
+}
+
+cmd_az_outage() {
+	local az="${1:?az-outage needs an AZ}" duration=PT5M wait=0 producer consumer acct template
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--duration) duration="${2:?--duration needs a value}"; shift ;;
+			--wait) wait=1 ;;
+			--wait-running) wait=running ;;
+			*) usage ;;
+		esac
+		shift
+	done
+	[[ "$duration" =~ ^PT[0-9]+[MS]$ ]] || die "--duration must look like PT5M"
+	producer="$(lookup "$az" "$L5_PRODUCER_SUBNETS")" || die "no producer subnet in $az"
+	consumer="$(lookup "$az" "$L5_CONSUMER_SUBNETS")" || die "no endpoint subnet in $az"
+	acct="$(account)"
+	template="$(jq -n --arg role "$L5_FIS_ROLE" --arg duration "$duration" --arg tag "$RUN_TAG" --arg stack "$L5_STACK" \
+		--arg p "arn:aws:ec2:$AWS_REGION:$acct:subnet/$producer" --arg c "arn:aws:ec2:$AWS_REGION:$acct:subnet/$consumer" '{
+		description: "L5 AZ connectivity loss",
+		roleArn: $role,
+		stopConditions: [{source: "none"}],
+		targets: {subnets: {resourceType: "aws:ec2:subnet", resourceArns: [$p, $c], selectionMode: "ALL"}},
+		actions: {disrupt: {actionId: "aws:network:disrupt-connectivity",
+			parameters: {duration: $duration, scope: "all"}, targets: {Subnets: "subnets"}}},
+		tags: {($tag): $stack}}')"
+	echo "L5-AZ-OUTAGE az=$az duration=$duration producer-subnet=$producer endpoint-subnet=$consumer"
+	start_experiment az-outage "$template"
+	case "$wait" in
+		1) wait_experiment "$EXPERIMENT" ;;
+		running) wait_running "$EXPERIMENT" ;;
+	esac
+	return 0
+}
+
+cmd_interruptions() {
+	local since="${1:?interruptions needs a UTC time like 2026-11-03T03:00:00Z}" asg at instance
+	[[ "$since" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die "interruptions needs a UTC time like 2026-11-03T03:00:00Z"
+	for asg in $(asgs); do
+		while read -r at instance; do
+			[ -n "$instance" ] || continue
+			grep -qx "$instance" "$L5_DIR/fis-interrupted" 2>/dev/null && continue
+			echo "L5-INTERRUPTED instance=$instance at=$at asg=$asg"
+		done <<<"$(aws autoscaling describe-scaling-activities --auto-scaling-group-name "$asg" --output json |
+			jq -r --arg since "${since%Z}" '.Activities[]
+				| select((.Cause | contains("Spot Instance interruption")) and .StartTime >= $since)
+				| "\(.StartTime) \(.Description | capture("(?<id>i-[0-9a-f]+)").id)"')"
+	done
+}
+
+cmd_endpoint_zone() {
+	local address="${1:?endpoint-zone needs an address}" subnets zone
+	[[ "$address" =~ ^[0-9.]+$ ]] || die "endpoint-zone needs an IPv4 address"
+	subnets="$(cut -d= -f2 <<<"${L5_CONSUMER_SUBNETS//,/$'\n'}" | paste -sd, -)"
+	zone="$(aws ec2 describe-network-interfaces \
+		--filters "Name=addresses.private-ip-address,Values=$address" "Name=subnet-id,Values=$subnets" \
+		--query 'NetworkInterfaces[0].AvailabilityZone' --output text)"
+	[ -n "$zone" ] && [ "$zone" != "None" ] || die "$address is not an endpoint address in $L5_CONSUMER_SUBNETS"
+	echo "L5-ENDPOINT-ZONE address=$address zone=$zone"
+}
+
+cmd_experiment() {
+	local id="${1:?experiment needs an id}"
+	if [ "${2:-}" = "--wait" ]; then
+		wait_experiment "$id"
+	else
+		echo "L5-FIS experiment=$id status=$(aws fis get-experiment --id "$id" --query 'experiment.state.status' --output text)"
+	fi
+}
+
+cmd_resolve_check() {
+	local expect="" consumer producer lookup_out rc=0
+	[ "${1:-}" = "--expect-producer" ] && expect="${2:?--expect-producer needs yes or no}"
+	consumer="$(getent hosts "$L5_ENDPOINT_NAME" | awk '{print $1}' | paste -sd, - || true)"
+	echo "L5-RESOLVE where=consumer name=$L5_ENDPOINT_NAME addresses=${consumer:-none}"
+	[ -n "$consumer" ] || { echo "ERROR: $L5_ENDPOINT_NAME does not resolve in the consumer VPC" >&2; rc=1; }
+	lookup_out="$(kubectl run "l5-resolve-$RANDOM" -n default --rm -i --restart=Never --quiet --image="$RESOLVE_IMAGE" \
+		--overrides='{"spec":{"nodeSelector":{"l5-aws/role":"system"}}}' -- nslookup "$L5_ENDPOINT_NAME." 2>&1 || true)"
+	if grep -A3 "^Name:" <<<"$lookup_out" | grep -q "^Address"; then
+		producer=yes
+	elif grep -q NXDOMAIN <<<"$lookup_out"; then
+		producer=no
+	else
+		echo "ERROR: lookup from the producer VPC gave neither an address nor NXDOMAIN: $(tr '\n' ' ' <<<"$lookup_out")" >&2
+		return 1
+	fi
+	echo "L5-RESOLVE where=producer name=$L5_ENDPOINT_NAME resolves=$producer"
+	tr '\n' ' ' <<<"L5-RESOLVE where=producer nslookup: $lookup_out"
+	echo
+	if [ -n "$expect" ] && [ "$expect" != "$producer" ]; then
+		echo "ERROR: expected the producer VPC to resolve it: $expect, got: $producer" >&2
+		rc=1
+	fi
+	return $rc
+}
+
+# Info commands over the Aerospike wire protocol, one "name<TAB>value" line each, after logging in
+# as admin with the password in $L5_DIR/admin-password when that file exists.
+info() {
+	L5_PASSWORD_FILE="$L5_DIR/admin-password" python3 - "$@" <<'PY'
+import os, socket, struct, sys, time
+host, port, cmds = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+body = "".join(c + "\n" for c in cmds).encode()
+
+def password_hash(password):
+    salt = "$2a$10$7EqJtq98hPqEX7fNZaFWoO"
+    try:
+        import bcrypt
+        return bcrypt.hashpw(password.encode(), salt.encode())
+    except ImportError:
+        import crypt
+        hashed = crypt.crypt(password, salt)
+        if not hashed or not hashed.startswith(salt):
+            sys.exit("no bcrypt: install python3-bcrypt")
+        return hashed.encode()
+
+def read(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise OSError("connection closed")
+        buf += chunk
+    return buf
+
+def field(fid, data):
+    return struct.pack(">IB", len(data) + 1, fid) + data
+
+def login(s, password):
+    msg = bytes([0, 0, 20, 2]) + bytes(12) + field(0, b"admin") + field(3, password_hash(password))
+    s.sendall(struct.pack(">Q", (2 << 56) | (2 << 48) | len(msg)) + msg)
+    size = struct.unpack(">Q", read(s, 8))[0] & 0xFFFFFFFFFFFF
+    result = read(s, size)[1]
+    if result not in (0, 52):
+        raise OSError("login failed with result code %d" % result)
+
+password = None
+if os.path.isfile(os.environ["L5_PASSWORD_FILE"]):
+    with open(os.environ["L5_PASSWORD_FILE"]) as f:
+        password = f.read().strip()
+start = time.monotonic()
+try:
+    with socket.create_connection((host, port), timeout=5) as s:
+        if password:
+            login(s, password)
+        s.sendall(struct.pack(">Q", (2 << 56) | (1 << 48) | len(body)) + body)
+        size = struct.unpack(">Q", read(s, 8))[0] & 0xFFFFFFFFFFFF
+        reply = read(s, size).decode()
+except OSError as e:
+    sys.exit("%s:%d: %s" % (host, port, e))
+names = {line.split("\t", 1)[0] for line in reply.splitlines() if "\t" in line}
+if any(c not in names for c in cmds):
+    sys.exit("%s:%d: unexpected reply: %s" % (host, port, reply.strip()))
+print("ms\t%.1f" % ((time.monotonic() - start) * 1000))
+sys.stdout.write(reply)
+PY
+}
+
+info_value() {
+	awk -F'\t' -v k="$1" '$1 == k { print $2 }'
+}
+
+# Checks the setup a row relies on: what each pod's server reports, the per-pod Service settings,
+# that each listener's healthy target is the node running the pod, and that the endpoint name on
+# each NodePort reaches that pod's server from this host.
+cmd_verify() {
+	local rc=0 pod svc port node_name instance local_port pf reply node build service_alt peers_alt \
+		other other_port spec healthy path_node ms
+	local -A node_of port_of
+	while read -r svc port; do
+		port_of[$svc]="$port"
+	done <<<"$(pod_service_ports)"
+	[ ${#port_of[@]} -gt 0 ] || die "no per-pod Services in namespace $NS"
+
+	for pod in $(kubectl -n "$NS" get pods -l "aerospike.com/cr=$CR" -o jsonpath='{.items[*].metadata.name}'); do
+		port="${port_of[$pod]:-}"
+		[ -n "$port" ] || { echo "ERROR: pod $pod has no per-pod Service" >&2; rc=1; continue; }
+		local_port=$((13000 + RANDOM % 1000))
+		kubectl -n "$NS" port-forward "pod/$pod" "$local_port:3000" >/dev/null 2>&1 &
+		pf=$!
+		reply=""
+		for _ in $(seq 1 20); do
+			if reply="$(info 127.0.0.1 "$local_port" node build service-clear-alt peers-clear-alt 2>&1)"; then
+				break
+			fi
+			[[ "$reply" == *"unexpected reply"* || "$reply" == *"login failed"* ]] && break
+			sleep 1
+		done
+		kill "$pf" 2>/dev/null || true
+		wait "$pf" 2>/dev/null || true
+		if [ -z "$(info_value node <<<"$reply")" ]; then
+			echo "ERROR: $pod through port-forward: $(tr '\n' ' ' <<<"$reply")" >&2
+			rc=1
+			continue
+		fi
+		node="$(info_value node <<<"$reply")"
+		build="$(info_value build <<<"$reply")"
+		service_alt="$(info_value service-clear-alt <<<"$reply")"
+		peers_alt="$(info_value peers-clear-alt <<<"$reply")"
+		node_of[$pod]="$node"
+		echo "L5-VERIFY-SERVER pod=$pod node=$node build=$build service-clear-alt=$service_alt"
+		echo "L5-VERIFY-PEERS pod=$pod peers-clear-alt=$peers_alt"
+		if [ "$service_alt" != "$L5_ENDPOINT_NAME:$port" ]; then
+			echo "ERROR: $pod advertises service-clear-alt=$service_alt, expected $L5_ENDPOINT_NAME:$port" >&2
+			rc=1
+		fi
+		for other in "${!port_of[@]}"; do
+			[ "$other" != "$pod" ] || continue
+			other_port="${port_of[$other]}"
+			if [[ "$peers_alt" != *"[$L5_ENDPOINT_NAME:$other_port]"* ]]; then
+				echo "ERROR: $pod peers-clear-alt has no $L5_ENDPOINT_NAME:$other_port for $other" >&2
+				rc=1
+			fi
+		done
+
+		spec="$(kubectl -n "$NS" get svc "$pod" -o jsonpath='{.spec.publishNotReadyAddresses} {.spec.externalTrafficPolicy}')"
+		echo "L5-VERIFY-SERVICE service=$pod port=$port publishNotReadyAddresses=${spec% *} externalTrafficPolicy=${spec#* }"
+
+		node_name="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}')"
+		instance="$(kubectl get node "$node_name" -o jsonpath='{.spec.providerID}')"
+		instance="${instance##*/}"
+		healthy="$(aws elbv2 describe-target-health --target-group-arn \
+			"$(listeners | awk -v p="$port" '$1 == p { print $3 }')" \
+			--query "TargetHealthDescriptions[?TargetHealth.State=='healthy'].Target.Id" --output text 2>/dev/null || true)"
+		echo "L5-VERIFY-TARGET port=$port pod=$pod instance=$instance healthy=${healthy// /,}"
+		if [ "$healthy" != "$instance" ]; then
+			echo "ERROR: listener $port: healthy targets ${healthy:-none}, expected only $instance" >&2
+			rc=1
+		fi
+	done
+
+	for pod in "${!node_of[@]}"; do
+		port="${port_of[$pod]}"
+		if ! reply="$(info "$L5_ENDPOINT_NAME" "$port" node build 2>&1)"; then
+			echo "L5-VERIFY-PATH port=$port pod=$pod error=$(tr '\n' ' ' <<<"$reply")"
+			rc=1
+			continue
+		fi
+		path_node="$(info_value node <<<"$reply")"
+		ms="$(info_value ms <<<"$reply")"
+		echo "L5-VERIFY-PATH port=$port pod=$pod node=$path_node expected=${node_of[$pod]} ms=$ms"
+		if [ "$path_node" != "${node_of[$pod]}" ]; then
+			echo "ERROR: $L5_ENDPOINT_NAME:$port reached node $path_node, expected ${node_of[$pod]}" >&2
+			rc=1
+		fi
+	done
+	[ $rc -ne 0 ] || echo "L5-VERIFY PASS"
+	return $rc
+}
+
+cmd_status() {
+	local pod port arn tg
+	kubectl get nodes -L topology.kubernetes.io/zone,eks.amazonaws.com/capacityType,l5-aws/role,"$ALTERNATE_ACCESS_LABEL" || true
+	kubectl -n "$NS" get aerospikecluster,pods,svc -o wide || true
+	for pod in $(kubectl -n "$NS" get pods -l "aerospike.com/cr=$CR" -o jsonpath='{.items[*].metadata.name}'); do
+		echo "Rendered by the operator for $pod:"
+		kubectl --request-timeout=30s -n "$NS" exec "$pod" -c aerospike-server -- \
+			grep -E 'access-(address|port)' /etc/aerospike/aerospike.conf || true
+	done
+	while read -r port arn tg; do
+		[ -n "$port" ] || continue
+		echo "Listener $port:"
+		aws elbv2 describe-target-health --target-group-arn "$tg" \
+			--query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State,TargetHealth.Reason]' --output text
+	done <<<"$(listeners)"
+}
+
+cmd_install() {
+	local image="" features="" auth="" size=3 expect_failure=0 password manifest zone_a zone_b zone_c i
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--server-image) image="${2:-}"; shift ;;
+			--features-conf) features="${2:-}"; shift ;;
+			--registry-auth) auth="${2:-}"; shift ;;
+			--size) size="${2:-}"; shift ;;
+			--expect-start-failure) expect_failure=1 ;;
+			*) usage ;;
+		esac
+		shift
+	done
+	[[ "$image" =~ ^[A-Za-z0-9._:/@-]+$ ]] || die "--server-image is required"
+	[ -r "$features" ] || die "--features-conf must be a readable file"
+	[ -z "$auth" ] || [ -r "$auth" ] || die "--registry-auth must be a readable file"
+	[[ "$size" =~ ^[1-9]$ ]] || die "--size must be 1-9"
+	read -r zone_a zone_b zone_c <<<"$(zones | paste -sd' ' -)"
+	[ -n "$zone_c" ] || die "expected three Aerospike node groups in L5_NODEGROUPS"
+
+	mkdir -p "$L5_DIR"
+	aws eks update-kubeconfig --name "$L5_CLUSTER" --kubeconfig "$KUBECONFIG" >/dev/null
+	kubectl wait --for=condition=Ready nodes --all --timeout=15m
+
+	helm repo add jetstack "$CERT_MANAGER_HELM_REPO" --force-update
+	helm repo add aerospike "$AKO_HELM_REPO" --force-update
+	helm repo update
+	helm upgrade --install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace \
+		--version "$CERT_MANAGER_CHART_VERSION" --set crds.enabled=true --wait --timeout 10m
+	kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+	helm upgrade --install aerospike-kubernetes-operator aerospike/aerospike-kubernetes-operator \
+		--namespace "$AKO_NS" --create-namespace --version "$AKO_CHART_VERSION" \
+		--set "watchNamespaces=$NS" --wait --timeout 10m
+	kubectl wait --for=condition=Established crd/aerospikeclusters.asdb.aerospike.com --timeout=180s
+	kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aerospike-operator-controller-manager
+  namespace: $NS
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aerospike-cluster-$NS
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aerospike-cluster
+subjects:
+  - kind: ServiceAccount
+    name: aerospike-operator-controller-manager
+    namespace: $NS
+EOF
+
+	kubectl -n "$NS" create secret generic aerospike-secret --from-file="features.conf=$features" \
+		--dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	if [ ! -s "$L5_DIR/admin-password" ]; then
+		(umask 077 && openssl rand -hex 16 >"$L5_DIR/admin-password")
+	fi
+	password="$(cat "$L5_DIR/admin-password")"
+	kubectl -n "$NS" create secret generic auth-secret --from-literal="password=$password" \
+		--dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	password=""
+	if [ -n "$auth" ]; then
+		kubectl -n "$NS" create secret generic l5-registry --type=kubernetes.io/dockerconfigjson \
+			--from-file=".dockerconfigjson=$auth" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	fi
+
+	manifest="$L5_DIR/aerospike-cluster.rendered.yaml"
+	sed -e "s|@SIZE@|$size|" -e "s|@IMAGE@|$image|" -e "s|@ZONE_A@|$zone_a|" -e "s|@ZONE_B@|$zone_b|" \
+		-e "s|@ZONE_C@|$zone_c|" "$SCRIPT_DIR/aerospike-cluster.yaml" >"$manifest"
+	if [ -n "$auth" ]; then
+		awk '{ print } /^    multiPodPerHost: true$/ { print "    imagePullSecrets:\n      - name: l5-registry" }' \
+			"$manifest" >"$manifest.tmp" && mv "$manifest.tmp" "$manifest"
+	fi
+	! grep -q '@[A-Z_]*@' "$manifest" || die "unreplaced placeholder in $manifest"
+
+	# helm --wait returns before the operator's webhook accepts connections.
+	for i in $(seq 1 60); do
+		kubectl apply --dry-run=server -f "$manifest" >/dev/null 2>"$L5_DIR/webhook.err" && break
+		[ "$i" -lt 60 ] || die "AKO webhook did not accept the AerospikeCluster: $(cat "$L5_DIR/webhook.err")"
+		sleep 3
+	done
+	kubectl apply -f "$manifest"
+	echo "L5-INSTALL ako=$AKO_CHART_VERSION image=$image size=$size zones=$zone_a,$zone_b,$zone_c"
+
+	if [ "$expect_failure" = "0" ]; then
+		cmd_wait_ready --timeout 1800
+		return 0
+	fi
+	expect_start_failure
+}
+
+# The control run on a released server with the endpoint name unresolvable in the producer VPC:
+# the server must fail to start, and no pod may become Ready.
+expect_start_failure() {
+	local deadline=$((SECONDS + 900)) pods restarts ready pod
+	while [ $SECONDS -lt $deadline ]; do
+		pods="$(kubectl -n "$NS" get pods -l "aerospike.com/cr=$CR" -o json)"
+		ready="$(jq '[.items[] | select(.status.conditions[]? | .type == "Ready" and .status == "True")] | length' <<<"$pods")"
+		[ "$ready" = "0" ] || die "control run: $ready pod(s) became Ready; the server started"
+		restarts="$(jq -r '[.items[].status.containerStatuses[]? | select(.name == "aerospike-server") | .restartCount] | max // 0' <<<"$pods")"
+		if [ "$restarts" -ge 2 ]; then
+			for pod in $(jq -r '.items[].metadata.name' <<<"$pods"); do
+				echo "Last aerospike-server log lines of $pod:"
+				kubectl -n "$NS" logs "$pod" -c aerospike-server --previous --tail=20 2>/dev/null || true
+			done
+			echo "L5-START-FAILURE restarts=$restarts ready=0"
+			return 0
+		fi
+		sleep 10
+	done
+	die "control run: the server neither started nor restarted twice in 15 minutes"
+}
+
+cmd_cleanup() {
+	local id port arn tg rc=0
+	for id in $(aws fis list-experiments --query "experiments[?tags.\"$RUN_TAG\"=='$L5_STACK' && (state.status=='running' || state.status=='initiating' || state.status=='pending')].id" --output text); do
+		[ "$id" != "None" ] || continue
+		aws fis stop-experiment --id "$id" >/dev/null || rc=1
+		echo "L5-CLEANUP stopped experiment $id"
+	done
+	for id in $(aws fis list-experiment-templates --query "experimentTemplates[?tags.\"$RUN_TAG\"=='$L5_STACK'].id" --output text); do
+		[ "$id" != "None" ] || continue
+		aws fis delete-experiment-template --id "$id" >/dev/null || rc=1
+		echo "L5-CLEANUP deleted experiment template $id"
+	done
+	while read -r port arn tg; do
+		[ -n "$port" ] || continue
+		aws elbv2 delete-listener --listener-arn "$arn" || rc=1
+		echo "L5-CLEANUP deleted listener $port"
+	done <<<"$(listeners)"
+	for tg in $(aws elbv2 describe-target-groups --query "TargetGroups[?starts_with(TargetGroupName, '$L5_STACK-')].TargetGroupArn" --output text); do
+		[ "$tg" != "None" ] || continue
+		delete_target_group "$tg" || rc=1
+		echo "L5-CLEANUP deleted target group $tg"
+	done
+	return $rc
+}
+
+command="${1:-}"
+[ $# -gt 0 ] && shift
+case "$command" in
+	install) cmd_install "$@" ;;
+	sync-listeners) cmd_sync_listeners "$@" ;;
+	wait-healthy) cmd_wait_healthy "$@" ;;
+	wait-ready) cmd_wait_ready "$@" ;;
+	scale) cmd_scale "$@" ;;
+	pending) cmd_pending ;;
+	pods) cmd_pods ;;
+	wait-advertised) cmd_wait_advertised "$@" ;;
+	add-node) cmd_add_node "$@" ;;
+	set-nodes) cmd_set_nodes "$@" ;;
+	spot-interrupt) cmd_spot_interrupt "$@" ;;
+	rollout) cmd_rollout "$@" ;;
+	az-outage) cmd_az_outage "$@" ;;
+	endpoint-zone) cmd_endpoint_zone "$@" ;;
+	interruptions) cmd_interruptions "$@" ;;
+	experiment) cmd_experiment "$@" ;;
+	resolve-check) cmd_resolve_check "$@" ;;
+	verify) cmd_verify ;;
+	status) cmd_status ;;
+	cleanup) cmd_cleanup ;;
+	*) usage ;;
+esac
