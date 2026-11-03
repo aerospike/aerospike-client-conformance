@@ -6,7 +6,8 @@
 # UNRESOLVABLE_HOSTNAMES=true nothing maps them, and the step fails if one
 # resolves in a running node. port-map-range adds one listener per address of
 # the node subnet range. low-mtu raises the namespace's max-record-size so a
-# 1 MiB record fits.
+# 1 MiB record fits. unresolved-access fails if its access hostname resolves in a
+# running node.
 set -euo pipefail
 
 profile="${L2_PROFILE:?}"
@@ -142,6 +143,10 @@ case "$profile" in
     done
     docker restart "${containers[@]}" > /dev/null
     wait_cluster
+    ;;
+  unresolved-access)
+    echo "Server under test advertises access addresses verbatim: ${VERBATIM_ACCESS_ADDRESS:?}"
+    "$(dirname "${BASH_SOURCE[0]}")/check-unresolvable.sh" "${AEROSPIKE_CONTAINER_NAMES}" "${ALTERNATE_HOST:?}"
     ;;
   *)
     echo "No profile step for ${profile}" >&2

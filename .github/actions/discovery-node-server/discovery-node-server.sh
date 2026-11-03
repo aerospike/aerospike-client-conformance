@@ -32,13 +32,15 @@ mapfile -t mounts < <(inspect '.[0].Mounts[] | "\(if .Type == "volume" then .Nam
 mapfile -t hosts < <(inspect '.[0].HostConfig.ExtraHosts // [] | .[]')
 docker cp "$template:$conf_dir/$template.conf" "$work/template.conf" || die "cannot copy the config of $template"
 
+host_args=()
+for host in "${hosts[@]}"; do
+  host_args+=(--add-host "$host")
+done
 run_args=(--network "$network" --ulimit nofile=15000 --entrypoint "$entrypoint")
 for mount in "${mounts[@]}"; do
   run_args+=(-v "$mount")
 done
-for host in "${hosts[@]}"; do
-  run_args+=(--add-host "$host")
-done
+run_args+=("${host_args[@]}")
 
 ack() {
   printf '%s\n' "$2" > "$dir/$1.tmp"
@@ -96,6 +98,30 @@ start() {
   fi
 }
 
+status() {
+  local id="$1" name="$2" state lookup="" lookup_rc="" where=""
+  : > "$work/err"
+  if [[ "$name" == "$prefix"-* ]] &&
+    state="$(docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' "$name" 2> "$work/err")"; then
+    docker logs "$name" > "$dir/$name.log" 2>&1 || true
+    if [[ -n "$alternate_host" ]]; then
+      lookup_rc=0
+      if [[ "${state% *}" == "true" ]]; then
+        where=container
+        lookup="$(docker exec "$name" getent hosts "$alternate_host" 2>&1)" || lookup_rc=$?
+      else
+        where=image
+        lookup="$(docker run --rm --name "$prefix-lookup-$id" --network "$network" "${host_args[@]}" \
+          --entrypoint getent "$image" hosts "$alternate_host" 2>&1)" || lookup_rc=$?
+      fi
+    fi
+    ack "$id" "$(printf 'running=%s\nexit-code=%s\nlog=%s\nlookup-in=%s\nlookup-exit=%s\nlookup=%s' \
+      "${state% *}" "${state#* }" "$dir/$name.log" "$where" "$lookup_rc" "$(tr '\n' ' ' <<< "$lookup")")"
+  else
+    ack "$id" "error=cannot inspect $name $(tr '\n' ' ' < "$work/err")"
+  fi
+}
+
 touch "$dir/ready"
 echo "Serving requests in $dir"
 
@@ -120,6 +146,9 @@ while true; do
         else
           ack "$id" "error=cannot remove $arg"
         fi
+        ;;
+      status)
+        status "$id" "$arg"
         ;;
       *)
         ack "$id" "error=unknown request: $action $arg"

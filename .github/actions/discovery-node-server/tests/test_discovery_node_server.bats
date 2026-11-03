@@ -28,7 +28,9 @@ EOF
 printf '%s\n' "$*" >> "$STUB/calls"
 case "$1" in
   inspect)
-    if [[ "$2" == -f ]]; then
+    if [[ "$2" == -f && "$3" == *State* ]]; then
+      cat "$STUB/state-$4" 2> /dev/null || { echo "Error: No such object: $4" >&2; exit 1; }
+    elif [[ "$2" == -f ]]; then
       echo "172.30.66.9"
     elif [[ "$2" == discovery-as-4 ]]; then
       cat "$STUB/inspect.json"
@@ -45,7 +47,16 @@ case "$1" in
       cp "$2" "$STUB/written/${3##*/}"
     fi
     ;;
+  logs) echo "log of $2" ;;
+  exec)
+    [[ -e "$STUB/resolves" ]] && { echo "10.0.0.1  $5"; exit 0; }
+    exit 2
+    ;;
   run)
+    if [[ "$2" == --rm ]]; then
+      printf '%s\n' "$@" > "$STUB/lookup-args"
+      exit 2
+    fi
     [[ ! -e "$STUB/fail-run" ]] || { echo "run failed" >&2; exit 1; }
     printf '%s\n' "$@" > "$STUB/run-args"
     ;;
@@ -141,6 +152,13 @@ request() {
   [[ "$output" == *$'        port 3000\n        alternate-access-address alt.example\n        alternate-access-port 4000\n    }'* ]]
 }
 
+@test "start alternate-port= advertises whichever alternate host the server was given" {
+  serve discovery-as-4 as-unresolved.test
+  request d3 "start alternate-port=4001"
+  run cat "$STUB/written/discovery-as-5.conf"
+  [[ "$output" == *$'        alternate-access-address as-unresolved.test\n        alternate-access-port 4001\n'* ]]
+}
+
 @test "start alternate-port= needs an alternate host" {
   serve
   run request d2 "start alternate-port=4000"
@@ -173,6 +191,54 @@ request() {
   run request f3 "stop discovery-as-1"
   [ "$output" = "error=cannot remove discovery-as-1" ]
   ! grep -q "^rm " "$STUB/calls"
+}
+
+@test "status of a running node acks its state, log and the lookup in the container" {
+  serve discovery-as-4 as-unresolved.test
+  request h1 "start alternate-port=4000"
+  echo "true 0" > "$STUB/state-discovery-as-5"
+  run request h2 "status discovery-as-5"
+  [ "$output" = "$(printf 'running=true\nexit-code=0\nlog=%s\nlookup-in=container\nlookup-exit=2\nlookup= ' "$CONTROL/discovery-as-5.log")" ]
+  [ "$(cat "$CONTROL/discovery-as-5.log")" = "log of discovery-as-5" ]
+  grep -qx "exec discovery-as-5 getent hosts as-unresolved.test" "$STUB/calls"
+  [ ! -e "$STUB/lookup-args" ]
+}
+
+@test "status of an exited node looks the hostname up in a new container from the same image and network" {
+  serve discovery-as-4 as-unresolved.test
+  request h3 "start alternate-port=4000"
+  echo "false 1" > "$STUB/state-discovery-as-5"
+  run request h4 "status discovery-as-5"
+  [ "$output" = "$(printf 'running=false\nexit-code=1\nlog=%s\nlookup-in=image\nlookup-exit=2\nlookup= ' "$CONTROL/discovery-as-5.log")" ]
+  run cat "$STUB/lookup-args"
+  [[ "$output" == $'run\n--rm\n--name\ndiscovery-as-lookup-h4\n--network\ndiscovery-aerospike-net\n--add-host\nalt.example:10.0.0.9\n--entrypoint\ngetent\naerospike/aerospike-server:8.1\nhosts\nas-unresolved.test' ]]
+  ! grep -q "^exec " "$STUB/calls"
+}
+
+@test "status reports what the hostname resolves to" {
+  serve discovery-as-4 as-unresolved.test
+  echo "true 0" > "$STUB/state-discovery-as-1"
+  touch "$STUB/resolves"
+  run request h5 "status discovery-as-1"
+  [[ "$output" == *$'\nlookup-exit=0\nlookup=10.0.0.1  as-unresolved.test ' ]]
+}
+
+@test "status without an alternate host acks no lookup" {
+  serve
+  echo "true 0" > "$STUB/state-discovery-as-1"
+  run request h6 "status discovery-as-1"
+  [ "$output" = "$(printf 'running=true\nexit-code=0\nlog=%s\nlookup-in=\nlookup-exit=\nlookup= ' "$CONTROL/discovery-as-1.log")" ]
+  ! grep -q "^exec " "$STUB/calls"
+}
+
+@test "status refuses a container it cannot inspect or outside the node prefix" {
+  serve
+  run request h7 "status discovery-as-7"
+  [ "$output" = "error=cannot inspect discovery-as-7 Error: No such object: discovery-as-7 " ]
+  echo "true 0" > "$STUB/state-other-1"
+  run request h8 "status other-1"
+  [ "$output" = "error=cannot inspect other-1 " ]
+  ! grep -q "State.* other-1" "$STUB/calls"
 }
 
 @test "an unknown request answers with an error" {
