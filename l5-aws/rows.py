@@ -420,6 +420,11 @@ class Driver:
 		kill_group(self.proc)
 		for thread in self.threads:
 			thread.join(10)
+		for pipe in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+			try:
+				pipe.close()
+			except OSError:
+				pass
 		status = self.proc.returncode
 		emit("L5-DRIVER-EXIT", status=status, afterQuit=not before_quit)
 		if self.violation is not None:

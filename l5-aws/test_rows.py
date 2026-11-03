@@ -83,7 +83,11 @@ while True:
 			out({"type": "log", "t": t, "level": "WARN", "message": message})
 	while commands:
 		words = commands.pop(0).split()
-		if words[0] == "quit":
+		if words[0] in spec.get("ignore", []):
+			continue
+		if words[0] in spec.get("refuse", []):
+			out({"type": "error", "t": t, "message": "cannot " + " ".join(words)})
+		elif words[0] == "quit":
 			if spec.get("ignore_quit"):
 				continue
 			sys.exit(spec.get("quit_exit", 0))
@@ -225,7 +229,7 @@ class RowsTest(unittest.TestCase):
 		self.ctl = os.path.join(self.dir.name, "l5ctl")
 		with open(self.ctl, "w") as f:
 			f.write("#!%s\n%s" % (sys.executable, STUB_L5CTL))
-		os.chmod(self.ctl, 0o755)
+		os.chmod(self.ctl, 0o700)
 		self.fake = os.path.join(self.dir.name, "fake_driver.py")
 		with open(self.fake, "w") as f:
 			f.write(FAKE_DRIVER)
@@ -416,6 +420,11 @@ class ContractTest(RowsTest):
 		s = w1()
 		s["driver"]["quit_exit"] = 1
 		self.assertContract(*self.run_row("W-1", s), "driver exited with status 1 after quit")
+
+	def test_error_reply(self):
+		s = w1()
+		s["driver"]["refuse"] = ["serve"]
+		self.assertContract(*self.run_row("W-1", s), "driver answered with error: cannot serve pass-through")
 
 	def test_client_not_created_is_a_failure(self):
 		s = w1()
@@ -654,6 +663,12 @@ class W5Test(RowsTest):
 		s["ctl"]["az-outage"] = {"exit": 2, "lines": s["ctl"]["az-outage"]["lines"][:2],
 			"stderr": "ERROR: FIS experiment E5 completed before it was seen running"}
 		self.assertFailsCheck(*self.run_row("W-5", s), "az-outage")
+		self.assertEqual(["experiment E5 --wait", "wait-ready --timeout 1200", "pods"], self.ctl_log()[-3:])
+
+	def test_reset_reply(self):
+		s = w5()
+		s["driver"]["ignore"] = ["reset"]
+		self.assertFailsCheck(*self.run_row("W-5", s), "reset-reply", boundMs=10000)
 		self.assertEqual(["experiment E5 --wait", "wait-ready --timeout 1200", "pods"], self.ctl_log()[-3:])
 
 	def test_outage_ended(self):
