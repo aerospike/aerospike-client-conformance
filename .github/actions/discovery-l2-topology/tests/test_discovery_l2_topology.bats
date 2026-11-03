@@ -47,6 +47,32 @@ setting() {
   done
 }
 
+@test "unresolved-access is the default topology with an unmapped alternate host for the node server" {
+  for subset in ce ee; do
+    [ "$(setting unresolved-access "$subset" alternate-host)" = as-unresolved.test ]
+    [ "$(setting unresolved-access "$subset" extra-hosts)" = "" ]
+    [ "$("$DIR/profile-settings.sh" unresolved-access "$subset" | grep -v '^alternate-host=')" = "$("$DIR/profile-settings.sh" default "$subset" | grep -v '^alternate-host=')" ]
+  done
+  [ "$("$DIR/profile-settings.sh" unresolved-access ce | cut -d= -f1)" = "$("$DIR/profile-settings.sh" default ce | cut -d= -f1)" ]
+}
+
+@test "verbatim-access-address true or false keeps every profile's settings" {
+  for profile in default reachable pass-through-names pass-through-ports port-map-range cn-only low-mtu port-range idle-reset unresolved-access; do
+    for subset in ce ee; do
+      [ "$("$DIR/profile-settings.sh" "$profile" "$subset" false false)" = "$("$DIR/profile-settings.sh" "$profile" "$subset")" ]
+      [ "$("$DIR/profile-settings.sh" "$profile" "$subset" false true)" = "$("$DIR/profile-settings.sh" "$profile" "$subset")" ]
+    done
+  done
+}
+
+@test "verbatim-access-address accepts only true or false" {
+  for value in 1 0 yes TRUE ""; do
+    run "$DIR/profile-settings.sh" unresolved-access ce false "$value"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"verbatim-access-address must be true or false (got: $value)"* ]]
+  done
+}
+
 @test "port-range sets the proxy source port range" {
   [ "$(setting port-range ce proxy-port-range)" = "40000 40009" ]
   [ "$(setting port-range ce proxy-sysctls)" = "net.ipv4.ip_local_port_range=40000 40009" ]
@@ -125,6 +151,48 @@ EOF
   CONTROL=true CONTROL_DIR=/work/.discovery-control NODE_SERVER_LOG=/tmp/log run "$DIR/write-env.sh"
   grep -qx "DISCOVERY_CONTROL_DIR=/work/.discovery-control" "$env_file"
   grep -qx "node-server-log=/tmp/log" "$GITHUB_OUTPUT"
+}
+
+@test "write-env sets the unresolved hostname and verbatim flag only for unresolved-access" {
+  export RUNNER_TEMP="$BATS_TEST_TMPDIR" GITHUB_OUTPUT="$BATS_TEST_TMPDIR/out"
+  env_file="$BATS_TEST_TMPDIR/discovery-l2.env"
+  L2_PROFILE=unresolved-access ALTERNATE_HOST=as-unresolved.test VERBATIM_ACCESS_ADDRESS=false run "$DIR/write-env.sh"
+  [ "$status" -eq 0 ]
+  grep -qx "DISCOVERY_UNRESOLVED_HOSTNAME=as-unresolved.test" "$env_file"
+  grep -qx "DISCOVERY_VERBATIM_ACCESS_ADDRESS=0" "$env_file"
+
+  L2_PROFILE=unresolved-access ALTERNATE_HOST=as-unresolved.test VERBATIM_ACCESS_ADDRESS=true run "$DIR/write-env.sh"
+  grep -qx "DISCOVERY_VERBATIM_ACCESS_ADDRESS=1" "$env_file"
+
+  L2_PROFILE=unresolved-access ALTERNATE_HOST=as-unresolved.test run "$DIR/write-env.sh"
+  grep -qx "DISCOVERY_VERBATIM_ACCESS_ADDRESS=0" "$env_file"
+
+  for profile in default pass-through-ports; do
+    L2_PROFILE=$profile ALTERNATE_HOST=as-pass-through.test VERBATIM_ACCESS_ADDRESS=true \
+      DISCOVERY_UNRESOLVED_HOSTNAME=leaked DISCOVERY_VERBATIM_ACCESS_ADDRESS=1 run "$DIR/write-env.sh"
+    [ "$status" -eq 0 ]
+    grep -qx "DISCOVERY_UNRESOLVED_HOSTNAME=" "$env_file"
+    grep -qx "DISCOVERY_VERBATIM_ACCESS_ADDRESS=" "$env_file"
+  done
+}
+
+@test "apply-profile unresolved-access passes when the hostname resolves in no running node" {
+  fake_docker
+  L2_PROFILE=unresolved-access AEROSPIKE_CONTAINER_NAMES=discovery-as-1,discovery-as-2,discovery-as-3 \
+    DISCOVERY_PROXY_MAP=discovery-as-1:3000 ALTERNATE_HOST=as-unresolved.test VERBATIM_ACCESS_ADDRESS=false \
+    run "$DIR/apply-profile.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"advertises access addresses verbatim: false"* ]]
+  [[ "$output" == *"as-unresolved.test does not resolve in discovery-as-3"* ]]
+}
+
+@test "apply-profile unresolved-access fails when the hostname resolves in a running node" {
+  fake_docker
+  RESOLVES=discovery-as-2/as-unresolved.test L2_PROFILE=unresolved-access \
+    AEROSPIKE_CONTAINER_NAMES=discovery-as-1,discovery-as-2,discovery-as-3 DISCOVERY_PROXY_MAP=discovery-as-1:3000 \
+    ALTERNATE_HOST=as-unresolved.test VERBATIM_ACCESS_ADDRESS=true run "$DIR/apply-profile.sh"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"as-unresolved.test resolves in discovery-as-2: 127.0.0.1 as-unresolved.test"* ]]
 }
 
 @test "write-env refuses a value with a newline" {

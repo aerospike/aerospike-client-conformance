@@ -5,6 +5,7 @@ set -euo pipefail
 profile="${1:?profile}"
 subset="${2:?subset}"
 unresolvable="${3:-false}"
+verbatim="${4-false}"
 
 num_nodes=3
 extra_hosts=""
@@ -31,6 +32,14 @@ case "$unresolvable" in
   true | false) ;;
   *)
     echo "Error: unresolvable-hostnames must be true or false (got: $unresolvable)" >&2
+    exit 1
+    ;;
+esac
+
+case "$verbatim" in
+  true | false) ;;
+  *)
+    echo "Error: verbatim-access-address must be true or false (got: $verbatim)" >&2
     exit 1
     ;;
 esac
@@ -70,6 +79,11 @@ case "$profile" in
     ;;
   idle-reset)
     idle_reset=1
+    ;;
+  unresolved-access)
+    num_nodes=4
+    control=true
+    alternate_host=as-unresolved.test
     ;;
   *)
     echo "Error: unknown profile $profile" >&2

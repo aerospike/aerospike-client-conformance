@@ -9,7 +9,7 @@ inputs:
   profile:
     description: >-
       default, reachable, pass-through-names, pass-through-ports, port-map-range, cn-only, low-mtu,
-      port-range or idle-reset
+      port-range, idle-reset or unresolved-access
     required: false
     default: default
   subset:
@@ -47,6 +47,12 @@ inputs:
       For reachable, pass-through-names and pass-through-ports, map no advertised hostname in the
       servers and fail if one resolves in a running node. Needs a server that does not resolve its
       access addresses.
+    required: false
+    default: "false"
+  verbatim-access-address:
+    description: >-
+      For unresolved-access, whether the server under test advertises access-address hostnames
+      verbatim without resolving them: true or false.
     required: false
     default: "false"
   control-dir:
@@ -92,9 +98,10 @@ runs:
         PROFILE: ${{ inputs.profile }}
         SUBSET: ${{ inputs.subset }}
         UNRESOLVABLE_HOSTNAMES: ${{ inputs.unresolvable-hostnames }}
+        VERBATIM_ACCESS_ADDRESS: ${{ inputs.verbatim-access-address }}
       run: |
         set -euo pipefail
-        "$GITHUB_ACTION_PATH/profile-settings.sh" "$PROFILE" "$SUBSET" "$UNRESOLVABLE_HOSTNAMES" >> "$GITHUB_OUTPUT"
+        "$GITHUB_ACTION_PATH/profile-settings.sh" "$PROFILE" "$SUBSET" "$UNRESOLVABLE_HOSTNAMES" "$VERBATIM_ACCESS_ADDRESS" >> "$GITHUB_OUTPUT"
 
     - name: Setup Aerospike cluster
       id: aerospike
@@ -140,11 +147,13 @@ runs:
 
     - name: Apply profile
       id: apply
-      if: ${{ contains(fromJSON('["reachable", "pass-through-names", "pass-through-ports", "port-map-range", "low-mtu"]'), inputs.profile) }}
+      if: ${{ contains(fromJSON('["reachable", "pass-through-names", "pass-through-ports", "port-map-range", "low-mtu", "unresolved-access"]'), inputs.profile) }}
       shell: bash
       env:
         L2_PROFILE: ${{ inputs.profile }}
         UNRESOLVABLE_HOSTNAMES: ${{ inputs.unresolvable-hostnames }}
+        VERBATIM_ACCESS_ADDRESS: ${{ inputs.verbatim-access-address }}
+        ALTERNATE_HOST: ${{ steps.profile.outputs.alternate-host }}
         AEROSPIKE_CONTAINER_NAMES: ${{ steps.nodes.outputs.running }}
         AEROSPIKE_NETWORK: ${{ steps.aerospike.outputs.network-name }}
         DISCOVERY_PROXY_MAP: ${{ steps.topology.outputs.proxy-name-port-map }}
@@ -190,4 +199,6 @@ runs:
         DISCOVERY_CLIENT_NETWORK_MTU: ${{ steps.profile.outputs.client-network-mtu }}
         DISCOVERY_PROXY_PORT_RANGE: ${{ steps.profile.outputs.proxy-port-range }}
         DISCOVERY_IDLE_RESET: ${{ steps.profile.outputs.idle-reset }}
+        ALTERNATE_HOST: ${{ steps.profile.outputs.alternate-host }}
+        VERBATIM_ACCESS_ADDRESS: ${{ inputs.verbatim-access-address }}
       run: '"$GITHUB_ACTION_PATH/write-env.sh"'

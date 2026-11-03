@@ -45,7 +45,7 @@ The server runs until the job ends; GitHub stops it then. When the tests run in 
 | `network-name`     | Yes      |         | Docker network of the nodes                                                                                    |
 | `parked-container` | Yes      |         | A created but not started node, `<prefix>-<index>`. Starts clone it as `<prefix>-<index + 1>`, `+ 2` and so on |
 | `config-container` | Yes      |         | A running node that mounts the config volume                                                                   |
-| `alternate-host`   | No       | `""`    | Hostname that `alternate-port=<port>` advertises as `alternate-access-address`                                 |
+| `alternate-host`   | No       | `""`    | Hostname that `alternate-port=<port>` advertises as `alternate-access-address` and `status` looks up           |
 | `ready-timeout`    | No       | `30`    | Seconds to wait for the server to be ready                                                                     |
 
 ## Outputs
@@ -58,18 +58,20 @@ The server runs until the job ends; GitHub stops it then. When the tests run in 
 
 A test picks a unique id, writes one line to `<id>.tmp` in `control-dir` and renames it to `<id>.request`, so the server never reads a partial request. The server deletes the request and answers with `<id>.ack`, written the same way. The ack holds one `key=value` per line; the test reads it, deletes it, and treats an `error` key as a failure.
 
-| Request                                    | Ack on success                        |
-| ------------------------------------------ | ------------------------------------- |
-| `start`                                    | `container=<name>` and `address=<ip>` |
-| `start alternate-port=<port>`              | the same                              |
-| `start address=<ip>`                       | the same                              |
-| `start alternate-port=<port> address=<ip>` | the same                              |
-| `stop <name>`                              | `removed=<name>`                      |
+| Request                                    | Ack on success                                                         |
+| ------------------------------------------ | ---------------------------------------------------------------------- |
+| `start`                                    | `container=<name>` and `address=<ip>`                                  |
+| `start alternate-port=<port>`              | the same                                                               |
+| `start address=<ip>`                       | the same                                                               |
+| `start alternate-port=<port> address=<ip>` | the same                                                               |
+| `stop <name>`                              | `removed=<name>`                                                       |
+| `status <name>`                            | `running`, `exit-code`, `log`, `lookup-in`, `lookup-exit` and `lookup` |
 
 - `start` runs a new node cloned from `parked-container`: same image, command, mounts and extra hosts, and its config copied under the new name.
 - `alternate-port=<port>` adds `alternate-access-address <alternate-host>` and `alternate-access-port <port>` to the new node's service section. It needs `alternate-host`.
 - `address=<ip>` gives the new node that IP. The network needs a fixed subnet (`network-subnet`).
 - `stop <name>` removes a node this server started; it refuses any other container.
+- `status <name>` reports on a node whose name starts with `<prefix>-`: `running=true` or `false`, its `exit-code`, and `log=<control-dir>/<name>.log`, a file the server writes with the node's log. With `alternate-host` it also looks that hostname up with `getent hosts`, in the node while it runs and otherwise in a new container from the same image, network and extra hosts: `lookup-in=container` or `image`, `lookup-exit=<getent exit code>` (`2` means not found) and `lookup=<output on one line>`. Without `alternate-host` those three are empty.
 
 Any failure answers `error=<message>` instead.
 
