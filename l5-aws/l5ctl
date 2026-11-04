@@ -606,9 +606,14 @@ cmd_az_outage() {
 		description: "L5 AZ connectivity loss",
 		roleArn: $role,
 		stopConditions: [{source: "none"}],
-		targets: {subnets: {resourceType: "aws:ec2:subnet", resourceArns: [$p, $c], selectionMode: "ALL"}},
-		actions: {disrupt: {actionId: "aws:network:disrupt-connectivity",
-			parameters: {duration: $duration, scope: "all"}, targets: {Subnets: "subnets"}}},
+		targets: {
+			producer: {resourceType: "aws:ec2:subnet", resourceArns: [$p], selectionMode: "ALL"},
+			consumer: {resourceType: "aws:ec2:subnet", resourceArns: [$c], selectionMode: "ALL"}},
+		actions: {
+			producer: {actionId: "aws:network:disrupt-connectivity",
+				parameters: {duration: $duration, scope: "all"}, targets: {Subnets: "producer"}},
+			consumer: {actionId: "aws:network:disrupt-connectivity",
+				parameters: {duration: $duration, scope: "all"}, targets: {Subnets: "consumer"}}},
 		tags: {($tag): $stack}}')"
 	echo "L5-AZ-OUTAGE az=$az duration=$duration producer-subnet=$producer endpoint-subnet=$consumer"
 	start_experiment az-outage "$template"

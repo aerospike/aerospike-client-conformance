@@ -74,6 +74,8 @@ case "$CONTROL" in
 	"" | resolvable | unresolvable) ;;
 	*) die "--control must be resolvable or unresolvable" ;;
 esac
+# A kept stack already runs a cluster, so the control would see its pods, not a fresh start.
+[ -z "$CONTROL" ] || [ -z "$EXISTING_STACK" ] || die "--control needs a new stack; it cannot run with --stack"
 if [ "$CONTROL" = "unresolvable" ] || [ "$ROWS" = "none" ]; then
 	ROW_LIST=()
 else
@@ -417,11 +419,12 @@ EOF
 	interrupted="$(grep -c '^L5-INTERRUPTED' "$RESULTS/$row-interruptions.txt" || true)"
 	if [ "$row_rc" -eq 0 ]; then
 		echo "ROW $row PASS (unplanned Spot interruptions: $interrupted)" | tee -a "$RESULTS/rows.txt"
-	elif [ "$interrupted" -gt 0 ]; then
-		echo "ROW $row INTERRUPTED: $interrupted unplanned Spot interruption(s) during the row, rerun it (see $row-interruptions.txt)" | tee -a "$RESULTS/rows.txt"
-		failed=1
 	else
-		echo "ROW $row FAIL exit=$row_rc (see $row.log)" | tee -a "$RESULTS/rows.txt"
+		reason="$(grep -m1 '^L5-FAILED' "$RESULTS/$row.log" | cut -c1-200 || true)"
+		line="ROW $row FAIL exit=$row_rc (see $row.log)${reason:+: $reason}"
+		[ "$interrupted" -eq 0 ] ||
+			line+="; $interrupted unplanned Spot interruption(s) during the row, rerun it (see $row-interruptions.txt)"
+		echo "$line" | tee -a "$RESULTS/rows.txt"
 		failed=1
 	fi
 done
