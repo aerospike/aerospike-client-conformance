@@ -310,7 +310,11 @@ install_rc=${PIPESTATUS[0]}
 set -e
 
 if [ "$CONTROL" = "unresolvable" ]; then
-	[ "$install_rc" -eq 0 ] || die "control run: the server did not fail to start as expected; see install.log"
+	if [ "$install_rc" -ne 0 ]; then
+		grep -q '^ERROR: control run:' "$RESULTS/install.log" ||
+			die "control run: install failed before the server was checked, no verdict; see install.log"
+		die "control run: the server did not fail to start as expected; see install.log"
+	fi
 	grep '^L5-START-FAILURE' "$RESULTS/install.log"
 	echo "CONTROL unresolvable PASS"
 	exit 0
