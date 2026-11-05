@@ -67,6 +67,11 @@ while True:
 	ph = spec["phases"].get(shape + ":" + name) or spec["phases"].get(name) or spec["phases"]["start"]
 	first = entered != name
 	entered = name
+	if first:
+		entered_t = t
+	for later in ph.get("later", []):
+		if t - entered_t >= later["after_ms"]:
+			ph = dict(ph, **later)
 	counters["succeeded"] += ph.get("succeed", 10)
 	counters["failed"] += ph.get("fail", 0) + (ph.get("fail_first", 0) if first else 0)
 	counters["clientErrors"] += ph.get("errors", 0)
@@ -216,8 +221,11 @@ def w5():
 	ctl["experiment --wait"] = {"lines": ["L5-FIS experiment={1} status=completed"]}
 	nodes = three_nodes(C1={"address": "10.0.0.2"})
 	outage = three_nodes(C1={"address": "10.0.0.2"}, B1={"active": False, "reachable": False})
+	moved = three_nodes(A1={"address": "10.0.0.2"}, B1={"address": "10.0.0.2", "active": False, "reachable": False},
+		C1={"address": "10.0.0.2"})
 	return {"ctl": ctl, "driver": {"step_ms": 1000, "phases": {"start": {"nodes": nodes},
-		"outage": {"nodes": outage, "fields": {"unowned": 0, "longestUnownedMs": 12000, "maxLatencyMs": 21000}},
+		"outage": {"nodes": outage, "fail": 1, "fields": {"unowned": 0, "longestUnownedMs": 12000, "maxLatencyMs": 21000},
+			"later": [{"after_ms": 10000, "nodes": moved, "fail": 0}]},
 		"after": {"nodes": nodes}}}}
 
 
@@ -642,6 +650,11 @@ class W5Test(RowsTest):
 		self.assertIn("L5-CHECK check=longest-unowned unownedReported=true longestUnownedMs=12000 boundMs=30000", out)
 		self.assertIn("L5-CHECK check=max-latency maxLatencyMs=21000 boundMs=33000", out)
 		self.assertIn("command=reset", out)
+		self.assertIn("L5-CHECK check=moved-off-zone address=10.0.0.1 ", out)
+		self.assertIn("L5-CHECK check=stays-off-zone address=10.0.0.1 t=null afterRunningMs=null nodes=null outcome=pass",
+			out)
+		self.assertIn("L5-CHECK check=no-failures-after-move ", out)
+		self.assertIn("L5-OUTAGE-DNS when=during name=127.0.0.1 address=10.0.0.1 resolvesToCut=false", out)
 
 	def test_passes_without_partition_map(self):
 		s = w5()
@@ -686,6 +699,35 @@ class W5Test(RowsTest):
 		s = w5()
 		s["driver"]["phases"]["outage"]["fields"]["maxLatencyMs"] = 33001
 		self.assertFailsCheck(*self.run_row("W-5", s), "max-latency", maxLatencyMs=33001)
+
+	def test_passes_after_holding_no_nodes(self):
+		s = w5()
+		s["driver"]["phases"]["outage"]["later"].insert(0, {"after_ms": 5000, "nodes": []})
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		self.assertIn("L5-CHECK check=no-failures-after-move ", out)
+
+	def test_moved_off_zone_never(self):
+		s = w5()
+		del s["driver"]["phases"]["outage"]["later"]
+		self.assertFailsCheck(*self.run_row("W-5", s), "moved-off-zone", address="10.0.0.1", afterRunningMs="null")
+
+	def test_moved_off_zone_late(self):
+		s = w5()
+		s["driver"]["phases"]["outage"]["later"][0]["after_ms"] = 60000
+		self.assertFailsCheck(*self.run_row("W-5", s), "moved-off-zone", boundMs=30000)
+
+	def test_stays_off_zone(self):
+		s = w5()
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 60000,
+			"nodes": three_nodes(C1={"address": "10.0.0.2"})})
+		self.assertFailsCheck(*self.run_row("W-5", s), "stays-off-zone", address="10.0.0.1",
+			nodes='["A1@127.0.0.1:31001/10.0.0.1/active=true/reachable=true"')
+
+	def test_no_failures_after_move(self):
+		s = w5()
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 60000, "fail": 1})
+		self.assertFailsCheck(*self.run_row("W-5", s), "no-failures-after-move")
 
 	def test_experiment_wait(self):
 		s = w5()

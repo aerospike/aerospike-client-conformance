@@ -793,9 +793,15 @@ def restore_w3(env, found, state):
 	env.outcome.guard(env.restore_size, found)
 
 
+def client_hosts(snapshot):
+	return ["%s=%s:%s/%s" % (n["name"], n["host"], n["port"], n["address"]) for n in snapshot["nodes"]]
+
+
 def log_resolved(env, when, snapshot):
-	emit("L5-RESOLVED", when=when, t=snapshot["t"], name=env.endpoint, addresses=resolve(env.endpoint) or "unresolved",
-		clientHosts=["%s=%s:%s/%s" % (n["name"], n["host"], n["port"], n["address"]) for n in snapshot["nodes"]])
+	addresses = resolve(env.endpoint)
+	emit("L5-RESOLVED", when=when, t=snapshot["t"], name=env.endpoint, addresses=addresses or "unresolved",
+		clientHosts=client_hosts(snapshot))
+	return addresses
 
 
 def row_w5(env):
@@ -829,8 +835,10 @@ def row_w5(env):
 			reset, _ = drv.request("reset", "reset", REPLY_WAIT_MS)
 			check("reset-reply", reset is not None, boundMs=REPLY_WAIT_MS)
 			running_t = reset["t"]
+			failed_at_running = drv.between(0, reset["_index"])[-1]["failed"]
 			seen = {"status": "running", "next": running_t + STATUS_POLL_MS, "halfway": False, "unowned": False,
-				"longestUnownedMs": 0, "maxLatencyMs": 0, "stretch": None}
+				"longestUnownedMs": 0, "maxLatencyMs": 0, "stretch": None, "resolved": None, "moved": None, "back": None,
+				"rise": None}
 
 			def during(msg):
 				if msg["type"] != "snapshot":
@@ -847,9 +855,21 @@ def row_w5(env):
 							unownedMs=msg["t"] - seen["stretch"], owners=msg["owners"])
 						seen["stretch"] = None
 				seen["maxLatencyMs"] = max(seen["maxLatencyMs"], msg["maxLatencyMs"])
+				on_zone = [n for n in msg["nodes"] if n["address"] == address]
+				if seen["moved"] is None:
+					if msg["nodes"] and not on_zone:
+						seen["moved"] = msg
+						emit("L5-OUTAGE-MOVED", zone=zone, address=address, afterRunningMs=msg["t"] - running_t,
+							clientHosts=client_hosts(msg), failedWhileOnZone=msg["failed"] - failed_at_running,
+							lastError=msg["lastError"])
+				else:
+					if on_zone and seen["back"] is None:
+						seen["back"] = {"t": msg["t"], "nodes": describe(on_zone)}
+					if msg["failed"] > seen["moved"]["failed"] and seen["rise"] is None:
+						seen["rise"] = msg
 				if not seen["halfway"] and msg["t"] - running_t >= OUTAGE_DURATION_MS // 2:
 					seen["halfway"] = True
-					log_resolved(env, "during", msg)
+					seen["resolved"] = log_resolved(env, "during", msg)
 				if msg["t"] >= seen["next"]:
 					seen["next"] = msg["t"] + STATUS_POLL_MS
 					seen["status"] = env.ctl.ok(CTL_TIMEOUT_MS, "experiment", experiment).first("L5-FIS")["status"]
@@ -863,12 +883,26 @@ def row_w5(env):
 				durationMs=OUTAGE_DURATION_MS, unownedReported=seen["unowned"], longestUnownedMs=seen["longestUnownedMs"],
 				maxLatencyMs=seen["maxLatencyMs"], failed=last["failed"], succeeded=last["succeeded"],
 				lastError=last["lastError"])
+			emit("L5-OUTAGE-DNS", when="during", name=env.endpoint, address=address,
+				resolvesToCut=None if seen["resolved"] is None else address in seen["resolved"],
+				addresses=seen["resolved"])
 			check("outage-ended", end is not None, experiment=experiment, status=seen["status"], observedMs=observed,
 				boundMs=OUTAGE_WAIT_MS, pollMs=STATUS_POLL_MS)
 			check("longest-unowned", not seen["unowned"] or seen["longestUnownedMs"] <= OWNERSHIP_GAP_MS,
 				unownedReported=seen["unowned"], longestUnownedMs=seen["longestUnownedMs"], boundMs=OWNERSHIP_GAP_MS)
 			check("max-latency", seen["maxLatencyMs"] <= COMMAND_BOUND_MS, maxLatencyMs=seen["maxLatencyMs"],
 				boundMs=COMMAND_BOUND_MS)
+			moved = seen["moved"]
+			moved_ms = moved and moved["t"] - running_t
+			check("moved-off-zone", moved is not None and moved_ms <= OWNERSHIP_GAP_MS, address=address,
+				afterRunningMs=moved_ms, boundMs=OWNERSHIP_GAP_MS, clientHosts=client_hosts(moved or last),
+				failedWhileOnZone=(moved or last)["failed"] - failed_at_running)
+			back = seen["back"] or {}
+			check("stays-off-zone", not back, address=address, t=back.get("t"),
+				afterRunningMs=back["t"] - running_t if back else None, nodes=back.get("nodes"))
+			rise = seen["rise"]
+			check("no-failures-after-move", rise is None, failedAtMove=moved["failed"], failedAtEnd=last["failed"],
+				firstRiseAfterRunningMs=rise and rise["t"] - running_t, lastError=last["lastError"])
 
 			env.ctl.ok(EXPERIMENT_WAIT_MS, "experiment", experiment, "--wait", name="experiment-wait")
 			state["ended"] = True
