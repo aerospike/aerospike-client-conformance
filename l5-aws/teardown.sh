@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Delete one L5 stack and everything l5ctl created for it: FIS experiments and templates, NLB
-# listeners and target groups first, then the stack. Fails if any resource tagged
+# listeners and target groups first, then the stack, removing what EKS leaves in its VPCs when the
+# stack delete is blocked. Fails if any resource tagged
 # l5-aws-run=<stack name> is left. run.sh calls it; run it by hand for a stack kept with --keep or
 # left by an interrupted run.
 #
@@ -95,7 +96,17 @@ echo "Stack $STACK: $status"
 if [ "$status" != "GONE" ] && [ "$status" != "DELETE_COMPLETE" ]; then
 	L5_STACK="$STACK" L5_ENV=/dev/null "$SCRIPT_DIR/l5ctl" cleanup || rc=1
 	echo "Deleting stack $STACK"
-	if delete_stack || { echo "Stack delete failed; removing what EKS left in its VPCs and retrying"; delete_eks_leftovers; delete_stack; }; then
+	deleted=0
+	for attempt in 1 2 3 4; do
+		if delete_stack; then
+			deleted=1
+			break
+		fi
+		[ "$attempt" -lt 4 ] || break
+		echo "Stack delete failed; removing what EKS left in its VPCs and retrying"
+		delete_eks_leftovers || true
+	done
+	if [ "$deleted" = 1 ]; then
 		echo "Stack $STACK deleted"
 	else
 		echo "ERROR: stack $STACK delete did not complete" >&2
