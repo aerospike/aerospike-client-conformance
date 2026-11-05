@@ -78,6 +78,8 @@ RESOLVE_IMAGE=public.ecr.aws/docker/library/busybox:1.36
 ALTERNATE_ACCESS_LABEL=aerospike.com/configured-alternate-access-address
 SERVICE_PORT=3000
 REPLACED_TIMEOUT=1200
+# A listener added to the NLB takes minutes to carry traffic through the endpoint.
+PATH_TIMEOUT=300
 
 die() {
 	echo "ERROR: $*" >&2
@@ -604,9 +606,14 @@ cmd_az_outage() {
 		description: "L5 AZ connectivity loss",
 		roleArn: $role,
 		stopConditions: [{source: "none"}],
-		targets: {subnets: {resourceType: "aws:ec2:subnet", resourceArns: [$p, $c], selectionMode: "ALL"}},
-		actions: {disrupt: {actionId: "aws:network:disrupt-connectivity",
-			parameters: {duration: $duration, scope: "all"}, targets: {Subnets: "subnets"}}},
+		targets: {
+			producer: {resourceType: "aws:ec2:subnet", resourceArns: [$p], selectionMode: "ALL"},
+			consumer: {resourceType: "aws:ec2:subnet", resourceArns: [$c], selectionMode: "ALL"}},
+		actions: {
+			producer: {actionId: "aws:network:disrupt-connectivity",
+				parameters: {duration: $duration, scope: "all"}, targets: {Subnets: "producer"}},
+			consumer: {actionId: "aws:network:disrupt-connectivity",
+				parameters: {duration: $duration, scope: "all"}, targets: {Subnets: "consumer"}}},
 		tags: {($tag): $stack}}')"
 	echo "L5-AZ-OUTAGE az=$az duration=$duration producer-subnet=$producer endpoint-subnet=$consumer"
 	start_experiment az-outage "$template"
@@ -749,7 +756,7 @@ info_value() {
 # each NodePort reaches that pod's server from this host.
 cmd_verify() {
 	local rc=0 pod svc port node_name instance local_port pf reply node build service_alt peers_alt \
-		other other_port spec healthy path_node ms
+		other other_port spec healthy path_node ms start
 	local -A node_of port_of
 	while read -r svc port; do
 		port_of[$svc]="$port"
@@ -815,14 +822,20 @@ cmd_verify() {
 
 	for pod in "${!node_of[@]}"; do
 		port="${port_of[$pod]}"
-		if ! reply="$(info "$L5_ENDPOINT_NAME" "$port" node build 2>&1)"; then
-			echo "L5-VERIFY-PATH port=$port pod=$pod error=$(tr '\n' ' ' <<<"$reply")"
+		start=$SECONDS
+		until reply="$(info "$L5_ENDPOINT_NAME" "$port" node build 2>&1)"; do
+			[[ "$reply" != *"unexpected reply"* && "$reply" != *"login failed"* ]] || break
+			[ $((SECONDS - start)) -lt "$PATH_TIMEOUT" ] || break
+			sleep 5
+		done
+		if [ -z "$(info_value node <<<"$reply")" ]; then
+			echo "L5-VERIFY-PATH port=$port pod=$pod waited=$((SECONDS - start))s bound=${PATH_TIMEOUT}s error=$(tr '\n' ' ' <<<"$reply")"
 			rc=1
 			continue
 		fi
 		path_node="$(info_value node <<<"$reply")"
 		ms="$(info_value ms <<<"$reply")"
-		echo "L5-VERIFY-PATH port=$port pod=$pod node=$path_node expected=${node_of[$pod]} ms=$ms"
+		echo "L5-VERIFY-PATH port=$port pod=$pod node=$path_node expected=${node_of[$pod]} ms=$ms waited=$((SECONDS - start))s"
 		if [ "$path_node" != "${node_of[$pod]}" ]; then
 			echo "ERROR: $L5_ENDPOINT_NAME:$port reached node $path_node, expected ${node_of[$pod]}" >&2
 			rc=1
