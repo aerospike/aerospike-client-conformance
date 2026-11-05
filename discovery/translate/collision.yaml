@@ -2,8 +2,10 @@ kind: collision
 description: >-
   Translation collisions. input is every peer advertised in one peers reply, in order; each is
   translated with the row's config. Peers that translate to the same host and port become no
-  node, and each colliding pair is reported with both node names, the shared host and port and the
-  translator. expect.nodes is the node names that become nodes.
+  node, and each collision is reported with both node names, the shared host and port and the
+  translator. An expected error with two nodeNames needs that pair reported; one with a single
+  name needs that peer reported in some collision on that host and port, paired with any other
+  peer. expect.nodes is the node names that become nodes.
 rows:
   - case: static-map-two-hosts-one-target
     because: Two hosts mapped to one host on the same port create neither node, and a peer with its own mapping is still created.
@@ -152,7 +154,7 @@ rows:
       errors: []
 
   - case: three-peers-one-endpoint
-    because: Three peers on one host and port create no node, and every colliding pair is reported.
+    because: Three peers on one host and port create no node, and each peer is reported in a collision. FR-46 names two peers per error, so which other peer each is paired with is left to the client.
     config:
       translation: { provider: pass-through }
     input:
@@ -185,7 +187,7 @@ rows:
         - category: translation-collision
           messageContains:
             {
-              nodeNames: [BB9020011AC4202, BB9030011AC4202],
+              nodeNames: [BB9020011AC4202],
               host: as.priv.example.com,
               port: 31001,
               translator: pass-through,
@@ -193,7 +195,7 @@ rows:
         - category: translation-collision
           messageContains:
             {
-              nodeNames: [BB9020011AC4202, BB9040011AC4202],
+              nodeNames: [BB9030011AC4202],
               host: as.priv.example.com,
               port: 31001,
               translator: pass-through,
@@ -201,7 +203,7 @@ rows:
         - category: translation-collision
           messageContains:
             {
-              nodeNames: [BB9030011AC4202, BB9040011AC4202],
+              nodeNames: [BB9040011AC4202],
               host: as.priv.example.com,
               port: 31001,
               translator: pass-through,
