@@ -35,7 +35,7 @@ and passes that directory to its runner; nothing is published elsewhere. A `v<VE
 VERSION
 schema/fixture.schema.json        every fixture file validates against this (JSON Schema 2020-12)
 schema/report.schema.json         the report each runtime writes
-discovery/translate/*.yaml        address translation (kind: translate)
+discovery/translate/*.yaml        address translation (kind: translate, collision)
 discovery/merge/*.yaml            seed merge policy (kind: merge)
 discovery/providers/dns.yaml      dns seed provider (kind: dns)
 discovery/providers/aws-tags.yaml aws-tags seed provider (kind: aws-tags)
@@ -81,6 +81,13 @@ both.
   `sourceList` = `standard` | `alternate`). `expect` is the endpoint to connect to (`host`,
   `port`, `tlsName`), or `error`. `tlsName` is in every input and every expected endpoint, so
   every row checks that translation never changes it.
+- **collision**: `config` is as in translate and sets `translation`. `input` is the ordered list of
+  peers advertised in one peers reply, each an advertised endpoint as in translate, with distinct
+  `nodeName`s. The runner translates every peer with the row's config and runs the collision check
+  on the results. `expect.nodes` is the `nodeName`s that become nodes, in any order, and
+  `expect.errors` is every collision reported, in any order: one `translation-collision` error per
+  pair of peers that translate to the same host and port, or `[]` when none do. Every input peer is
+  either in `nodes` or in a collision.
 - **merge**: `config.seeds` are the static seeds, `input.discoveryResults` are applied in order
   (the first at client initialization, each later one as a refresh) and `expect.snapshots[i]` is
   the exact seed list after result `i`. Seeds compare by host and port.
@@ -114,14 +121,18 @@ both.
 
 An expected error is a category plus the facts its message must contain, never an exception
 type. `translation-miss` must name the node, the advertised host and port,
-and the translator.
+and the translator. `translation-collision` must name both colliding nodes (`nodeNames`), the
+shared host and port they translate to, and the translator; one message naming several nodes on
+the same host and port matches every pair among them.
 
 ## Validation
 
 CI runs `scripts/validate-fixtures.py` on every pull request. It validates each fixture file
 against the schema and checks what the schema cannot: case names are unique within a file, every
 `input.shape` is defined, every shape has a certificate whose CN and SAN match it, every
-certificate has a shape, a merge row has one snapshot per discovery result, and a dns or
+certificate has a shape, a merge row has one snapshot per discovery result, a collision row has
+distinct input node names, names only input peers, accounts for every peer in `nodes` or a
+collision, lists each pair once and names the configured translator, and a dns or
 aws-tags row has one expected refresh per input refresh, a first refresh that returns hosts, seeds
 consistent with its hosts and errors, A and AAAA addresses of the right family, distinct instance
 ids, and `timeout_ms` when a refresh is unanswered. A released

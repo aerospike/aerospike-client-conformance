@@ -6,7 +6,9 @@
 	"additionalProperties": false,
 	"required": ["kind", "rows"],
 	"properties": {
-		"kind": { "enum": ["translate", "merge", "tls", "dns", "aws-tags"] },
+		"kind": {
+			"enum": ["translate", "collision", "merge", "tls", "dns", "aws-tags"]
+		},
 		"description": { "type": "string" },
 		"shapes": {
 			"type": "object",
@@ -22,6 +24,14 @@
 			"then": {
 				"properties": {
 					"rows": { "items": { "$ref": "#/$defs/translateRow" } }
+				}
+			}
+		},
+		{
+			"if": { "properties": { "kind": { "const": "collision" } } },
+			"then": {
+				"properties": {
+					"rows": { "items": { "$ref": "#/$defs/collisionRow" } }
 				}
 			}
 		},
@@ -140,82 +150,84 @@
 			"type": "string",
 			"pattern": "^(\\[[0-9A-Fa-f:.]+\\]|[^\\[\\]:]+):[0-9]+$"
 		},
+		"translateConfig": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"ip_map": { "$ref": "#/$defs/hostMap" },
+				"translation": {
+					"type": "object",
+					"additionalProperties": false,
+					"required": ["provider"],
+					"properties": {
+						"provider": {
+							"enum": ["static-map", "port-map", "pass-through"]
+						},
+						"on_miss": { "enum": ["pass_through", "strict"] },
+						"static_map": { "$ref": "#/$defs/hostMap" },
+						"port_map": {
+							"type": "object",
+							"propertyNames": {
+								"pattern": "^(\\[[0-9A-Fa-f:.]+\\]:[0-9]+|[^\\[\\]:]+:[0-9]+|[0-9A-Fa-f]+)$"
+							},
+							"additionalProperties": { "$ref": "#/$defs/hostPort" }
+						}
+					},
+					"allOf": [
+						{
+							"if": {
+								"properties": { "provider": { "const": "static-map" } }
+							},
+							"then": {
+								"required": ["static_map"],
+								"not": { "required": ["port_map"] }
+							}
+						},
+						{
+							"if": {
+								"properties": { "provider": { "const": "port-map" } }
+							},
+							"then": {
+								"required": ["port_map"],
+								"not": { "required": ["static_map"] }
+							}
+						},
+						{
+							"if": {
+								"properties": { "provider": { "const": "pass-through" } }
+							},
+							"then": {
+								"not": {
+									"anyOf": [
+										{ "required": ["static_map"] },
+										{ "required": ["port_map"] }
+									]
+								}
+							}
+						}
+					]
+				}
+			},
+			"not": { "required": ["ip_map", "translation"] }
+		},
+		"endpoint": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["nodeName", "tlsName", "host", "port", "sourceList"],
+			"properties": {
+				"nodeName": { "type": "string" },
+				"tlsName": { "type": ["string", "null"] },
+				"host": { "type": "string" },
+				"port": { "$ref": "#/$defs/port" },
+				"sourceList": { "enum": ["standard", "alternate"] }
+			}
+		},
 		"translateRow": {
 			"$ref": "#/$defs/row",
 			"unevaluatedProperties": false,
 			"properties": {
-				"config": {
-					"type": "object",
-					"additionalProperties": false,
-					"properties": {
-						"ip_map": { "$ref": "#/$defs/hostMap" },
-						"translation": {
-							"type": "object",
-							"additionalProperties": false,
-							"required": ["provider"],
-							"properties": {
-								"provider": {
-									"enum": ["static-map", "port-map", "pass-through"]
-								},
-								"on_miss": { "enum": ["pass_through", "strict"] },
-								"static_map": { "$ref": "#/$defs/hostMap" },
-								"port_map": {
-									"type": "object",
-									"propertyNames": {
-										"pattern": "^(\\[[0-9A-Fa-f:.]+\\]:[0-9]+|[^\\[\\]:]+:[0-9]+|[0-9A-Fa-f]+)$"
-									},
-									"additionalProperties": { "$ref": "#/$defs/hostPort" }
-								}
-							},
-							"allOf": [
-								{
-									"if": {
-										"properties": { "provider": { "const": "static-map" } }
-									},
-									"then": {
-										"required": ["static_map"],
-										"not": { "required": ["port_map"] }
-									}
-								},
-								{
-									"if": {
-										"properties": { "provider": { "const": "port-map" } }
-									},
-									"then": {
-										"required": ["port_map"],
-										"not": { "required": ["static_map"] }
-									}
-								},
-								{
-									"if": {
-										"properties": { "provider": { "const": "pass-through" } }
-									},
-									"then": {
-										"not": {
-											"anyOf": [
-												{ "required": ["static_map"] },
-												{ "required": ["port_map"] }
-											]
-										}
-									}
-								}
-							]
-						}
-					},
-					"not": { "required": ["ip_map", "translation"] }
-				},
-				"input": {
-					"type": "object",
-					"additionalProperties": false,
-					"required": ["nodeName", "tlsName", "host", "port", "sourceList"],
-					"properties": {
-						"nodeName": { "type": "string" },
-						"tlsName": { "type": ["string", "null"] },
-						"host": { "type": "string" },
-						"port": { "$ref": "#/$defs/port" },
-						"sourceList": { "enum": ["standard", "alternate"] }
-					}
-				},
+				"config": { "$ref": "#/$defs/translateConfig" },
+				"input": { "$ref": "#/$defs/endpoint" },
 				"expect": {
 					"type": "object",
 					"additionalProperties": false,
@@ -244,6 +256,63 @@
 				}
 			},
 			"required": ["config"]
+		},
+		"collisionFacts": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["category", "messageContains"],
+			"properties": {
+				"category": { "const": "translation-collision" },
+				"messageContains": {
+					"type": "object",
+					"additionalProperties": false,
+					"required": ["nodeNames", "host", "port", "translator"],
+					"properties": {
+						"nodeNames": {
+							"type": "array",
+							"minItems": 2,
+							"maxItems": 2,
+							"uniqueItems": true,
+							"items": { "type": "string" }
+						},
+						"host": { "type": "string" },
+						"port": { "$ref": "#/$defs/port" },
+						"translator": { "enum": ["static-map", "port-map", "pass-through"] }
+					}
+				}
+			}
+		},
+		"collisionRow": {
+			"$ref": "#/$defs/row",
+			"unevaluatedProperties": false,
+			"required": ["config"],
+			"properties": {
+				"config": {
+					"$ref": "#/$defs/translateConfig",
+					"required": ["translation"]
+				},
+				"input": {
+					"type": "array",
+					"minItems": 2,
+					"items": { "$ref": "#/$defs/endpoint" }
+				},
+				"expect": {
+					"type": "object",
+					"additionalProperties": false,
+					"required": ["nodes", "errors"],
+					"properties": {
+						"nodes": {
+							"type": "array",
+							"uniqueItems": true,
+							"items": { "type": "string" }
+						},
+						"errors": {
+							"type": "array",
+							"items": { "$ref": "#/$defs/collisionFacts" }
+						}
+					}
+				}
+			}
 		},
 		"mergeRow": {
 			"$ref": "#/$defs/row",
