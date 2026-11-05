@@ -90,6 +90,40 @@ def check_provider_row(row):
     return errors
 
 
+def check_collision_row(row):
+    errors = []
+    names = [peer["nodeName"] for peer in row["input"]]
+    if len(names) != len(set(names)):
+        errors.append("duplicate nodeName in input")
+    if "expect" not in row:
+        return errors
+    nodes = row["expect"]["nodes"]
+    provider = row["config"]["translation"]["provider"]
+    collided = set()
+    pairs = set()
+    for name in nodes:
+        if name not in names:
+            errors.append(f"expect.nodes: {name} is not an input peer")
+    for error in row["expect"]["errors"]:
+        facts = error["messageContains"]
+        pair = frozenset(facts["nodeNames"])
+        if pair in pairs:
+            errors.append(f"collision {sorted(pair)} listed twice")
+        pairs.add(pair)
+        for name in facts["nodeNames"]:
+            if name not in names:
+                errors.append(f"collision names {name}, which is not an input peer")
+            if name in nodes:
+                errors.append(f"collision names {name}, which is also in expect.nodes")
+        collided |= pair
+        if facts["translator"] != provider:
+            errors.append(f"collision names translator {facts['translator']}, config uses {provider}")
+    for name in names:
+        if name not in nodes and name not in collided:
+            errors.append(f"input peer {name} is neither in expect.nodes nor in a collision")
+    return errors
+
+
 def check_file(path, validator):
     errors = []
     doc = yaml.safe_load(path.read_text())
@@ -105,13 +139,17 @@ def check_file(path, validator):
             errors.append(f"{row['case']}: duplicate case")
         seen.add(row["case"])
 
-    if doc["kind"] == "translate":
+    if doc["kind"] in ("translate", "collision"):
         for row in doc["rows"]:
             port_map = row["config"].get("translation", {}).get("port_map", {})
             for key, value in port_map.items():
                 for kind, text in (("key", key), ("value", value)):
                     if (kind == "value" or ":" in text) and (error := host_port_error(text)):
                         errors.append(f"{row['case']}: port_map {kind} {text}: {error}")
+
+    if doc["kind"] == "collision":
+        for row in doc["rows"]:
+            errors += [f"{row['case']}: {error}" for error in check_collision_row(row)]
 
     if doc["kind"] == "merge":
         for row in doc["rows"]:
