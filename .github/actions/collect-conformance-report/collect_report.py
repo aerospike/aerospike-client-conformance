@@ -17,7 +17,7 @@ from pathlib import Path
 import yaml
 
 RESULTS = ("pass", "fail", "unsupported", "blocked")
-FIXTURE_KINDS = ("translate", "merge", "dns", "aws-tags", "tls")
+FIXTURE_KINDS = ("translate", "collision", "merge", "dns", "aws-tags", "tls")
 FIXTURE_ROOTS = ("discovery", "tls")
 
 
