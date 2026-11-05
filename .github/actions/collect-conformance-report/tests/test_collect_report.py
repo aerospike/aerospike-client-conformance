@@ -33,13 +33,14 @@ class CollectReportTests(unittest.TestCase):
         for directory in (self.reports, self.fixtures, self.declarations):
             directory.mkdir()
 
-    def fixture_set(self, cases, blocked=()):
+    def fixture_set(self, cases, blocked=(), kinds=None):
         (self.fixtures / "VERSION").write_text(f"{VERSION}\n", encoding="utf-8")
         by_file: dict[str, list[str]] = {}
         for file_name, case_name in cases:
             by_file.setdefault(file_name, []).append(case_name)
         for file_name, case_names in by_file.items():
-            lines = [f"kind: {'tls' if file_name.startswith('tls/') else 'translate'}", "rows:"]
+            kind = (kinds or {}).get(file_name, "tls" if file_name.startswith("tls/") else "translate")
+            lines = [f"kind: {kind}", "rows:"]
             for case_name in case_names:
                 lines.append(f"  - case: {case_name}")
                 if (file_name, case_name) in blocked:
@@ -74,6 +75,15 @@ class CollectReportTests(unittest.TestCase):
         self.assertFalse(failed)
         self.assertIn("| java | 9.1.0 | 1.0.0 | 0 | 1 | 1 | 0 | ok |", markdown)
         self.assertIn("no translator API", markdown)
+
+    def test_a_collision_case_can_be_declared(self) -> None:
+        collision = "discovery/translate/collision.yaml"
+        self.fixture_set([(collision, "three-peers-one-endpoint")], kinds={collision: "collision"})
+        self.report([{"file": collision, "case": "three-peers-one-endpoint", "result": "fail", "reason": "pairs only"}])
+        self.declare(f"{collision}:\n  three-peers-one-endpoint: {{ result: fail, reason: pairs only }}\n")
+        markdown, failed = self.collect()
+        self.assertFalse(failed)
+        self.assertIn("| java | 9.1.0 | 1.0.0 | 0 | 1 | 0 | 0 | ok |", markdown)
 
     def test_each_gate_rule_fails(self) -> None:
         cases = [(FILE, "broken"), (FILE, "unsupported"), (FILE, "blocked"), (FILE, "missing")]
