@@ -80,7 +80,7 @@ l5-aws/run.sh --client-repo https://github.com/aerospike/aerospike-client-java -
 - `--keep` leaves the stack for debugging; delete it with `teardown.sh <stack name>`. `--stack <stack name>` runs again on a kept stack instead of creating one; SSH to the runner is allowed only from the IP that created it.
 - Control runs on a released server: `--control resolvable` runs the rows with the name also resolvable in the producer VPC (expected to pass); `--control unresolvable` runs no rows and passes only if the server fails to start.
 
-Results go to `l5-aws/results/<stack name>/`: `env`, `install.log`, `setup.log`, `build.log`, one `<row>.log`, `<row>-status.txt` and `<row>-interruptions.txt` per row, `rows.txt` and `cleanup.txt`. AWS can reclaim the Spot nodes at any time; a failed row that overlapped a Spot interruption `spot-interrupt` did not send is reported as `INTERRUPTED` and should be rerun. The feature-key file is copied to the runner, loaded into a Kubernetes secret and deleted; the run fails if any result file contains its content.
+Results go to `l5-aws/results/<stack name>/`: `env`, `install.log`, `setup.log`, `build.log`, one `<row>.log`, `<row>-status.txt` and `<row>-interruptions.txt` per row, `rows.txt` and `cleanup.txt`. AWS can reclaim the Spot nodes at any time; a failed row that overlapped a Spot interruption `spot-interrupt` did not send, or a Spot instance replaced after a rebalance recommendation, is reported as `INTERRUPTED` and should be rerun. The feature-key file is copied to the runner, loaded into a Kubernetes secret and deleted; the run fails if any result file contains its content.
 
 ## Not yet verified
 

@@ -39,6 +39,8 @@ REPLY_WAIT_MS = 10000
 STALL_MARGIN_MS = 30000
 QUIT_WAIT_MS = 60000
 CTL_TIMEOUT_MS = 300000
+# One listener's target health wait and path wait in l5ctl verify, plus CTL_TIMEOUT_MS for the rest.
+VERIFY_TIMEOUT_MS = 900000
 CTL_MARGIN_MS = 120000
 READY_TIMEOUT_S = 1200
 HEALTHY_TIMEOUT_S = 600
@@ -630,7 +632,7 @@ def row_w1(env):
 				snapshot = await_routing(drv, shape, nodes, ROUTING_WAIT_MS)
 				assert_nodes_at_endpoint(env, shape, snapshot, pods)
 				serve(drv, shape)
-		env.ctl.ok(CTL_TIMEOUT_MS, "verify")
+		env.ctl.ok(VERIFY_TIMEOUT_MS, "verify")
 		expect = "yes" if env.control == "resolvable" else "no"
 		env.ctl.ok(CTL_TIMEOUT_MS, "resolve-check", "--expect-producer", expect)
 	finally:
@@ -650,7 +652,7 @@ def recover(env, drv, step, replaced, bound_ms, *command):
 	ready_t = drv.mark()[1]
 	_, pods = env.pods()
 	snapshot = await_routing(drv, step, [p["node"] for p in pods], CLIENT_RECOVERY_MS)
-	env.ctl.ok(CTL_TIMEOUT_MS, "verify")
+	env.ctl.ok(VERIFY_TIMEOUT_MS, "verify")
 	assert_nodes_at_endpoint(env, step, snapshot, pods)
 	end = await_quiet(drv, step, QUIET_WAIT_MS)
 	emit("L5-RECOVERY", step=step, clusterReadyMs=ready_t - start_t, clientRoutedMs=snapshot["t"] - start_t,
@@ -823,6 +825,7 @@ def row_w5(env):
 			check("outage-zone", zone in rack_zones, zone=zone, address=address, nodesByAddress=by_address,
 				rackZones=rack_zones, runnerAz=env.runner_az)
 
+			until_t = drv.mark()[1] + OUTAGE_DURATION_MS
 			started = env.ctl(CTL_TIMEOUT_MS + RUNNING_WAIT_MS, "az-outage", zone, "--duration", OUTAGE_DURATION,
 				"--wait-running")
 			fis = [line for line in started.tagged("L5-FIS") if "experiment" in line.fields]
@@ -863,7 +866,7 @@ def row_w5(env):
 							clientHosts=client_hosts(msg), failedWhileOnZone=msg["failed"] - failed_at_running,
 							lastError=msg["lastError"])
 				else:
-					if on_zone and seen["back"] is None:
+					if on_zone and seen["back"] is None and msg["t"] < until_t:
 						seen["back"] = {"t": msg["t"], "nodes": describe(on_zone)}
 					if msg["failed"] > seen["moved"]["failed"] and seen["rise"] is None:
 						seen["rise"] = msg
@@ -899,7 +902,7 @@ def row_w5(env):
 				failedWhileOnZone=(moved or last)["failed"] - failed_at_running)
 			back = seen["back"] or {}
 			check("stays-off-zone", not back, address=address, t=back.get("t"),
-				afterRunningMs=back["t"] - running_t if back else None, nodes=back.get("nodes"))
+				afterRunningMs=back["t"] - running_t if back else None, nodes=back.get("nodes"), untilT=until_t)
 			rise = seen["rise"]
 			check("no-failures-after-move", rise is None, failedAtMove=moved["failed"], failedAtEnd=last["failed"],
 				firstRiseAfterRunningMs=rise and rise["t"] - running_t, lastError=last["lastError"])

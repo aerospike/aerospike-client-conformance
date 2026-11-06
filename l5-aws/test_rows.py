@@ -651,8 +651,7 @@ class W5Test(RowsTest):
 		self.assertIn("L5-CHECK check=max-latency maxLatencyMs=21000 boundMs=33000", out)
 		self.assertIn("command=reset", out)
 		self.assertIn("L5-CHECK check=moved-off-zone address=10.0.0.1 ", out)
-		self.assertIn("L5-CHECK check=stays-off-zone address=10.0.0.1 t=null afterRunningMs=null nodes=null outcome=pass",
-			out)
+		self.assertIn("L5-CHECK check=stays-off-zone address=10.0.0.1 t=null afterRunningMs=null nodes=null untilT=", out)
 		self.assertIn("L5-CHECK check=no-failures-after-move ", out)
 		self.assertIn("L5-OUTAGE-DNS when=during name=127.0.0.1 address=10.0.0.1 resolvesToCut=false", out)
 
@@ -723,6 +722,26 @@ class W5Test(RowsTest):
 			"nodes": three_nodes(C1={"address": "10.0.0.2"})})
 		self.assertFailsCheck(*self.run_row("W-5", s), "stays-off-zone", address="10.0.0.1",
 			nodes='["A1@127.0.0.1:31001/10.0.0.1/active=true/reachable=true"')
+
+	def test_stays_off_zone_before_outage_end(self):
+		s = w5()
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 200000,
+			"nodes": three_nodes(C1={"address": "10.0.0.2"})})
+		self.assertFailsCheck(*self.run_row("W-5", s), "stays-off-zone", address="10.0.0.1")
+		failed = [line for line in self.output.splitlines() if line.startswith("L5-CHECK check=stays-off-zone ")][0]
+		fields = dict(word.split("=", 1) for word in failed.split()[1:])
+		self.assertLess(int(fields["t"]), int(fields["untilT"]))
+
+	def test_passes_when_back_after_outage_end(self):
+		s = w5()
+		s["ctl"]["experiment"] = [{"lines": ["L5-FIS experiment={1} status=running"]}] * 30 + [
+			{"lines": ["L5-FIS experiment={1} status=completed"], "phase": "after"}]
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 310000,
+			"nodes": three_nodes(C1={"address": "10.0.0.2"})})
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		self.assertIn("L5-CHECK check=stays-off-zone address=10.0.0.1 t=null afterRunningMs=null nodes=null untilT=",
+			out)
 
 	def test_no_failures_after_move(self):
 		s = w5()
