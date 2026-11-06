@@ -80,13 +80,11 @@ l5-aws/run.sh --client-repo https://github.com/aerospike/aerospike-client-java -
 - `--keep` leaves the stack for debugging; delete it with `teardown.sh <stack name>`. `--stack <stack name>` runs again on a kept stack instead of creating one; SSH to the runner is allowed only from the IP that created it.
 - Control runs on a released server: `--control resolvable` runs the rows with the name also resolvable in the producer VPC (expected to pass); `--control unresolvable` runs no rows and passes only if the server fails to start.
 
-Results go to `results/<stack name>/`: `env`, `install.log`, `setup.log`, `build.log`, one `<row>.log`, `<row>-status.txt` and `<row>-interruptions.txt` per row, `rows.txt` and `cleanup.txt`. AWS can reclaim the Spot nodes at any time; a failed row that overlapped a Spot interruption `spot-interrupt` did not send is reported as `INTERRUPTED` and should be rerun. The feature-key file is copied to the runner, loaded into a Kubernetes secret and deleted; the run fails if any result file contains its content.
+Results go to `l5-aws/results/<stack name>/`: `env`, `install.log`, `setup.log`, `build.log`, one `<row>.log`, `<row>-status.txt` and `<row>-interruptions.txt` per row, `rows.txt` and `cleanup.txt`. AWS can reclaim the Spot nodes at any time; a failed row that overlapped a Spot interruption `spot-interrupt` did not send is reported as `INTERRUPTED` and should be rerun. The feature-key file is copied to the runner, loaded into a Kubernetes secret and deleted; the run fails if any result file contains its content.
 
 ## Not yet verified
 
-One run with `--rows none` has passed (2026-11-02): stack create, Elastic IP and EKS access entry, AKO 4.6.0 on EKS 1.33 with the endpoint name in the `configuredIP` label, `verify` and `resolve-check`. Two unplanned Spot interruptions replaced the node in one AZ during that run, and the replacement joined every listener's target group through the Auto Scaling group. No client, row or disruption command has run yet. Unverified:
+The Java and Python clients have both run all four rows through `rows.py` on AWS, which exercised `spot-interrupt` and `az-outage` through FIS and `rollout` through a new launch template version. Still unverified:
 
-- Anything through FIS, which the account's permission simulation did not cover; SCPs were not checked.
-- `update-nodegroup-version` with a new launch template version as the rollout mechanism.
-- The FIS `aws:network:disrupt-connectivity` action also cuts the EKS control plane ENIs in that subnet.
-- `rows.py` against a real driver and cluster; so far only `test_rows.py` has run it, against a fake driver and a stub `l5ctl`.
+- Whether the FIS `aws:network:disrupt-connectivity` action also cuts the EKS control plane ENIs in that subnet.
+- The teardown retry for CNI ENIs and the EKS cluster security group left after a Spot reclaim.

@@ -167,7 +167,7 @@ Restart `maxLatencyMs` and `longestUnownedMs` from now, and reply `{"type":"rese
 
 Measure how soon the client uses a node once its listener serves:
 
-1. Every 10 ms, open a TCP connection to `HOST:PORT` with a 50 ms connect timeout and close it. `servingAt` is the `t` at the start of the first attempt that connects; `lastClosedAt` is the `t` at the start of the last attempt that did not.
+1. Every 10 ms, resolve `HOST`, open a TCP connection to the first address it resolves to, at `PORT`, with a 50 ms connect timeout, and close it. An attempt does not try the other addresses: a new listener serves on one endpoint address before the others, so a probe that walks every address sets `servingAt` early and fails the bound for a client that is not slow. `servingAt` is the `t` at the start of the first attempt that connects; `lastClosedAt` is the `t` at the start of the last attempt that did not.
 2. From `servingAt`, every 10 ms, check whether `NODE` is usable (Definitions). `usableAt` is the `t` of the first check where it is.
 3. Reply when `NODE` is usable, or 60000 ms after `servingAt`:
 
