@@ -756,7 +756,7 @@ info_value() {
 # each NodePort reaches that pod's server from this host.
 cmd_verify() {
 	local rc=0 pod svc port node_name instance local_port pf reply node build service_alt peers_alt \
-		other other_port spec healthy path_node ms start
+		other other_port spec tg healthy path_node ms start
 	local -A node_of port_of
 	while read -r svc port; do
 		port_of[$svc]="$port"
@@ -810,10 +810,16 @@ cmd_verify() {
 		node_name="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}')"
 		instance="$(kubectl get node "$node_name" -o jsonpath='{.spec.providerID}')"
 		instance="${instance##*/}"
-		healthy="$(aws elbv2 describe-target-health --target-group-arn \
-			"$(listeners | awk -v p="$port" '$1 == p { print $3 }')" \
+		tg="$(listeners | awk -v p="$port" '$1 == p { print $3 }')"
+		# A target can drop out for a while just after wait-healthy saw it healthy.
+		start=$SECONDS
+		while healthy="$(aws elbv2 describe-target-health --target-group-arn "$tg" \
 			--query "TargetHealthDescriptions[?TargetHealth.State=='healthy'].Target.Id" --output text 2>/dev/null || true)"
-		echo "L5-VERIFY-TARGET port=$port pod=$pod instance=$instance healthy=${healthy// /,}"
+			[ "$healthy" != "$instance" ]; do
+			[ $((SECONDS - start)) -lt "$PATH_TIMEOUT" ] || break
+			sleep 5
+		done
+		echo "L5-VERIFY-TARGET port=$port pod=$pod instance=$instance healthy=${healthy// /,} waited=$((SECONDS - start))s"
 		if [ "$healthy" != "$instance" ]; then
 			echo "ERROR: listener $port: healthy targets ${healthy:-none}, expected only $instance" >&2
 			rc=1
