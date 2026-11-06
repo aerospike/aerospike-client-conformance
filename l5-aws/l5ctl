@@ -634,7 +634,10 @@ cmd_interruptions() {
 			echo "L5-INTERRUPTED instance=$instance at=$at asg=$asg"
 		done <<<"$(aws autoscaling describe-scaling-activities --auto-scaling-group-name "$asg" --output json |
 			jq -r --arg since "${since%Z}" '.Activities[]
-				| select((.Cause | contains("Spot Instance interruption")) and .StartTime >= $since)
+				| select(((.Cause | contains("Spot Instance interruption"))
+					or ((.Description | startswith("Terminating EC2 instance"))
+						and (.Cause | ascii_downcase | contains("rebalance recommendation"))))
+					and .StartTime >= $since)
 				| "\(.StartTime) \(.Description | capture("(?<id>i-[0-9a-f]+)").id)"')"
 	done
 }
