@@ -29,6 +29,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_TAG=l5-aws-run
+OPERATOR_TAG=l5-aws-operator
 KUBECTL_VERSION=v1.33.0
 HELM_VERSION=v3.16.4
 ALL_ROWS="W-1 W-2 W-3 W-5"
@@ -141,6 +142,32 @@ if [ ${#ROW_LIST[@]} -gt 0 ] && [[ "${CLIENT_REPO%.git}" =~ ^https://github\.com
 		die "$MANIFEST not found at $COMMIT in $CLIENT_REPO; use --rows none for the environment only"
 fi
 
+OPERATOR="${CALLER##*/}"
+live="$(aws cloudformation list-stacks --stack-status-filter CREATE_IN_PROGRESS CREATE_COMPLETE ROLLBACK_IN_PROGRESS \
+	UPDATE_IN_PROGRESS UPDATE_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_COMPLETE UPDATE_ROLLBACK_IN_PROGRESS \
+	UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_ROLLBACK_COMPLETE \
+	--query "StackSummaries[?starts_with(StackName,'l5-aws-')].[StackName,StackId,StackStatus,CreationTime]" --output text)" ||
+	die "cannot list stacks in $AWS_REGION, so the check for another live L5 run could not run"
+blocking=""
+while read -r live_name live_id live_status live_created; do
+	[ -n "$live_name" ] && [ "$live_name" != "$EXISTING_STACK" ] || continue
+	owner="$(aws cloudformation describe-stacks --stack-name "$live_id" \
+		--query "Stacks[0].Tags[?Key=='$OPERATOR_TAG'].Value | [0]" --output text 2>/dev/null)" || owner=""
+	if [ -z "$owner" ] || [ "$owner" = "None" ]; then
+		owner="$(aws cloudtrail lookup-events --lookup-attributes "AttributeKey=ResourceName,AttributeValue=$live_id" \
+			--query "Events[?EventName=='CreateStack'].Username | [0]" --output text 2>/dev/null)" || owner=""
+	fi
+	[ -n "$owner" ] && [ "$owner" != "None" ] || owner=unknown
+	live_created="${live_created%%.*}"
+	live_created="${live_created%+00:00}Z"
+	if [ "$owner" = "$OPERATOR" ]; then
+		echo "Your stack $live_name is also live ($live_status, created $live_created)"
+	else
+		blocking+=$'\n'"  $live_name  $live_status  created $live_created  by $owner"
+	fi
+done <<<"$live"
+[ -z "$blocking" ] || die "another L5 run is live in $AWS_REGION:$blocking"$'\n'"Wait for it to finish or ask its owner; a kept stack is deleted with teardown.sh <stack name>."
+
 RESULTS="$SCRIPT_DIR/results/$STACK"
 WORK="$(mktemp -d)"
 STACK_CREATED=0
@@ -197,7 +224,7 @@ if [ -n "$EXISTING_STACK" ]; then
 	echo "Reusing stack $STACK"
 else
 	aws cloudformation create-stack --stack-name "$STACK" --template-body "file://$SCRIPT_DIR/stack.yaml" \
-		--capabilities CAPABILITY_IAM --tags "Key=$RUN_TAG,Value=$STACK" \
+		--capabilities CAPABILITY_IAM --tags "Key=$RUN_TAG,Value=$STACK" "Key=$OPERATOR_TAG,Value=$OPERATOR" \
 		--parameters "ParameterKey=OperatorCidr,ParameterValue=$OPERATOR_IP/32" \
 		"ParameterKey=PermissionsBoundaryArn,ParameterValue=$AWS_PERMISSIONS_BOUNDARY" \
 		"ParameterKey=ProducerRecord,ParameterValue=$PRODUCER_RECORD" >/dev/null

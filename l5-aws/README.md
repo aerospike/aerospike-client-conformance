@@ -72,6 +72,8 @@ l5-aws/run.sh --client-repo https://github.com/aerospike/aerospike-client-java -
   --manifest test/discovery/l5-aws.manifest --server-image <image with SERVER-1839>
 ```
 
+Before creating anything, every mode except `--plan` refuses to start while another user's L5 stack is live in the region: an `l5-aws-` stack that is being created, updated or rolled back, or is complete. Stacks being deleted or already failed do not block, nor does your own live stack or the one named by `--stack`. The owner is the stack's `l5-aws-operator` tag, or for a stack without it the user CloudTrail records for its `CreateStack`; a stack whose owner cannot be found blocks.
+
 - `--plan` prints what would be created and makes no AWS call.
 - `--rows W-1,W-3` runs a subset; the default order is W-1, W-3, W-2, W-5, least disruptive first.
 - `--registry-auth <dockerconfigjson>` adds a pull secret when the server image is private, for example a JFrog build. Write the file with `podman login --authfile <file> <registry host>`, which stores the credentials in the file itself; a `docker login` that uses a credential helper leaves no credentials in `config.json`. The nodes are x86_64, so the image needs an amd64 variant.
