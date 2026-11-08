@@ -748,6 +748,23 @@ class W5Test(RowsTest):
 		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 60000, "fail": 1})
 		self.assertFailsCheck(*self.run_row("W-5", s), "no-failures-after-move")
 
+	def test_no_failures_after_move_before_outage_end(self):
+		s = w5()
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 200000, "fail": 1})
+		self.assertFailsCheck(*self.run_row("W-5", s), "no-failures-after-move")
+		failed = [line for line in self.output.splitlines() if line.startswith("L5-CHECK check=no-failures-after-move ")][0]
+		self.assertIn(" untilT=", failed)
+
+	def test_passes_when_failures_after_outage_end(self):
+		s = w5()
+		s["ctl"]["experiment"] = [{"lines": ["L5-FIS experiment={1} status=running"]}] * 30 + [
+			{"lines": ["L5-FIS experiment={1} status=completed"], "phase": "after"}]
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 310000, "fail": 1})
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		self.assertIn("L5-CHECK check=no-failures-after-move ", out)
+		self.assertIn(" firstRiseAfterRunningMs=null ", out)
+
 	def test_experiment_wait(self):
 		s = w5()
 		s["ctl"]["experiment --wait"] = {"exit": 2, "stderr": "ERROR: FIS experiment E5 failed"}
