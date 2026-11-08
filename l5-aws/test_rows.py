@@ -54,7 +54,7 @@ if "exit_before_ready" in spec:
 	out({"type": "error", "t": 0, "message": "client not created"})
 	sys.exit(spec["exit_before_ready"])
 if spec.get("ready", True):
-	out(dict({"type": "ready", "t": 0, "contract": 1, "epochMs": 0, "client": "fake", "clientVersion": "0",
+	out(dict({"type": "ready", "t": 0, "contract": 2, "epochMs": 0, "client": "fake", "clientVersion": "0",
 		"shape": shape}, **spec.get("ready_fields", {})))
 t = 0
 counters = {"succeeded": 0, "failed": 0, "clientErrors": 0, "clientTimeouts": 0}
@@ -106,8 +106,14 @@ while True:
 		else:
 			out({"type": "error", "t": t, "message": "unknown command: " + " ".join(words)})
 	if watch and name in spec.get("watch_phases", ["listener"]):
-		out(dict({"type": "watch", "t": t, "address": watch[0], "node": watch[1], "servingAt": t - 60,
-			"lastClosedAt": t - 70, "usableAt": t - 10, "usableMs": 50, "ownershipChecked": True}, **spec.get("watch", {})))
+		reply = {"type": "watch", "t": t, "address": watch[0], "node": watch[1], "servingAt": t - 60,
+			"lastClosedAt": t - 70, "addresses": [{"address": "127.0.0.1", "firstConnectedAt": t - 80},
+				{"address": "127.0.0.2", "firstConnectedAt": t - 60}],
+			"usableAt": t - 10, "usableMs": 50, "ownershipChecked": True}
+		reply.update(spec.get("watch", {}))
+		for key in spec.get("watch_omit", []):
+			reply.pop(key, None)
+		out(reply)
 		watch = None
 '''
 
@@ -416,8 +422,8 @@ class ContractTest(RowsTest):
 
 	def test_wrong_contract(self):
 		s = w1()
-		s["driver"]["ready_fields"] = {"contract": 2}
-		self.assertContract(*self.run_row("W-1", s), "ready with contract 2")
+		s["driver"]["ready_fields"] = {"contract": 3}
+		self.assertContract(*self.run_row("W-1", s), "ready with contract 3, harness speaks 1 or 2")
 
 	def test_no_ready(self):
 		s = w1()
@@ -541,6 +547,34 @@ class W3Test(RowsTest):
 		self.assertIn("L5-PEER-WARNING", out)
 		self.assertIn("ownershipChecked=true", out)
 		self.assertIn("L5-CHECK check=routing step=served", out)
+		self.assertRestored()
+
+	def test_passes_with_addresses(self):
+		s = w3(self.port)
+		s["driver"]["watch"] = {"addresses": [{"address": "127.0.0.1", "firstConnectedAt": 5000},
+			{"address": "127.0.0.2", "firstConnectedAt": None}]}
+		code, out = self.run_row("W-3", s)
+		self.assertPasses(code, out)
+		usable = [line for line in out.splitlines() if line.startswith("L5-NODE-USABLE ")]
+		self.assertEqual(1, len(usable), out)
+		self.assertIn(" contract=2 addresses=127.0.0.1@5000,127.0.0.2@null ", usable[0])
+
+	def test_passes_contract_1(self):
+		s = w3(self.port)
+		s["driver"]["ready_fields"] = {"contract": 1}
+		s["driver"]["watch_omit"] = ["addresses"]
+		code, out = self.run_row("W-3", s)
+		self.assertPasses(code, out)
+		self.assertIn("L5-CHECK check=usable-ms", out)
+		usable = [line for line in out.splitlines() if line.startswith("L5-NODE-USABLE ")]
+		self.assertEqual(1, len(usable), out)
+		self.assertIn(" contract=1 addresses=- ", usable[0])
+		self.assertRestored()
+
+	def test_watch_without_addresses(self):
+		s = w3(self.port)
+		s["driver"]["watch_omit"] = ["addresses"]
+		self.assertContract(*self.run_row("W-3", s), "watch without addresses")
 		self.assertRestored()
 
 	def test_pending(self):
