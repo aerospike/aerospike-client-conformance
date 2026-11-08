@@ -4,7 +4,9 @@ Each client runs L5 through a driver: one executable in the client's repository 
 
 This document is for the engineer writing a client's driver, and is what the harness may rely on. Operating the harness is in [README.md](README.md).
 
-Contract version: **1**.
+Contract version: **2**.
+
+Changed from 1: `watch` probes every address `HOST` resolves to, and `servingAt` is the start of the first of 3 consecutive rounds in which every address connected, where in 1 it was the start of the first attempt that connected to the first address. The `watch` reply adds `addresses`.
 
 Status: the harness side is [`rows.py`](rows.py), which `run.sh` runs for each row when the manifest sets `L5_DRIVER`. A manifest without `L5_DRIVER` still runs its rows through `L5_RUN`, as described in the README.
 
@@ -69,7 +71,7 @@ Once, when the first load command has succeeded.
 {
 	"type": "ready",
 	"t": 812,
-	"contract": 1,
+	"contract": 2,
 	"epochMs": 1762189200123,
 	"client": "java",
 	"clientVersion": "9.2.0",
@@ -167,7 +169,7 @@ Restart `maxLatencyMs` and `longestUnownedMs` from now, and reply `{"type":"rese
 
 Measure how soon the client uses a node once its listener serves:
 
-1. Every 10 ms, resolve `HOST`, open a TCP connection to the first address it resolves to, at `PORT`, with a 50 ms connect timeout, and close it. An attempt does not try the other addresses: a new listener serves on one endpoint address before the others, so a probe that walks every address sets `servingAt` early and fails the bound for a client that is not slow. `servingAt` is the `t` at the start of the first attempt that connects; `lastClosedAt` is the `t` at the start of the last attempt that did not.
+1. Every 10 ms, resolve `HOST` and open a TCP connection to every address it resolves to, at `PORT`, each with a 50 ms connect timeout, concurrently, and close them. A round whose connects have not all finished before the next 10 ms tick delays that tick; rounds never overlap. `servingAt` is the `t` at the start of the first of 3 consecutive rounds in which every address connected; `lastClosedAt` is the `t` at the start of the last round in which any address did not connect. Every address is required because the client may connect to any of them, so the measurement starts only when none refuses.
 2. From `servingAt`, every 10 ms, check whether `NODE` is usable (Definitions). `usableAt` is the `t` of the first check where it is.
 3. Reply when `NODE` is usable, or 60000 ms after `servingAt`:
 
@@ -179,11 +181,18 @@ Measure how soon the client uses a node once its listener serves:
 	"node": "4A0",
 	"servingAt": 90150,
 	"lastClosedAt": 90140,
+	"addresses": [
+		{ "address": "10.80.1.25", "firstConnectedAt": 90100 },
+		{ "address": "10.80.2.31", "firstConnectedAt": 90130 },
+		{ "address": "10.80.3.17", "firstConnectedAt": 90150 }
+	],
 	"usableAt": 90400,
 	"usableMs": 250,
 	"ownershipChecked": true
 }
 ```
+
+`addresses` has one object per address `HOST` resolved to, in resolution order: `address`, the IP address, and `firstConnectedAt`, the `t` at the start of the first round in which it connected, or `null` if none did.
 
 `usableAt` and `usableMs` are `null` if the node did not become usable. `ownershipChecked` is false when the client does not expose its partition map. Probe and check in the driver, with no harness round trip; this is the one measurement whose bound, twice the tend interval, is too tight to rebuild from snapshots.
 

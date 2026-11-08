@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 #
-# One L5 row (W-1, W-2, W-3 or W-5) through a client's driver (DRIVER.md, contract version 1). run.sh
-# runs it on the runner from the client checkout with the row environment of the README. It starts
-# the driver with bash -c from the current directory, sends it commands, reads its JSON lines and
-# makes every pass/fail call; it drives the cluster through $L5_CTL. Every interval it asserts on is
+# One L5 row (W-1, W-2, W-3 or W-5) through a client's driver (DRIVER.md, contract version 2, or 1).
+# run.sh runs it on the runner from the client checkout with the row environment of the README. It
+# starts the driver with bash -c from the current directory, sends it commands, reads its JSON lines
+# and makes every pass/fail call; it drives the cluster through $L5_CTL. Every interval it asserts on is
 # a difference of driver t values or a field the driver measured. Each check prints an L5-CHECK line
 # with its measurement, bound and outcome. The row leaves the cluster at the size it found it.
 #
@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 
-CONTRACT = 1
+CONTRACTS = (1, 2)
 NAMESPACE = "test"
 USER = "admin"
 CLUSTER_SIZE = 3
@@ -83,6 +83,7 @@ MESSAGE_FIELDS = {
 	"error": ("message",),
 }
 NODE_FIELDS = ("name", "host", "port", "address", "active", "reachable")
+WATCH_ADDRESS_FIELDS = ("address", "firstConnectedAt")
 UNOWNED_FIELDS = ("owners", "longestUnownedMs")
 SNAPSHOT_NUMBERS = ("succeeded", "failed", "maxLatencyMs", "unowned", "longestUnownedMs", "clientErrors",
 	"clientTimeouts")
@@ -134,7 +135,7 @@ def is_number(value):
 	return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def contract_problem(msg):
+def contract_problem(msg, contract=None):
 	if not isinstance(msg, dict):
 		return "not a JSON object"
 	kind = msg.get("type")
@@ -157,10 +158,20 @@ def contract_problem(msg):
 		bad = [f for f in SNAPSHOT_NUMBERS if f in msg and not is_number(msg[f])]
 		if bad:
 			return "snapshot %s not a number" % ",".join(bad)
+	if kind == "watch" and contract == 2:
+		if "addresses" not in msg:
+			missing.append("addresses")
+		elif not isinstance(msg["addresses"], list):
+			return "watch addresses is not a list"
+		else:
+			for entry in msg["addresses"]:
+				if not isinstance(entry, dict):
+					return "watch address is not an object"
+				missing += ["addresses[].%s" % f for f in WATCH_ADDRESS_FIELDS if f not in entry]
 	if missing:
 		return "%s without %s" % (kind, ",".join(missing))
-	if kind == "ready" and msg["contract"] != CONTRACT:
-		return "ready with contract %r, harness speaks %d" % (msg["contract"], CONTRACT)
+	if kind == "ready" and msg["contract"] not in CONTRACTS:
+		return "ready with contract %r, harness speaks %s" % (msg["contract"], " or ".join(map(str, CONTRACTS)))
 	return None
 
 
@@ -256,6 +267,7 @@ class Driver:
 		self.status = None
 		self.quit_sent = False
 		self.ready = None
+		self.contract = None
 		say("L5-DRIVER-START command=" + self.command)
 		self.proc = subprocess.Popen(["bash", "-c", self.command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
 			stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, start_new_session=True)
@@ -290,7 +302,7 @@ class Driver:
 			raw = raw.rstrip("\n")
 			try:
 				msg = json.loads(raw)
-				problem = contract_problem(msg)
+				problem = contract_problem(msg, self.contract)
 			except ValueError:
 				msg, problem = None, "non-JSON line on stdout: " + raw[:300]
 			with self.cond:
@@ -298,6 +310,8 @@ class Driver:
 					problem = "t went back from %s to %s" % (self.messages[-1]["t"], msg["t"])
 				if problem is None and msg["type"] == "ready" and msg["shape"] != self.shape:
 					problem = "ready for shape %r, started with %r" % (msg["shape"], self.shape)
+				if problem is None and msg["type"] == "ready":
+					self.contract = msg["contract"]
 				if problem is None:
 					msg["_index"] = len(self.messages)
 					self.messages.append(msg)
@@ -557,6 +571,12 @@ def tcp_connects(host, port, timeout_ms):
 		return False
 
 
+def probed(contract, reply):
+	if contract == 1:
+		return "-"
+	return ",".join("%s@%s" % (a["address"], fmt(a["firstConnectedAt"])) for a in reply["addresses"]) or "-"
+
+
 def await_routing(drv, step, expected, bound_ms):
 	"""A snapshot holding one node per expected name, each active and reachable, with every partition
 	owned when the driver reports ownership."""
@@ -761,9 +781,10 @@ def row_w3(env):
 			reply, waited = drv.reply("watch", LISTENER_WAIT_MS, (watch_mark[0], sync_t))
 			check("watch-reply", reply is not None, address=address, node=node, waitedMs=waited,
 				boundMs=LISTENER_WAIT_MS)
-			emit("L5-NODE-USABLE", pod=pod, node=node, advertised=address, servingAt=reply["servingAt"],
-				lastClosedAt=reply["lastClosedAt"], usableAt=reply["usableAt"], usableMs=reply["usableMs"],
-				ownershipChecked=reply["ownershipChecked"], tendInterval=TEND_INTERVAL_MS)
+			emit("L5-NODE-USABLE", pod=pod, node=node, advertised=address, contract=drv.contract,
+				addresses=probed(drv.contract, reply), servingAt=reply["servingAt"], lastClosedAt=reply["lastClosedAt"],
+				usableAt=reply["usableAt"], usableMs=reply["usableMs"], ownershipChecked=reply["ownershipChecked"],
+				tendInterval=TEND_INTERVAL_MS)
 			check("watch-usable", reply["usableAt"] is not None and reply["usableMs"] is not None, node=node,
 				servingAt=reply["servingAt"], usableAt=reply["usableAt"])
 			budget_ms = USABLE_TEND_INTERVALS * TEND_INTERVAL_MS
