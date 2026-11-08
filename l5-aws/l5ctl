@@ -45,8 +45,8 @@
 #       Cut all traffic in and out of the producer and endpoint subnets in AZ, through FIS
 #       (default PT5M). --wait-running returns once FIS reports the experiment running.
 #   interruptions SINCE
-#       Print each Spot interruption of an Aerospike node since SINCE (UTC, 2026-11-03T03:00:00Z)
-#       that spot-interrupt did not send.
+#       Print each Spot interruption of an Aerospike node in progress at or started after SINCE
+#       (UTC, 2026-11-03T03:00:00Z) that spot-interrupt did not send.
 #   endpoint-zone ADDRESS
 #       Print the AZ of the interface endpoint's network interface that has ADDRESS.
 #   experiment ID [--wait]
@@ -637,7 +637,7 @@ cmd_interruptions() {
 				| select(((.Cause | contains("Spot Instance interruption"))
 					or ((.Description | startswith("Terminating EC2 instance"))
 						and (.Cause | ascii_downcase | contains("rebalance recommendation"))))
-					and .StartTime >= $since)
+					and (.StartTime >= $since or .EndTime == null or .EndTime >= $since))
 				| "\(.StartTime) \(.Description | capture("(?<id>i-[0-9a-f]+)").id)"')"
 	done
 }
