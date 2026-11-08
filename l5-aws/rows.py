@@ -868,7 +868,7 @@ def row_w5(env):
 				else:
 					if on_zone and seen["back"] is None and msg["t"] < until_t:
 						seen["back"] = {"t": msg["t"], "nodes": describe(on_zone)}
-					if msg["failed"] > seen["moved"]["failed"] and seen["rise"] is None:
+					if msg["failed"] > seen["moved"]["failed"] and seen["rise"] is None and msg["t"] < until_t:
 						seen["rise"] = msg
 				if not seen["halfway"] and msg["t"] - running_t >= OUTAGE_DURATION_MS // 2:
 					seen["halfway"] = True
@@ -905,7 +905,7 @@ def row_w5(env):
 				afterRunningMs=back["t"] - running_t if back else None, nodes=back.get("nodes"), untilT=until_t)
 			rise = seen["rise"]
 			check("no-failures-after-move", rise is None, failedAtMove=moved["failed"], failedAtEnd=last["failed"],
-				firstRiseAfterRunningMs=rise and rise["t"] - running_t, lastError=last["lastError"])
+				firstRiseAfterRunningMs=rise and rise["t"] - running_t, lastError=last["lastError"], untilT=until_t)
 
 			env.ctl.ok(EXPERIMENT_WAIT_MS, "experiment", experiment, "--wait", name="experiment-wait")
 			state["ended"] = True
