@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# One L5 row (W-1, W-2, W-3 or W-5) through a client's driver (DRIVER.md, contract version 2, or 1).
+# One L5 row (W-1, W-2, W-3 or W-5) through a client's driver (DRIVER.md, contract version 3, 2 or 1).
 # run.sh runs it on the runner from the client checkout with the row environment of the README. It
 # starts the driver with bash -c from the current directory, sends it commands, reads its JSON lines
 # and makes every pass/fail call; it drives the cluster through $L5_CTL. Every interval it asserts on is
@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 
-CONTRACTS = (1, 2)
+CONTRACTS = (1, 2, 3)
 NAMESPACE = "test"
 USER = "admin"
 CLUSTER_SIZE = 3
@@ -81,6 +81,7 @@ MESSAGE_FIELDS = {
 	"reset": (),
 	"watch": ("address", "node", "servingAt", "lastClosedAt", "usableAt", "usableMs", "ownershipChecked"),
 	"error": ("message",),
+	"failure": ("startedAt", "message"),
 }
 NODE_FIELDS = ("name", "host", "port", "address", "active", "reachable")
 WATCH_ADDRESS_FIELDS = ("address", "firstConnectedAt")
@@ -141,6 +142,8 @@ def contract_problem(msg, contract=None):
 	kind = msg.get("type")
 	if kind not in MESSAGE_FIELDS:
 		return "unknown type %r" % (kind,)
+	if kind == "failure" and contract != 3:
+		return "failure from a driver without contract 3"
 	if not is_number(msg.get("t")):
 		return "%s without a numeric t" % kind
 	missing = [f for f in MESSAGE_FIELDS[kind] if f not in msg]
@@ -170,8 +173,11 @@ def contract_problem(msg, contract=None):
 				missing += ["addresses[].%s" % f for f in WATCH_ADDRESS_FIELDS if f not in entry]
 	if missing:
 		return "%s without %s" % (kind, ",".join(missing))
+	if kind == "failure" and not is_number(msg["startedAt"]):
+		return "failure startedAt not a number"
 	if kind == "ready" and msg["contract"] not in CONTRACTS:
-		return "ready with contract %r, harness speaks %s" % (msg["contract"], " or ".join(map(str, CONTRACTS)))
+		return "ready with contract %r, harness speaks %s or %s" % (msg["contract"],
+			", ".join(map(str, CONTRACTS[:-1])), CONTRACTS[-1])
 	return None
 
 
@@ -862,9 +868,16 @@ def row_w5(env):
 			failed_at_running = drv.between(0, reset["_index"])[-1]["failed"]
 			seen = {"status": "running", "next": running_t + STATUS_POLL_MS, "halfway": False, "unowned": False,
 				"longestUnownedMs": 0, "maxLatencyMs": 0, "stretch": None, "resolved": None, "moved": None, "back": None,
-				"rise": None}
+				"rise": None, "startedBeforeMove": 0, "startedAfterMove": 0, "firstStartAfterMove": None}
 
 			def during(msg):
+				if msg["type"] == "failure" and seen["moved"] is not None:
+					if msg["startedAt"] < seen["moved"]["t"]:
+						seen["startedBeforeMove"] += 1
+					elif msg["startedAt"] < until_t:
+						seen["startedAfterMove"] += 1
+						if seen["firstStartAfterMove"] is None:
+							seen["firstStartAfterMove"] = msg
 				if msg["type"] != "snapshot":
 					return None
 				if "unowned" in msg:
@@ -924,9 +937,17 @@ def row_w5(env):
 			back = seen["back"] or {}
 			check("stays-off-zone", not back, address=address, t=back.get("t"),
 				afterRunningMs=back["t"] - running_t if back else None, nodes=back.get("nodes"), untilT=until_t)
-			rise = seen["rise"]
-			check("no-failures-after-move", rise is None, failedAtMove=moved["failed"], failedAtEnd=last["failed"],
-				firstRiseAfterRunningMs=rise and rise["t"] - running_t, lastError=last["lastError"], untilT=until_t)
+			if drv.contract == 3:
+				first = seen["firstStartAfterMove"]
+				check("no-failures-after-move", first is None, failedAtMove=moved["failed"], failedAtEnd=last["failed"],
+					basis="start", startedBeforeMove=seen["startedBeforeMove"], startedAfterMove=seen["startedAfterMove"],
+					firstStartAfterRunningMs=first and first["startedAt"] - running_t, message=first and first["message"],
+					lastError=last["lastError"], untilT=until_t)
+			else:
+				rise = seen["rise"]
+				check("no-failures-after-move", rise is None, failedAtMove=moved["failed"], failedAtEnd=last["failed"],
+					basis="completion", firstRiseAfterRunningMs=rise and rise["t"] - running_t, lastError=last["lastError"],
+					untilT=until_t)
 
 			env.ctl.ok(EXPERIMENT_WAIT_MS, "experiment", experiment, "--wait", name="experiment-wait")
 			state["ended"] = True
