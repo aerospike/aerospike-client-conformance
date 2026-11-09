@@ -147,8 +147,8 @@ live="$(aws cloudformation list-stacks --stack-status-filter CREATE_IN_PROGRESS 
 	UPDATE_IN_PROGRESS UPDATE_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_COMPLETE UPDATE_ROLLBACK_IN_PROGRESS \
 	UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_ROLLBACK_COMPLETE \
 	--query "StackSummaries[?starts_with(StackName,'l5-aws-')].[StackName,StackId,StackStatus,CreationTime]" --output text)" ||
-	die "cannot list stacks in $AWS_REGION, so the check for another live L5 run could not run"
-blocking=""
+	die "cannot list stacks in $AWS_REGION"
+others=""
 while read -r live_name live_id live_status live_created; do
 	[ -n "$live_name" ] && [ "$live_name" != "$EXISTING_STACK" ] || continue
 	owner="$(aws cloudformation describe-stacks --stack-name "$live_id" \
@@ -160,13 +160,32 @@ while read -r live_name live_id live_status live_created; do
 	[ -n "$owner" ] && [ "$owner" != "None" ] || owner=unknown
 	live_created="${live_created%%.*}"
 	live_created="${live_created%+00:00}Z"
-	if [ "$owner" = "$OPERATOR" ]; then
-		echo "Your stack $live_name is also live ($live_status, created $live_created)"
-	else
-		blocking+=$'\n'"  $live_name  $live_status  created $live_created  by $owner"
-	fi
+	others+=$'\n'"  $live_name  $live_status  created $live_created  by $owner"
 done <<<"$live"
-[ -z "$blocking" ] || die "another L5 run is live in $AWS_REGION:$blocking"$'\n'"Wait for it to finish or ask its owner; a kept stack is deleted with teardown.sh <stack name>."
+
+short=""
+check_capacity() {
+	local label=$1 type=$2 service=$3 code=$4 count=$5 key=$6 needed limit in_use
+	needed="$(grep -c "^    Type: AWS::EC2::$type\$" "$SCRIPT_DIR/stack.yaml")" || needed=0
+	limit="$(aws service-quotas get-service-quota --service-code "$service" --quota-code "$code" \
+		--query Quota.Value --output text 2>/dev/null)" ||
+		limit="$(aws service-quotas get-aws-default-service-quota --service-code "$service" --quota-code "$code" \
+			--query Quota.Value --output text 2>/dev/null)" ||
+		die "cannot read the $label quota ($service $code) in $AWS_REGION, so the capacity check could not run"
+	limit="${limit%%.*}"
+	in_use="$(aws ec2 "$count" --query "length($key)" --output text)" ||
+		die "cannot count $label in $AWS_REGION, so the capacity check could not run"
+	[[ "$limit" =~ ^[0-9]+$ && "$in_use" =~ ^[0-9]+$ ]] ||
+		die "unexpected $label quota '$limit' or count '$in_use', so the capacity check could not run"
+	[ $((in_use + needed)) -le "$limit" ] || short+=$'\n'"  $label $in_use of $limit in use, this run needs $needed"
+}
+if [ -z "$EXISTING_STACK" ]; then
+	check_capacity VPCs VPC vpc L-F678F1CE describe-vpcs Vpcs
+	check_capacity "internet gateways" InternetGateway vpc L-A4707A72 describe-internet-gateways InternetGateways
+	check_capacity "Elastic IPs" EIP ec2 L-0263D0A3 describe-addresses Addresses
+	[ -z "$short" ] || die "not enough capacity in $AWS_REGION for another L5 run:$short"$'\n'"Live L5 stacks:${others:- none}"$'\n'"Wait for one to finish, ask its owner, raise the quota, or run in another AWS_REGION."
+fi
+[ -z "$others" ] || echo "Live L5 stacks in $AWS_REGION:$others"
 
 RESULTS="$SCRIPT_DIR/results/$STACK"
 WORK="$(mktemp -d)"
