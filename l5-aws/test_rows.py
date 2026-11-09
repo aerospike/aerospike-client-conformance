@@ -53,6 +53,7 @@ for raw in spec.get("raw", []):
 if "exit_before_ready" in spec:
 	out({"type": "error", "t": 0, "message": "client not created"})
 	sys.exit(spec["exit_before_ready"])
+contract = dict({"contract": 2}, **spec.get("ready_fields", {}))["contract"]
 if spec.get("ready", True):
 	out(dict({"type": "ready", "t": 0, "contract": 2, "epochMs": 0, "client": "fake", "clientVersion": "0",
 		"shape": shape}, **spec.get("ready_fields", {})))
@@ -73,7 +74,15 @@ while True:
 		if t - entered_t >= later["after_ms"]:
 			ph = dict(ph, **later)
 	counters["succeeded"] += ph.get("succeed", 10)
-	counters["failed"] += ph.get("fail", 0) + (ph.get("fail_first", 0) if first else 0)
+	failures = ph.get("fail", 0) + (ph.get("fail_first", 0) if first else 0)
+	counters["failed"] += failures
+	if contract == 3:
+		for _ in range(failures):
+			failure = {"type": "failure", "t": t, "startedAt": entered_t + ph["started_ms"] if "started_ms" in ph else t - 500,
+				"message": ph.get("error", "timeout")}
+			for key in ph.get("failure_omit", []):
+				failure.pop(key, None)
+			out(failure)
 	counters["clientErrors"] += ph.get("errors", 0)
 	snapshot = {"type": "snapshot", "t": t, "reason": "change" if first else "heartbeat", "nodes": ph["nodes"],
 		"unowned": 0, "owners": {n["name"]: 1 for n in ph["nodes"]}, "longestUnownedMs": 0, "maxLatencyMs": 5,
@@ -422,8 +431,8 @@ class ContractTest(RowsTest):
 
 	def test_wrong_contract(self):
 		s = w1()
-		s["driver"]["ready_fields"] = {"contract": 3}
-		self.assertContract(*self.run_row("W-1", s), "ready with contract 3, harness speaks 1 or 2")
+		s["driver"]["ready_fields"] = {"contract": 4}
+		self.assertContract(*self.run_row("W-1", s), "ready with contract 4, harness speaks 1, 2 or 3")
 
 	def test_no_ready(self):
 		s = w1()
@@ -687,6 +696,7 @@ class W5Test(RowsTest):
 		self.assertIn("L5-CHECK check=moved-off-zone address=10.0.0.1 ", out)
 		self.assertIn("L5-CHECK check=stays-off-zone address=10.0.0.1 t=null afterRunningMs=null nodes=null untilT=", out)
 		self.assertIn("L5-CHECK check=no-failures-after-move ", out)
+		self.assertIn(" basis=completion firstRiseAfterRunningMs=null ", out)
 		self.assertIn("L5-OUTAGE-DNS when=during name=127.0.0.1 address=10.0.0.1 resolvesToCut=false", out)
 
 	def test_passes_without_partition_map(self):
@@ -798,6 +808,43 @@ class W5Test(RowsTest):
 		self.assertPasses(code, out)
 		self.assertIn("L5-CHECK check=no-failures-after-move ", out)
 		self.assertIn(" firstRiseAfterRunningMs=null ", out)
+
+	def test_passes_contract_3_when_failures_started_before_move(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 3}
+		s["driver"]["phases"]["outage"]["later"] += [{"after_ms": 11000, "fail": 2, "started_ms": 9500},
+			{"after_ms": 13000, "fail": 0}]
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		self.assertIn("basis=start startedBeforeMove=4 startedAfterMove=0 firstStartAfterRunningMs=null message=null ",
+			out)
+
+	def test_no_failures_after_move_contract_3(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 3}
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 60000, "fail": 1, "error": "node-2A0-timeout"})
+		self.assertFailsCheck(*self.run_row("W-5", s), "no-failures-after-move", basis="start",
+			startedBeforeMove=0, message="node-2A0-timeout")
+		failed = [line for line in self.output.splitlines() if line.startswith("L5-CHECK check=no-failures-after-move ")][0]
+		fields = dict(word.split("=", 1) for word in failed.split()[1:])
+		self.assertGreater(int(fields["firstStartAfterRunningMs"]), 50000)
+		self.assertNotEqual("0", fields["startedAfterMove"])
+
+	def test_passes_contract_3_when_failures_start_after_outage_end(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 3}
+		s["ctl"]["experiment"] = [{"lines": ["L5-FIS experiment={1} status=running"]}] * 30 + [
+			{"lines": ["L5-FIS experiment={1} status=completed"], "phase": "after"}]
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 310000, "fail": 1})
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		self.assertIn(" basis=start startedBeforeMove=0 startedAfterMove=0 firstStartAfterRunningMs=null ", out)
+
+	def test_failure_without_started_at(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 3}
+		s["driver"]["phases"]["outage"]["failure_omit"] = ["startedAt"]
+		self.assertContract(*self.run_row("W-5", s), "failure without startedAt")
 
 	def test_experiment_wait(self):
 		s = w5()

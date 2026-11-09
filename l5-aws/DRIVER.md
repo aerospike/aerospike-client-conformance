@@ -4,9 +4,11 @@ Each client runs L5 through a driver: one executable in the client's repository 
 
 This document is for the engineer writing a client's driver, and is what the harness may rely on. Operating the harness is in [README.md](README.md).
 
-Contract version: **2**.
+Contract version: **3**.
 
-Changed from 1: `watch` probes every address `HOST` resolves to, and `servingAt` is the start of the first of 3 consecutive rounds in which every address connected, where in 1 it was the start of the first attempt that connected to the first address. The `watch` reply adds `addresses`.
+Changed from 2: each failed attempt of the load writes a `failure` with the `t` its attempt started, so the harness can tell an attempt sent before a routing change from one sent after it.
+
+Changed from 1 to 2: `watch` probes every address `HOST` resolves to, and `servingAt` is the start of the first of 3 consecutive rounds in which every address connected, where in 1 it was the start of the first attempt that connected to the first address. The `watch` reply adds `addresses`.
 
 Status: the harness side is [`rows.py`](rows.py), which `run.sh` runs for each row when the manifest sets `L5_DRIVER`. A manifest without `L5_DRIVER` still runs its rows through `L5_RUN`, as described in the README.
 
@@ -52,7 +54,7 @@ Set the client's own command retries to zero. The driver retries, so the timing 
 Start the load once the client is created. Each of the `--workers` workers runs one command at a time, forever, until `quit`:
 
 - Worker `w` (from 0), iteration `i` (from 0) uses key `load-<k>` with `k = (w + i * workers) % keys`. An even `i` puts bin `v` with the integer `i`; an odd `i` gets the record.
-- An attempt fails on any error the client returns or raises. Count it in `failed`, keep its message as `lastError`, sleep one tend interval, and issue the same command again. Repeat until it succeeds.
+- An attempt fails on any error the client returns or raises. Count it in `failed`, keep its message as `lastError`, write a `failure` (Output), sleep one tend interval, and issue the same command again. Repeat until it succeeds.
 - A success counts in `succeeded`. Its latency is the time from its first attempt to its success. `maxLatencyMs` is the largest latency of the commands whose first attempt started at or after the last `reset`.
 
 On a worker runtime without threads, run the workers as concurrent tasks; each still has one command in flight.
@@ -71,7 +73,7 @@ Once, when the first load command has succeeded.
 {
 	"type": "ready",
 	"t": 812,
-	"contract": 2,
+	"contract": 3,
 	"epochMs": 1762189200123,
 	"client": "java",
 	"clientVersion": "9.2.0",
@@ -123,6 +125,21 @@ Every 100 ms, and immediately whenever the routing changes: a node is added or r
 | `succeeded`, `failed`, `maxLatencyMs`, `lastError` | yes                                     | From the load                                                                                                                                                                                                                                                                           |
 
 Leave out a field the client cannot provide; never send a placeholder. The harness asserts on `unowned` only when it is present, and otherwise on `serve` and command latency.
+
+### `failure`
+
+Once for each failed attempt of the load, when it fails.
+
+```json
+{
+	"type": "failure",
+	"t": 19370,
+	"startedAt": 19110,
+	"message": "Node 2A0 10.80.1.25 30287: Timeout"
+}
+```
+
+`startedAt` is the `t` at the start of that attempt, not of the command's first attempt. `message` is the error message, as kept in `lastError`. An attempt that fails before `ready` counts in `failed` but writes no `failure`, since `ready` is the first line and `t` never goes back.
 
 ### `log`
 
