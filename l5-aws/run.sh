@@ -114,7 +114,7 @@ STACK="${EXISTING_STACK:-l5-aws-$(date -u +%Y%m%d-%H%M%S)}"
 if [ "$PLAN" = "1" ]; then
 	echo "Plan, no AWS call made:"
 	echo "  stack          $STACK in $AWS_REGION, profile $AWS_PROFILE, template $SCRIPT_DIR/stack.yaml"
-	echo "  creates        producer VPC (EKS $(sed -n '/^  KubernetesVersion:/,/Default:/s/^ *Default: *//p' "$SCRIPT_DIR/stack.yaml" | tr -d '"'), one system and three Spot node groups, internal NLB, endpoint service),"
+	echo "  creates        producer VPC (EKS $(sed -n '/^  KubernetesVersion:/,/Default:/s/^ *Default: *//p' "$SCRIPT_DIR/stack.yaml" | tr -d '"'), one system and three Aerospike node groups (Spot in zone A, on-demand in B and C), internal NLB, endpoint service),"
 	echo "                 consumer VPC (interface endpoint, private hosted zone, runner with an Elastic IP), IAM roles for EKS, nodes, FIS and the runner"
 	echo "  boundary       $AWS_PERMISSIONS_BOUNDARY"
 	echo "  producer zone  $PRODUCER_RECORD"

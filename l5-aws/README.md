@@ -4,7 +4,7 @@
 
 ## What the environment is
 
-- Producer VPC: EKS across three AZs, AKO 4.6.0, one AerospikeCluster with one rack per AZ, `multiPodPerHost: true` and `alternateAccess: configuredIP`. Aerospike runs on Spot, one node group per AZ, one pod per node. Every Aerospike node carries the endpoint name as the `aerospike.com/configured-alternate-access-address` label, so every pod advertises the endpoint name and its own per-pod Service NodePort in `peers-*-alt`.
+- Producer VPC: EKS across three AZs, AKO 4.6.0, one AerospikeCluster with one rack per AZ, `multiPodPerHost: true` and `alternateAccess: configuredIP`. Aerospike runs on one node group per AZ, one pod per node: Spot in the first AZ, where W-2 sends its Spot interruption, and on-demand in the other two, so unplanned reclaims hit one rack instead of three. Every Aerospike node carries the endpoint name as the `aerospike.com/configured-alternate-access-address` label, so every pod advertises the endpoint name and its own per-pod Service NodePort in `peers-*-alt`.
 - An internal NLB with cross-zone load balancing, one TCP listener per pod NodePort (listener port = NodePort), each forwarding to a target group of the Aerospike node groups' instances. `l5ctl sync-listeners` creates them; the stack does not.
 - Consumer VPC: the interface endpoint in three subnets and a private hosted zone that resolves the endpoint name to it. The name resolves here only, as in Cloud. With `--control resolvable` it also resolves in the producer VPC.
 - The runner, in the consumer VPC: the client and its tests run here, and it is the only address the EKS API accepts.
