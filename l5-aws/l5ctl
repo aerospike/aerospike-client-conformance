@@ -625,20 +625,24 @@ cmd_az_outage() {
 }
 
 cmd_interruptions() {
-	local since="${1:?interruptions needs a UTC time like 2026-11-03T03:00:00Z}" asg at instance
+	local since="${1:?interruptions needs a UTC time like 2026-11-03T03:00:00Z}" groups asg activities at instance
 	[[ "$since" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die "interruptions needs a UTC time like 2026-11-03T03:00:00Z"
-	for asg in $(asgs); do
-		while read -r at instance; do
-			[ -n "$instance" ] || continue
-			grep -qx "$instance" "$L5_DIR/fis-interrupted" 2>/dev/null && continue
-			echo "L5-INTERRUPTED instance=$instance at=$at asg=$asg"
-		done <<<"$(aws autoscaling describe-scaling-activities --auto-scaling-group-name "$asg" --output json |
+	groups="$(asgs)"
+	[ -n "$groups" ] || die "no Aerospike node group Auto Scaling group found, so interruptions cannot be checked"
+	for asg in $groups; do
+		activities="$(aws autoscaling describe-scaling-activities --auto-scaling-group-name "$asg" --output json |
 			jq -r --arg since "${since%Z}" '.Activities[]
 				| select(((.Cause | contains("Spot Instance interruption"))
 					or ((.Description | startswith("Terminating EC2 instance"))
 						and (.Cause | ascii_downcase | contains("rebalance recommendation"))))
 					and (.StartTime >= $since or .EndTime == null or .EndTime >= $since))
-				| "\(.StartTime) \(.Description | capture("(?<id>i-[0-9a-f]+)").id)"')"
+				| "\(.StartTime) \(.Description | capture("(?<id>i-[0-9a-f]+)").id)"')" ||
+			die "cannot read the scaling activities of $asg"
+		while read -r at instance; do
+			[ -n "$instance" ] || continue
+			grep -qx "$instance" "$L5_DIR/fis-interrupted" 2>/dev/null && continue
+			echo "L5-INTERRUPTED instance=$instance at=$at asg=$asg"
+		done <<<"$activities"
 	done
 }
 

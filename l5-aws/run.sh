@@ -223,7 +223,11 @@ cleanup() {
 			echo "  AWS_PROFILE=$AWS_PROFILE AWS_REGION=$AWS_REGION $SCRIPT_DIR/teardown.sh $STACK"
 		else
 			"$SCRIPT_DIR/teardown.sh" "$STACK" 2>&1 | tee "$RESULTS/cleanup.txt"
-			[ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
+			if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+				rc=1
+				echo "Teardown failed; the stack may still exist. Once the credentials work, run it again with:"
+				echo "  AWS_PROFILE=$AWS_PROFILE AWS_REGION=$AWS_REGION $SCRIPT_DIR/teardown.sh $STACK"
+			fi
 		fi
 	fi
 	secret_scan || rc=1
@@ -421,9 +425,21 @@ grep -E '^(Commit|Rows): ' "$RESULTS/build.log"
 # Each row starts on a Completed cluster with a healthy listener per NodePort. rows.py with the
 # manifest's L5_DRIVER, or else its L5_RUN, runs from the client checkout with the manifest and the
 # environment loaded.
+credentials_fail() {
+	local err
+	err="$(aws sts get-caller-identity --query Account --output text 2>&1 >/dev/null | sed '/^$/d' | paste -sd' ' -)" &&
+		return 1
+	echo "AWS credentials of profile $AWS_PROFILE stopped working ($err); run aws sso login, then rerun the row with --stack $STACK"
+}
+
 failed=0
 for row in "${ROW_LIST[@]}"; do
 	echo "Row $row"
+	if reason="$(credentials_fail)"; then
+		echo "ROW $row NOT RUN: $reason" | tee -a "$RESULTS/rows.txt"
+		failed=1
+		continue
+	fi
 	row_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	remote_script "$MANIFEST" "$row" "${CONTROL:-none}"
 	set +e
@@ -461,15 +477,21 @@ EOF
 	REMOTE_COMMAND=(l5/l5ctl status)
 	remote >"$RESULTS/$row-status.txt" 2>&1 || true
 	REMOTE_COMMAND=(l5/l5ctl interruptions "$row_start")
-	remote >"$RESULTS/$row-interruptions.txt" 2>&1 || echo "L5-INTERRUPTED unknown: interruptions check failed" >>"$RESULTS/$row-interruptions.txt"
-	interrupted="$(grep -c '^L5-INTERRUPTED' "$RESULTS/$row-interruptions.txt" || true)"
+	if remote >"$RESULTS/$row-interruptions.txt" 2>&1; then
+		interrupted="$(grep -c '^L5-INTERRUPTED' "$RESULTS/$row-interruptions.txt" || true)"
+	else
+		interrupted=unknown
+	fi
 	if [ "$row_rc" -eq 0 ]; then
 		echo "ROW $row PASS (unplanned Spot interruptions: $interrupted)" | tee -a "$RESULTS/rows.txt"
 	else
-		reason="$(grep -m1 '^L5-FAILED' "$RESULTS/$row.log" | cut -c1-200 || true)"
+		reason="$(credentials_fail)" || reason="$(grep -m1 '^L5-FAILED' "$RESULTS/$row.log" | cut -c1-200 || true)"
 		line="ROW $row FAIL exit=$row_rc (see $row.log)${reason:+: $reason}"
-		[ "$interrupted" -eq 0 ] ||
+		if [ "$interrupted" = unknown ]; then
+			line+="; the Spot interruption check failed (see $row-interruptions.txt)"
+		elif [ "$interrupted" -gt 0 ]; then
 			line+="; $interrupted unplanned Spot interruption(s) during the row, rerun it (see $row-interruptions.txt)"
+		fi
 		echo "$line" | tee -a "$RESULTS/rows.txt"
 		failed=1
 	fi
