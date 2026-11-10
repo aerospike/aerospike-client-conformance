@@ -32,7 +32,7 @@ Parameters:
     Default: "1.33"
   AerospikeInstanceTypes:
     Type: CommaDelimitedList
-    Description: Spot instance types for the Aerospike node groups, each with 2 vCPUs so one Aerospike pod fits per node.
+    Description: Instance types for the Aerospike node groups (Spot in zone A, on-demand in B and C), each with 2 vCPUs so one Aerospike pod fits per node.
     Default: m6i.large,m5.large,m6a.large,m5a.large,m7i.large
   SystemInstanceType:
     Type: String
@@ -284,8 +284,9 @@ Resources:
       Tags:
         l5-aws-run: !Ref AWS::StackName
 
-  # One Spot node group per AZ, so a pod Pending in one rack's zone gets a node in that zone, and
-  # every Aerospike node carries the endpoint name as AKO's configuredIP label.
+  # One node group per AZ, so a pod Pending in one rack's zone gets a node in that zone, and every
+  # Aerospike node carries the endpoint name as AKO's configuredIP label. Only A is Spot, for the Spot
+  # interruption W-2 sends to the first pod; unplanned reclaims in B and C only failed rows.
   AerospikeNodegroupA:
     Type: AWS::EKS::Nodegroup
     Properties:
@@ -321,7 +322,7 @@ Resources:
       ClusterName: !Ref Cluster
       NodegroupName: !Sub "${AWS::StackName}-aerospike-b"
       NodeRole: !GetAtt NodeRole.Arn
-      CapacityType: SPOT
+      CapacityType: ON_DEMAND
       InstanceTypes: !Ref AerospikeInstanceTypes
       Subnets:
         - !Ref ProducerSubnetB
@@ -350,7 +351,7 @@ Resources:
       ClusterName: !Ref Cluster
       NodegroupName: !Sub "${AWS::StackName}-aerospike-c"
       NodeRole: !GetAtt NodeRole.Arn
-      CapacityType: SPOT
+      CapacityType: ON_DEMAND
       InstanceTypes: !Ref AerospikeInstanceTypes
       Subnets:
         - !Ref ProducerSubnetC
