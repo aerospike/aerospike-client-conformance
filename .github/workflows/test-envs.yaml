@@ -1,0 +1,101 @@
+name: Test environment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment in envs/: dns, aws-tags, port-map, collision, yaml, pass-through, on-miss, alt-missing or tls-matching"
+        required: true
+        type: string
+      command:
+        description: Command run with bash from the caller's checkout while the environment is up, with the values file in its environment
+        required: true
+        type: string
+      server-image:
+        description: Aerospike server image; Enterprise needs the features-conf secret
+        required: true
+        type: string
+      conformance-ref:
+        description: Commit or tag of aerospike-client-conformance to take envs/ from, the one this workflow is called at
+        required: true
+        type: string
+      port-base:
+        description: ENV_PORT_BASE, the first host port
+        required: false
+        default: "4700"
+        type: string
+      runs-on:
+        description: Runner label
+        required: false
+        default: ubuntu-24.04
+        type: string
+    secrets:
+      features-conf:
+        description: Content of the Enterprise feature-key file
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ${{ inputs.runs-on }}
+    env:
+      ENV_PREFIX: envs-${{ github.run_id }}-${{ github.run_attempt }}
+      ENV_PORT_BASE: ${{ inputs.port-base }}
+      ENVIRONMENT: ${{ inputs.environment }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - name: Check the environment name
+        run: |
+          case "$ENVIRONMENT" in
+            dns | aws-tags | port-map | collision | yaml | pass-through | on-miss | alt-missing | tls-matching) ;;
+            *) echo "::error::unknown environment '$ENVIRONMENT'"; exit 2 ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout aerospike-client-conformance
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: aerospike/aerospike-client-conformance
+          ref: ${{ inputs.conformance-ref }}
+          path: .test-envs
+
+      - name: Write the feature-key file
+        env:
+          FEATURES_CONF: ${{ secrets.features-conf }}
+        run: |
+          [ -n "$FEATURES_CONF" ] || exit 0
+          install -m 600 /dev/null "$RUNNER_TEMP/features.conf"
+          printf '%s\n' "$FEATURES_CONF" > "$RUNNER_TEMP/features.conf"
+          echo "FEATURES_CONF_PATH=$RUNNER_TEMP/features.conf" >> "$GITHUB_ENV"
+
+      - name: Bring the environment up
+        env:
+          AEROSPIKE_IMAGE: ${{ inputs.server-image }}
+        run: |
+          values="$(.test-envs/envs/"$ENVIRONMENT".sh up)"
+          cat "$values"
+          cat "$values" >> "$GITHUB_ENV"
+
+      - name: Run the command
+        env:
+          COMMAND: ${{ inputs.command }}
+        run: bash -c "$COMMAND"
+
+      - name: Bring the environment down
+        if: always()
+        run: |
+          .test-envs/envs/"$ENVIRONMENT".sh down
+          left="$(docker ps -aq --filter "name=$ENV_PREFIX-"; docker network ls -q --filter "name=$ENV_PREFIX-")"
+          [ -z "$left" ] || { echo "::error::left behind: $left"; exit 1; }
+
+      - name: Remove the feature-key file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/features.conf"
