@@ -47,6 +47,7 @@ scripts/validate-fixtures.py      the CI check for every fixture file (see Valid
 scripts/test_fixture_server.py    tests for the fixture server
 .github/actions/<name>/           actions every client workflow can use; not part of the fixture set
 aws-real/                         aws-tags against real AWS for any client (aws-real/README.md); not part of the fixture set
+l2-proxy/                         L2 proxy topology and fault rows for any client's L5 driver (l2-proxy/README.md); not part of the fixture set
 ```
 
 The fixture set is every `*.yaml` under `discovery/` and `tls/`. Runners and tools read fixtures only from

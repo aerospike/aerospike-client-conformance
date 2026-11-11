@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+#
+# Control for one L2 topology that run.sh built: Toxiproxy listeners and toxics through Toxiproxy's API,
+# what each node advertises through asinfo, the nodes themselves, and checks run from the client
+# network. Every command prints L2-* lines and exits non-zero on failure. The topology is read from
+# $L2_STATE/topology.env, which run.sh writes.
+#
+# Toxiproxy's API and the node addresses are on the node network, which the host cannot always route
+# to (Docker Desktop, a Podman machine), so API calls run in the control container on that network
+# and asinfo runs in each node's container.
+#
+# Usage: l2ctl <command> [arguments]; l2ctl with no command lists the commands.
+
+set -euo pipefail
+
+usage() {
+	cat >&2 <<'EOF'
+Usage: l2ctl <command> [arguments]
+
+  nodes                                  L2-NODE per node: container, node name, address, listener and
+                                         port, what it advertises, peers generation and cluster size
+  listeners                              L2-LISTENER per Toxiproxy listener, with its toxics
+  listener NAME on|off                   Enable or disable a listener
+  listener-add NAME PORT UPSTREAM [--off]
+                                         Add a listener on PORT to UPSTREAM (host:port)
+  listener-remove NAME                   Remove a listener
+  toxic-add NAME TOXIC TYPE [--stream upstream|downstream] [ATTRIBUTE=VALUE ...]
+                                         Add a toxic: reset_peer, timeout, latency, bandwidth, ...
+  toxic-remove NAME TOXIC                Remove a toxic
+  toxics NAME                            L2-TOXIC per toxic of a listener
+  start-node [--name NAME] [--address IP] [--access HOST:PORT] [--alternate HOST:PORT] [--no-hosts]
+                                         Start a node on the node network with the cluster's config and
+                                         mesh seeds; L2-STARTED container= address=
+  stop-node CONTAINER                    Remove a node container of this topology
+  wait-cluster N [--timeout S]           Every node reports cluster size N and no pending migrations
+  wait-advertised CONTAINER [--timeout S]
+                                         Every other node lists CONTAINER's node among its peers;
+                                         L2-ADVERTISED container= node= by=
+  lookup NAME                            L2-LOOKUP per node: whether NAME resolves in its container
+  route-check                            From the client network: no node address connects and every
+                                         endpoint port does
+  client-mtu                             L2-MTU: the MTU of the client network's interface
+  proxy-port-range                       L2-PORT-RANGE: Toxiproxy's local port range
+  proxy-ports                            L2-PROXY-PORTS: Toxiproxy's sockets on a port in that range,
+                                         and how many are in TIME_WAIT
+  drivers-stop                           Remove every driver container of this topology
+  status                                 nodes and listeners
+EOF
+	exit 2
+}
+
+die() {
+	echo "ERROR: $*" >&2
+	exit 1
+}
+
+[ -n "${L2_STATE:-}" ] && [ -f "$L2_STATE/topology.env" ] || die "L2_STATE must name a topology state directory"
+# KEY=value lines, unquoted, so the values file also serves as a container --env-file.
+while IFS= read -r line; do
+	if [[ "$line" =~ ^[A-Z0-9_]+= ]]; then
+		printf -v "${line%%=*}" '%s' "${line#*=}"
+	fi
+done <"$L2_STATE/topology.env"
+
+TIMEOUT_S=60
+
+api() {
+	local method=$1 path=$2 body=${3:-}
+	local args=(-sS -f -m 10 -X "$method" "$TOXIPROXY_URL$path")
+	[ -z "$body" ] || args+=(-H "Content-Type: application/json" -d "$body")
+	docker exec "$L2_CTL_CONTAINER" curl "${args[@]}"
+}
+
+node_containers() {
+	docker ps --filter "name=^${L2_PREFIX}-node-" --format '{{.Names}}' | sort -V
+}
+
+container_address() {
+	docker inspect -f "{{(index .NetworkSettings.Networks \"$L2_NODE_NETWORK\").IPAddress}}" "$1" 2>/dev/null
+}
+
+asinfo_values() {
+	# shellcheck disable=SC2016 # expanded in the node container
+	docker exec "$1" bash -c 'for k in "$@"; do printf "%s=%s\n" "$k" "$(asinfo -v "$k" 2>/dev/null | tr -d " \n")"; done' \
+		asinfo node service-clear-std service-clear-alt peers-clear-std peers-clear-alt peers-generation
+	docker exec "$1" asinfo -v statistics -l 2>/dev/null | grep '^cluster_size='
+}
+
+# Read every running node's values in parallel into $VALUES_DIR/<container>.
+read_all_values() {
+	local container
+	VALUES_DIR="$(mktemp -d)"
+	for container in $(node_containers); do
+		asinfo_values "$container" >"$VALUES_DIR/$container" 2>/dev/null &
+	done
+	wait
+}
+
+info_value() {
+	sed -n "s/^$1=//p" <<<"$2"
+}
+
+cmd_nodes() {
+	local proxies container address values listener port
+	proxies="$(api GET /proxies)" || die "cannot read Toxiproxy listeners"
+	read_all_values
+	for container in $(node_containers); do
+		address="$(container_address "$container")"
+		listener="$(jq -r --arg c "$container" --arg a "$address" \
+			'[.[] | select(.upstream == ($c + ":3000") or .upstream == ($a + ":3000")) | .name] | sort | first // ""' <<<"$proxies")"
+		port=""
+		[ -z "$listener" ] || port="$(jq -r --arg n "$listener" '.[$n].listen | split(":") | last' <<<"$proxies")"
+		values="$(cat "$VALUES_DIR/$container")"
+		if [ -z "$(info_value node "$values")" ]; then
+			echo "L2-NODE container=$container node= address=$address listener=$listener port=$port state=down"
+			continue
+		fi
+		echo "L2-NODE container=$container node=$(info_value node "$values") address=$address listener=$listener" \
+			"port=$port std=$(info_value service-clear-std "$values") alt=$(info_value service-clear-alt "$values")" \
+			"peersGeneration=$(info_value peers-generation "$values") clusterSize=$(info_value cluster_size "$values")" \
+			"peersStd=$(info_value peers-clear-std "$values") peersAlt=$(info_value peers-clear-alt "$values") state=up"
+	done
+	rm -rf "$VALUES_DIR"
+}
+
+cmd_listeners() {
+	api GET /proxies | jq -r '.[] | "L2-LISTENER name=\(.name) listen=\(.listen) upstream=\(.upstream) enabled=\(.enabled) toxics=\([.toxics[].name] | join(","))"' |
+		sort -V
+}
+
+cmd_listener() {
+	[ $# -eq 2 ] || usage
+	local enabled
+	case "$2" in
+		on) enabled=true ;;
+		off) enabled=false ;;
+		*) usage ;;
+	esac
+	api POST "/proxies/$1" "{\"enabled\":$enabled}" >/dev/null || die "cannot turn listener $1 $2"
+	echo "L2-LISTENER name=$1 enabled=$enabled"
+}
+
+cmd_listener_add() {
+	[ $# -ge 3 ] || usage
+	local enabled=true
+	[ "${4:-}" != "--off" ] || enabled=false
+	[[ "$2" =~ ^[0-9]+$ ]] || die "port must be a number: $2"
+	api POST /proxies "{\"name\":\"$1\",\"listen\":\"0.0.0.0:$2\",\"upstream\":\"$3\",\"enabled\":$enabled}" >/dev/null ||
+		die "cannot add listener $1 on $2"
+	echo "L2-LISTENER name=$1 listen=0.0.0.0:$2 upstream=$3 enabled=$enabled added"
+}
+
+cmd_listener_remove() {
+	[ $# -eq 1 ] || usage
+	api DELETE "/proxies/$1" >/dev/null || die "cannot remove listener $1"
+	echo "L2-LISTENER name=$1 removed"
+}
+
+cmd_toxic_add() {
+	[ $# -ge 3 ] || usage
+	local proxy=$1 name=$2 type=$3 stream=downstream attributes="{}" pair
+	shift 3
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--stream)
+				stream="${2:-}"
+				shift
+				;;
+			*=*)
+				pair="$1"
+				[[ "${pair#*=}" =~ ^[0-9]+$ ]] || die "toxic attribute $pair must be a number"
+				attributes="$(jq -c --arg k "${pair%%=*}" --argjson v "${pair#*=}" '. + {($k): $v}' <<<"$attributes")"
+				;;
+			*) usage ;;
+		esac
+		shift
+	done
+	[[ "$stream" =~ ^(upstream|downstream)$ ]] || die "--stream must be upstream or downstream"
+	api POST "/proxies/$proxy/toxics" "{\"name\":\"$name\",\"type\":\"$type\",\"stream\":\"$stream\",\"toxicity\":1,\"attributes\":$attributes}" \
+		>/dev/null || die "cannot add toxic $name to $proxy"
+	echo "L2-TOXIC listener=$proxy toxic=$name type=$type stream=$stream attributes=$attributes added"
+}
+
+cmd_toxic_remove() {
+	[ $# -eq 2 ] || usage
+	api DELETE "/proxies/$1/toxics/$2" >/dev/null || die "cannot remove toxic $2 from $1"
+	echo "L2-TOXIC listener=$1 toxic=$2 removed"
+}
+
+cmd_toxics() {
+	[ $# -eq 1 ] || usage
+	api GET "/proxies/$1/toxics" | jq -r --arg p "$1" \
+		'.[] | "L2-TOXIC listener=\($p) toxic=\(.name) type=\(.type) stream=\(.stream) attributes=\(.attributes | tojson)"'
+}
+
+render_conf() {
+	ACCESS="$2" awk '{print} $1 == "port" && $2 == "3000" {printf "%s", ENVIRON["ACCESS"]}' \
+		"$L2_STATE/conf/aerospike.conf" >"$L2_STATE/conf/$1"
+}
+
+next_name() {
+	local i=1
+	while [ -e "$L2_STATE/conf/.used-$i" ]; do
+		i=$((i + 1))
+	done
+	echo "$L2_PREFIX-node-$i"
+}
+
+cmd_start_node() {
+	local name="" access="" options=() hosts=1 conf=aerospike.conf entry run_args=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--name) name="${2:-}"; shift ;;
+			--address)
+				[[ "${2:-}" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || die "--address must be an IPv4 address"
+				options+=(--ip "$2")
+				shift
+				;;
+			--access)
+				[[ "${2:-}" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] || die "--access must be HOST:PORT"
+				access+="        access-address ${2%:*}"$'\n'"        access-port ${2##*:}"$'\n'
+				shift
+				;;
+			--alternate)
+				[[ "${2:-}" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] || die "--alternate must be HOST:PORT"
+				access+="        alternate-access-address ${2%:*}"$'\n'"        alternate-access-port ${2##*:}"$'\n'
+				shift
+				;;
+			--no-hosts) hosts=0 ;;
+			*) usage ;;
+		esac
+		shift
+	done
+	[ -n "$name" ] || name="$(next_name)"
+	[[ "$name" =~ ^$L2_PREFIX-node-[0-9]+$ ]] || die "node names are $L2_PREFIX-node-<number>"
+	touch "$L2_STATE/conf/.used-${name##*-}"
+	if [ -n "$access" ]; then
+		conf="$name.conf"
+		render_conf "$conf" "$access"
+	fi
+	if [ "$hosts" = 1 ] && [ -n "${L2_NODE_HOSTS:-}" ]; then
+		IFS=, read -r -a entries <<<"$L2_NODE_HOSTS"
+		for entry in "${entries[@]}"; do
+			options+=(--add-host "$entry")
+		done
+	fi
+	[ ! -f "$L2_STATE/features.conf" ] || run_args+=(-v "$L2_STATE/features.conf:/etc/aerospike/features.conf:ro")
+	docker run -d --name "$name" --network "$L2_NODE_NETWORK" --ulimit nofile=15000 "${options[@]+"${options[@]}"}" \
+		-v "$L2_STATE/conf:/etc/aerospike/conf:ro" "${run_args[@]+"${run_args[@]}"}" \
+		--entrypoint asd "$L2_SERVER_IMAGE" --foreground --config-file "/etc/aerospike/conf/$conf" >/dev/null ||
+		die "cannot start $name"
+	echo "L2-STARTED container=$name address=$(container_address "$name") conf=$conf"
+}
+
+cmd_stop_node() {
+	[ $# -eq 1 ] && [[ "$1" == "$L2_PREFIX-node-"* ]] || die "stop-node takes a node container of this topology"
+	docker rm -f "$1" >/dev/null || die "cannot remove $1"
+	echo "L2-STOPPED container=$1"
+}
+
+timeout_arg() {
+	if [ "${1:-}" = "--timeout" ]; then
+		[[ "${2:-}" =~ ^[0-9]+$ ]] || die "--timeout takes seconds"
+		TIMEOUT_S=$2
+	elif [ $# -gt 0 ]; then
+		usage
+	fi
+}
+
+cmd_wait_cluster() {
+	[[ "${1:-}" =~ ^[0-9]+$ ]] || usage
+	local size=$1 deadline container key keys ready
+	shift
+	timeout_arg "$@"
+	deadline=$((SECONDS + TIMEOUT_S))
+	while true; do
+		ready=1
+		keys=""
+		for container in $(node_containers); do
+			if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != true ]; then
+				ready=0
+				continue
+			fi
+			key="$(docker exec "$container" asinfo -v "cluster-stable:size=$size;ignore-migrations=false" 2>/dev/null | tr -d '\n')" || key=""
+			[[ "$key" =~ ^[0-9A-Fa-f]+$ ]] || ready=0
+			keys+=" $key"
+		done
+		[ "$(node_containers | wc -l)" -eq "$size" ] || ready=0
+		if [ "$ready" = 1 ] && [ "$(tr ' ' '\n' <<<"$keys" | sed '/^$/d' | sort -u | wc -l)" -eq 1 ]; then
+			echo "L2-CLUSTER size=$size key=${keys# }"
+			return 0
+		fi
+		[ "$SECONDS" -lt "$deadline" ] || die "cluster not stable at size $size within ${TIMEOUT_S}s (keys:${keys:- none})"
+		sleep 1
+	done
+}
+
+cmd_wait_advertised() {
+	[ $# -ge 1 ] || usage
+	local target=$1 deadline node container values by missing
+	shift
+	timeout_arg "$@"
+	deadline=$((SECONDS + TIMEOUT_S))
+	while true; do
+		node=""
+		values="$(asinfo_values "$target" 2>/dev/null)" && node="$(info_value node "$values")"
+		by=""
+		missing=""
+		if [ -n "$node" ]; then
+			read_all_values
+			for container in $(node_containers); do
+				[ "$container" != "$target" ] || continue
+				values="$(cat "$VALUES_DIR/$container")"
+				if grep -q "\[$node," <<<"$(info_value peers-clear-std "$values")$(info_value peers-clear-alt "$values")"; then
+					by+="${by:+,}$container"
+				else
+					missing+=" $container"
+				fi
+			done
+			rm -rf "$VALUES_DIR"
+			if [ -z "$missing" ] && [ -n "$by" ]; then
+				echo "L2-ADVERTISED container=$target node=$node address=$(container_address "$target") by=$by"
+				return 0
+			fi
+		fi
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			docker logs "$target" 2>&1 | tail -20 >&2 || true
+			die "$target (node ${node:-unknown}) not advertised by every node within ${TIMEOUT_S}s; missing:${missing:- all}"
+		fi
+		sleep 0.5
+	done
+}
+
+cmd_lookup() {
+	[ $# -eq 1 ] || usage
+	local container rc
+	for container in $(node_containers); do
+		rc=0
+		docker exec "$container" getent hosts "$1" >/dev/null 2>&1 || rc=$?
+		echo "L2-LOOKUP container=$container name=$1 exit=$rc resolves=$([ "$rc" = 0 ] && echo true || echo false)"
+	done
+}
+
+client_check() {
+	docker run --rm --network "$L2_CLIENT_NETWORK" --entrypoint bash "$L2_SERVER_IMAGE" -c "$1"
+}
+
+cmd_route_check() {
+	local container address port failed=0 script="" ports
+	for container in $(node_containers); do
+		address="$(container_address "$container")"
+		script+="if timeout 3 bash -c 'echo >/dev/tcp/$address/3000' 2>/dev/null; then echo 'L2-ROUTE address=$address:3000 node=$container connects=true expected=false'; else echo 'L2-ROUTE address=$address:3000 node=$container connects=false expected=false'; fi;"
+	done
+	IFS=, read -r -a ports <<<"$DISCOVERY_ENDPOINT_PORTS"
+	for port in "${ports[@]}"; do
+		script+="if timeout 3 bash -c 'echo >/dev/tcp/$DISCOVERY_ENDPOINT_HOSTNAME/$port' 2>/dev/null; then echo 'L2-ROUTE address=$DISCOVERY_ENDPOINT_HOSTNAME:$port connects=true expected=true'; else echo 'L2-ROUTE address=$DISCOVERY_ENDPOINT_HOSTNAME:$port connects=false expected=true'; fi;"
+	done
+	while read -r line; do
+		echo "$line"
+		case "$line" in
+			*"connects=true expected=false"* | *"connects=false expected=true"*) failed=1 ;;
+		esac
+	done < <(client_check "$script")
+	[ "$failed" = 0 ] || die "route check failed"
+}
+
+cmd_client_mtu() {
+	echo "L2-MTU network=$L2_CLIENT_NETWORK mtu=$(client_check 'cat /sys/class/net/eth0/mtu')"
+}
+
+cmd_proxy_port_range() {
+	local range
+	range="$(docker run --rm --network "container:$TOXIPROXY_HOST" --entrypoint cat "$L2_CURL_IMAGE" \
+		/proc/sys/net/ipv4/ip_local_port_range)" || die "cannot read Toxiproxy's local port range"
+	read -r first last <<<"$range"
+	echo "L2-PORT-RANGE first=$first last=$last"
+}
+
+cmd_proxy_ports() {
+	local tables first last used=0 time_wait=0 local_address state port
+	tables="$(docker run --rm --network "container:$TOXIPROXY_HOST" --entrypoint cat "$L2_CURL_IMAGE" \
+		/proc/sys/net/ipv4/ip_local_port_range /proc/net/tcp /proc/net/tcp6)" ||
+		die "cannot read Toxiproxy's sockets"
+	read -r first last <<<"$(head -1 <<<"$tables")"
+	while read -r _ local_address _ state _; do
+		[[ "$local_address" == *:* ]] || continue
+		port=$((16#${local_address##*:}))
+		if [ "$port" -ge "$first" ] && [ "$port" -le "$last" ] && [ "$state" != 0A ]; then
+			used=$((used + 1))
+			[ "$state" != 06 ] || time_wait=$((time_wait + 1))
+		fi
+	done < <(tail -n +2 <<<"$tables")
+	echo "L2-PROXY-PORTS first=$first last=$last used=$used timeWait=$time_wait"
+}
+
+[ $# -gt 0 ] || usage
+command=$1
+shift
+case "$command" in
+	nodes) cmd_nodes ;;
+	listeners) cmd_listeners ;;
+	listener) cmd_listener "$@" ;;
+	listener-add) cmd_listener_add "$@" ;;
+	listener-remove) cmd_listener_remove "$@" ;;
+	toxic-add) cmd_toxic_add "$@" ;;
+	toxic-remove) cmd_toxic_remove "$@" ;;
+	toxics) cmd_toxics "$@" ;;
+	start-node) cmd_start_node "$@" ;;
+	stop-node) cmd_stop_node "$@" ;;
+	wait-cluster) cmd_wait_cluster "$@" ;;
+	wait-advertised) cmd_wait_advertised "$@" ;;
+	lookup) cmd_lookup "$@" ;;
+	route-check) cmd_route_check ;;
+	client-mtu) cmd_client_mtu ;;
+	proxy-port-range) cmd_proxy_port_range ;;
+	proxy-ports) cmd_proxy_ports ;;
+	drivers-stop)
+		for container in $(docker ps -aq --filter "name=^${L2_PREFIX}-driver-"); do
+			docker rm -f "$container" >/dev/null || die "cannot remove driver container $container"
+			echo "L2-DRIVER-REMOVED container=$container"
+		done
+		;;
+	status)
+		cmd_nodes
+		cmd_listeners
+		;;
+	*) usage ;;
+esac
