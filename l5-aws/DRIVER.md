@@ -4,13 +4,17 @@ Each client runs L5 through a driver: one executable in the client's repository 
 
 This document is for the engineer writing a client's driver, and is what the harness may rely on. Operating the harness is in [README.md](README.md).
 
-Contract version: **3**.
+Contract version: **5**.
 
-Changed from 2: each failed attempt of the load writes a `failure` with the `t` its attempt started, so the harness can tell an attempt sent before a routing change from one sent after it.
+Changed from 3: a `--port-map` key may be an advertised `HOST:PORT` as well as a node name, and the `large` command writes and reads records of a given size. Version 4 is reserved for the optional TLS flags being added in a separate change, which is not merged yet; version 5 does not include them.
+
+Changed from 2 to 3: each failed attempt of the load writes a `failure` with the `t` its attempt started, so the harness can tell an attempt sent before a routing change from one sent after it.
 
 Changed from 1 to 2: `watch` probes every address `HOST` resolves to, and `servingAt` is the start of the first of 3 consecutive rounds in which every address connected, where in 1 it was the start of the first attempt that connected to the first address. The `watch` reply adds `addresses`.
 
-Status: the harness side is [`rows.py`](rows.py), which `run.sh` runs for each row when the manifest sets `L5_DRIVER`. A manifest without `L5_DRIVER` still runs its rows through `L5_RUN`, as described in the README.
+Status: the harness side is [`rows.py`](rows.py), which `run.sh` runs for each row when the manifest sets `L5_DRIVER`. A manifest without `L5_DRIVER` still runs its rows through `L5_RUN`, as described in the README. The L2 harness, [`l2-proxy/rows.py`](../l2-proxy/rows.py), runs the same driver against a local proxy topology.
+
+A harness reads the version from `ready` and skips, with the reason, every row that needs a later version than the driver reports; a version 1 to 3 driver still runs every other row. `rows.py` here reads versions 1 to 3 and `l2-proxy/rows.py` reads 1, 2, 3 and 5.
 
 ## Packaging
 
@@ -22,7 +26,7 @@ The client's manifest (see the README) sets:
 | `L5_BUILD`  | Once, after setup, to build the client and its driver                                                                                               |
 | `L5_DRIVER` | The driver command. The harness appends the flags below and runs it with `bash -c` from the repository root, as many times per row as the row needs |
 
-The runner is Amazon Linux 2023 on x86_64. The driver gets the harness environment (README), of which it needs only `AEROSPIKE_ADMIN_PASSWORD`.
+The runner is Amazon Linux 2023 on x86_64. The driver gets the harness environment (README), of which it needs only `AEROSPIKE_ADMIN_PASSWORD`. L2 runs the same commands in an Amazon Linux 2023 container, as described in [its README](../l2-proxy/README.md).
 
 ## Invocation
 
@@ -36,7 +40,7 @@ $L5_DRIVER --seed HOST:PORT --shape pass-through|port-map [--port-map NODE=HOST:
 | `--seed`               | The only seed host                                                                                     |
 | `--shape pass-through` | Use the services-alternate peer list, with the pass-through translator                                 |
 | `--shape port-map`     | Use the standard peer list, with the port-map translator built from `--port-map`                       |
-| `--port-map`           | Node name to `host:port`, comma separated. Only with `--shape port-map`                                |
+| `--port-map`           | Node name or advertised `HOST:PORT` to `host:port`, comma separated. Only with `--shape port-map`      |
 | `--on-miss`            | Translator miss mode. Default `strict`                                                                 |
 | `--user`               | User name; the password is `AEROSPIKE_ADMIN_PASSWORD`. Without it, no authentication                   |
 | `--tend-interval`      | Client tend interval in milliseconds                                                                   |
@@ -44,6 +48,8 @@ $L5_DRIVER --seed HOST:PORT --shape pass-through|port-map [--port-map NODE=HOST:
 | `--namespace`, `--set` | Where the load and `serve` write                                                                       |
 | `--workers`            | Concurrent load workers. Default 4                                                                     |
 | `--keys`               | Keys the load cycles over. Default 1000                                                                |
+
+A `--port-map` key that contains `:` is an advertised `HOST:PORT` (version 5), matched against the endpoint as the node advertises it on the standard list; any other key is a node name. Pass every key to the client's port-map translator as given.
 
 Map each flag to the client's own configuration of the same meaning. In Java, `pass-through` is `useServicesAlternate = true` with `PassThroughAddressTranslator.INSTANCE`, and `port-map` is `useServicesAlternate = false` with `new PortMapAddressTranslator(map)` and `translationOnMiss`.
 
@@ -73,7 +79,7 @@ Once, when the first load command has succeeded.
 {
 	"type": "ready",
 	"t": 812,
-	"contract": 3,
+	"contract": 5,
 	"epochMs": 1762189200123,
 	"client": "java",
 	"clientVersion": "9.2.0",
@@ -149,7 +155,7 @@ Each message the client logs at warning level or above.
 { "type": "log", "t": 2210, "level": "WARN", "message": "..." }
 ```
 
-### `served`, `reset`, `watch`, `error`
+### `served`, `reset`, `watch`, `large`, `error`
 
 The replies to the commands below.
 
@@ -214,6 +220,29 @@ Measure how soon the client uses a node once its listener serves:
 `usableAt` and `usableMs` are `null` if the node did not become usable. `ownershipChecked` is false when the client does not expose its partition map. Probe and check in the driver, with no harness round trip; this is the one measurement whose bound, twice the tend interval, is too tight to rebuild from snapshots.
 
 One `watch` at a time; a second gets an `error` reply.
+
+### `large STEP BYTES KEYS`
+
+Version 5. Write and read `KEYS` keys, `STEP-0` to `STEP-<KEYS-1>`, each with bin `v` a string of exactly `BYTES` characters that starts with the key's name, one put then one get per key, one attempt each. Then reply:
+
+```json
+{
+	"type": "large",
+	"t": 7310,
+	"step": "mtu",
+	"bytes": 1048576,
+	"keys": 8,
+	"written": 8,
+	"read": 8,
+	"mismatched": 0,
+	"failures": 0,
+	"firstFailure": null,
+	"maxMs": 41,
+	"elapsedMs": 610
+}
+```
+
+`read` and `mismatched` count as for `serve`. `maxMs` is the longest single put or get.
 
 ### `quit`
 

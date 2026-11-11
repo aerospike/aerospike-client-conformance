@@ -1,0 +1,121 @@
+name: L2 proxy run
+
+on:
+  workflow_call:
+    inputs:
+      client-repository:
+        description: Client repository on GitHub, owner/name
+        type: string
+        required: true
+      commit:
+        description: Client commit to build and run
+        type: string
+        required: true
+      manifest:
+        description: Manifest path in the client repository (l2-proxy/README.md)
+        type: string
+        required: true
+      profile:
+        description: >-
+          Comma-separated profiles, or all: default, reachable, pass-through-names,
+          pass-through-ports, port-map-range, port-range, low-mtu, idle-reset
+        type: string
+        required: false
+        default: all
+      rows:
+        description: Comma-separated rows to run; empty runs every row of each profile
+        type: string
+        required: false
+        default: ""
+      edition:
+        description: ee runs Aerospike Enterprise with the FEATURES_CONF secret, ce Aerospike Community
+        type: string
+        required: false
+        default: ee
+      server-image:
+        description: Aerospike server image; empty uses the latest image of the edition
+        type: string
+        required: false
+        default: ""
+      conformance-ref:
+        description: Ref of aerospike/aerospike-client-conformance to run l2-proxy from
+        type: string
+        required: false
+        default: main
+    secrets:
+      FEATURES_CONF:
+        description: Enterprise feature-key file content, for edition ee
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  l2:
+    name: L2 proxy (${{ inputs.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - name: Checkout the harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: aerospike/aerospike-client-conformance
+          ref: ${{ inputs.conformance-ref }}
+          path: conformance
+          persist-credentials: false
+
+      - name: Write the feature key
+        if: ${{ inputs.edition == 'ee' }}
+        env:
+          FEATURES_CONF: ${{ secrets.FEATURES_CONF }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${FEATURES_CONF}" ]]; then
+            echo "::error::edition ee needs the FEATURES_CONF secret"
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "${FEATURES_CONF}" > "${RUNNER_TEMP}/features.conf"
+
+      - name: Run L2
+        env:
+          CLIENT_REPOSITORY: ${{ inputs.client-repository }}
+          COMMIT: ${{ inputs.commit }}
+          MANIFEST: ${{ inputs.manifest }}
+          PROFILE: ${{ inputs.profile }}
+          ROWS: ${{ inputs.rows }}
+          EDITION: ${{ inputs.edition }}
+          SERVER_IMAGE: ${{ inputs.server-image }}
+        run: |
+          set -euo pipefail
+          args=(
+            --client-repo "https://github.com/${CLIENT_REPOSITORY}"
+            --commit "${COMMIT}"
+            --manifest "${MANIFEST}"
+            --profile "${PROFILE}"
+            --edition "${EDITION}"
+            --results "${RUNNER_TEMP}/l2-proxy-results"
+          )
+          [[ -z "${ROWS}" ]] || args+=(--rows "${ROWS}")
+          [[ -z "${SERVER_IMAGE}" ]] || args+=(--server-image "${SERVER_IMAGE}")
+          if [[ "${EDITION}" == "ee" ]]; then
+            export FEATURES_CONF_PATH="${RUNNER_TEMP}/features.conf"
+          fi
+          conformance/l2-proxy/run.sh "${args[@]}"
+
+      - name: Remove the feature key
+        if: ${{ always() }}
+        run: rm -f "${RUNNER_TEMP}/features.conf"
+
+      - name: Upload results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: l2-proxy-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/l2-proxy-results
+          if-no-files-found: warn
