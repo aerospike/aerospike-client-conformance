@@ -24,6 +24,8 @@ import threading
 import time
 
 CONTRACTS = (1, 2, 3)
+# Tag of every line the shared driver code prints; l2-proxy/rows.py sets L2.
+TAG = "L5"
 NAMESPACE = "test"
 USER = "admin"
 CLUSTER_SIZE = 3
@@ -127,7 +129,7 @@ def emit(tag, **fields):
 
 def check(name, ok, quiet=False, **fields):
 	if not ok or not quiet:
-		emit("L5-CHECK", check=name, **fields, outcome="pass" if ok else "fail")
+		emit(TAG + "-CHECK", check=name, **fields, outcome="pass" if ok else "fail")
 	if not ok:
 		raise RowFailure(name + ": " + " ".join("%s=%s" % (k, fmt(v)) for k, v in fields.items()))
 
@@ -136,17 +138,17 @@ def is_number(value):
 	return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def contract_problem(msg, contract=None):
+def contract_problem(msg, contract=None, contracts=CONTRACTS, fields=MESSAGE_FIELDS):
 	if not isinstance(msg, dict):
 		return "not a JSON object"
 	kind = msg.get("type")
-	if kind not in MESSAGE_FIELDS:
+	if kind not in fields:
 		return "unknown type %r" % (kind,)
-	if kind == "failure" and contract != 3:
+	if kind == "failure" and (contract not in contracts or contract < 3):
 		return "failure from a driver without contract 3"
 	if not is_number(msg.get("t")):
 		return "%s without a numeric t" % kind
-	missing = [f for f in MESSAGE_FIELDS[kind] if f not in msg]
+	missing = [f for f in fields[kind] if f not in msg]
 	if kind == "snapshot":
 		if not isinstance(msg.get("nodes"), list):
 			return "snapshot nodes is not a list"
@@ -175,9 +177,9 @@ def contract_problem(msg, contract=None):
 		return "%s without %s" % (kind, ",".join(missing))
 	if kind == "failure" and not is_number(msg["startedAt"]):
 		return "failure startedAt not a number"
-	if kind == "ready" and msg["contract"] not in CONTRACTS:
+	if kind == "ready" and msg["contract"] not in contracts:
 		return "ready with contract %r, harness speaks %s or %s" % (msg["contract"],
-			", ".join(map(str, CONTRACTS[:-1])), CONTRACTS[-1])
+			", ".join(map(str, contracts[:-1])), contracts[-1])
 	return None
 
 
@@ -262,8 +264,9 @@ def kill_group(proc):
 class Driver:
 	"""A running driver: its messages in order, and the commands sent to it."""
 
-	def __init__(self, command, flags, shape, outcome):
+	def __init__(self, command, flags, shape, outcome, problem=contract_problem):
 		self.shape = shape
+		self.problem = problem
 		self.outcome = outcome
 		self.command = command + " " + " ".join(shlex.quote(f) for f in flags)
 		self.messages = []
@@ -274,7 +277,7 @@ class Driver:
 		self.quit_sent = False
 		self.ready = None
 		self.contract = None
-		say("L5-DRIVER-START command=" + self.command)
+		say(TAG + "-DRIVER-START command=" + self.command)
 		self.proc = subprocess.Popen(["bash", "-c", self.command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
 			stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, start_new_session=True)
 		self.threads = [threading.Thread(target=self._read, daemon=True),
@@ -308,7 +311,7 @@ class Driver:
 			raw = raw.rstrip("\n")
 			try:
 				msg = json.loads(raw)
-				problem = contract_problem(msg, self.contract)
+				problem = self.problem(msg, self.contract)
 			except ValueError:
 				msg, problem = None, "non-JSON line on stdout: " + raw[:300]
 			with self.cond:
@@ -327,10 +330,10 @@ class Driver:
 			if problem is None and msg["type"] == "log":
 				emit("CLIENT-LOG", t=msg["t"], level=msg["level"], message=msg["message"])
 			elif problem is None and msg["type"] == "snapshot" and msg["reason"] == "change":
-				emit("L5-SNAPSHOT", t=msg["t"], nodes=describe(msg["nodes"]), unowned=msg.get("unowned"),
+				emit(TAG + "-SNAPSHOT", t=msg["t"], nodes=describe(msg["nodes"]), unowned=msg.get("unowned"),
 					failed=msg["failed"], succeeded=msg["succeeded"])
 			elif problem is None and msg["type"] == "error":
-				emit("L5-DRIVER-ERROR", t=msg["t"], message=msg["message"])
+				emit(TAG + "-DRIVER-ERROR", t=msg["t"], message=msg["message"])
 		status = self.proc.wait()
 		with self.cond:
 			self.exited = True
@@ -398,12 +401,12 @@ class Driver:
 		if ready is None:
 			raise ContractError("no ready within %d ms of the driver's first t" % READY_WAIT_MS)
 		self.ready = ready
-		emit("L5-DRIVER-READY", t=ready["t"], client=ready["client"], clientVersion=ready["clientVersion"],
+		emit(TAG + "-DRIVER-READY", t=ready["t"], client=ready["client"], clientVersion=ready["clientVersion"],
 			shape=ready["shape"], contract=ready["contract"])
 
 	def send(self, command):
 		self._raise_if_broken()
-		emit("L5-DRIVER-COMMAND", t=self.mark()[1], command=command)
+		emit(TAG + "-DRIVER-COMMAND", t=self.mark()[1], command=command)
 		try:
 			self.proc.stdin.write(command + "\n")
 			self.proc.stdin.flush()
@@ -436,7 +439,7 @@ class Driver:
 			try:
 				self.proc.wait(QUIT_WAIT_MS / 1000)
 			except subprocess.TimeoutExpired:
-				emit("L5-DRIVER-KILLED", reason="no exit within %d ms of quit" % QUIT_WAIT_MS)
+				emit(TAG + "-DRIVER-KILLED", reason="no exit within %d ms of quit" % QUIT_WAIT_MS)
 				kill_group(self.proc)
 				self.proc.wait()
 		kill_group(self.proc)
@@ -448,7 +451,7 @@ class Driver:
 			except OSError:
 				pass
 		status = self.proc.returncode
-		emit("L5-DRIVER-EXIT", status=status, afterQuit=not before_quit)
+		emit(TAG + "-DRIVER-EXIT", status=status, afterQuit=not before_quit)
 		if self.violation is not None:
 			raise ContractError("driver broke the contract: " + self.violation)
 		if before_quit and self.ready is None and status == 3:
@@ -464,7 +467,7 @@ class Outcome:
 	def record(self, error):
 		status = 3 if isinstance(error, ContractError) else 1
 		self.status = max(self.status, status)
-		emit("L5-FAILED", kind="contract" if status == 3 else "assertion", reason=str(error))
+		emit(TAG + "-FAILED", kind="contract" if status == 3 else "assertion", reason=str(error))
 
 	def guard(self, step, *args):
 		try:

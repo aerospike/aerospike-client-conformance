@@ -50,6 +50,7 @@ scripts/test_stub_ec2_server.py   tests for the stub EC2 server
 .github/actions/<name>/           actions every client workflow can use; not part of the fixture set
 aws-real/                         aws-tags against real AWS for any client (aws-real/README.md); not part of the fixture set
 envs/                             test environments any client's integration suites run against (envs/README.md); not part of the fixture set
+l2-proxy/                         L2 proxy topology and fault rows for any client's L5 driver (l2-proxy/README.md); not part of the fixture set
 ```
 
 The fixture set is every `*.yaml` under `discovery/` and `tls/`. Runners and tools read fixtures only from
