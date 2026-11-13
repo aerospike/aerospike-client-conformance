@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # One L5 run on AWS for one client, from the operator's machine. Creates stack.yaml as a uniquely
-# named stack, installs AKO 4.6.0 and the AerospikeCluster from the runner with l5ctl, adds one NLB
+# named stack, installs AKO and the AerospikeCluster from the runner with l5ctl, adds one NLB
 # listener per pod NodePort and checks where the endpoint name resolves. On the runner, over EC2
 # Instance Connect, it checks out the client, runs the manifest's setup and build commands and runs
 # each row once: through rows.py with the manifest's driver (L5_DRIVER, DRIVER.md) when it sets one,
@@ -11,6 +11,10 @@
 #
 # --control resolvable makes the endpoint name resolvable in the producer VPC too, for W-1 on a
 # released server. --control unresolvable runs no rows and passes only if the server fails to start.
+# --ako-version latest (the default) installs the newest released AKO chart from --ako-helm-repo.
+# --alternate-access configured-ip (the default) labels every Aerospike node with the endpoint name for
+# AKO's configuredIP; nlb sets networkLoadBalancer at the endpoint name with no node label, and with
+# --one-pod-per-host also multiPodPerHost false.
 # --plan validates the arguments and prints what would be created, with no AWS call.
 # --stack reuses a stack left by --keep instead of creating one; it is deleted at the end unless
 # --keep is given again.
@@ -23,6 +27,8 @@
 #
 # Usage: l5-aws/run.sh --client-repo <https url> --commit <sha> --manifest <path in the client repo>
 #                      --server-image <image> [--rows W-1,W-3,W-2,W-5] [--registry-auth <file>]
+#                      [--ako-version <chart version>|latest] [--ako-helm-repo <url>]
+#                      [--alternate-access configured-ip|nlb] [--one-pod-per-host]
 #                      [--control resolvable|unresolvable] [--stack <kept stack>] [--keep] [--plan]
 
 set -euo pipefail
@@ -50,6 +56,10 @@ MANIFEST=""
 SERVER_IMAGE=""
 ROWS="W-1,W-3,W-2,W-5"
 REGISTRY_AUTH=""
+AKO_VERSION=latest
+AKO_HELM_REPO=https://aerospike.github.io/aerospike-kubernetes-operator
+ALTERNATE_ACCESS=configured-ip
+ONE_POD_PER_HOST=0
 CONTROL=""
 KEEP=0
 EXISTING_STACK=""
@@ -62,6 +72,10 @@ while [ $# -gt 0 ]; do
 		--server-image) SERVER_IMAGE="${2:-}"; shift ;;
 		--rows) ROWS="${2:-}"; shift ;;
 		--registry-auth) REGISTRY_AUTH="${2:-}"; shift ;;
+		--ako-version) AKO_VERSION="${2:-}"; shift ;;
+		--ako-helm-repo) AKO_HELM_REPO="${2:-}"; shift ;;
+		--alternate-access) ALTERNATE_ACCESS="${2:-}"; shift ;;
+		--one-pod-per-host) ONE_POD_PER_HOST=1 ;;
 		--control) CONTROL="${2:-}"; shift ;;
 		--stack) EXISTING_STACK="${2:-}"; shift ;;
 		--keep) KEEP=1 ;;
@@ -71,6 +85,15 @@ while [ $# -gt 0 ]; do
 	shift
 done
 [[ "$SERVER_IMAGE" =~ ^[A-Za-z0-9._:/@-]+$ ]] || die "--server-image is required"
+[[ "$AKO_VERSION" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?)$ ]] ||
+	die "--ako-version must be latest or a chart version like 4.6.0"
+[[ "$AKO_HELM_REPO" =~ ^https://[A-Za-z0-9./_-]+$ ]] || die "--ako-helm-repo must be an https URL"
+case "$ALTERNATE_ACCESS" in
+	configured-ip) NODE_LABEL=true ;;
+	nlb) NODE_LABEL=false ;;
+	*) die "--alternate-access must be configured-ip or nlb" ;;
+esac
+[ "$ONE_POD_PER_HOST" = "0" ] || [ "$ALTERNATE_ACCESS" = "nlb" ] || die "--one-pod-per-host needs --alternate-access nlb"
 case "$CONTROL" in
 	"" | resolvable | unresolvable) ;;
 	*) die "--control must be resolvable or unresolvable" ;;
@@ -119,6 +142,12 @@ if [ "$PLAN" = "1" ]; then
 	echo "  boundary       $AWS_PERMISSIONS_BOUNDARY"
 	echo "  producer zone  $PRODUCER_RECORD"
 	echo "  server image   $SERVER_IMAGE${REGISTRY_AUTH:+ (pull secret from $REGISTRY_AUTH)}"
+	echo "  AKO            $AKO_VERSION from $AKO_HELM_REPO$([ "$AKO_VERSION" = "latest" ] && echo " (newest released chart)")"
+	if [ "$ALTERNATE_ACCESS" = "nlb" ]; then
+		echo "  access         nlb: networkLoadBalancer at the endpoint name, multiPodPerHost $([ "$ONE_POD_PER_HOST" = "1" ] && echo false || echo true), no node label"
+	else
+		echo "  access         configured-ip: configuredIP, multiPodPerHost true, endpoint name as node label"
+	fi
 	if [ "$CONTROL" = "unresolvable" ]; then
 		echo "  rows           none; passes only if the server fails to start"
 	elif [ ${#ROW_LIST[@]} -eq 0 ]; then
@@ -140,6 +169,24 @@ OPERATOR_IP="$(curl -sf -m 10 https://checkip.amazonaws.com | tr -d '[:space:]')
 if [ ${#ROW_LIST[@]} -gt 0 ] && [[ "${CLIENT_REPO%.git}" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$ ]]; then
 	curl -sfI -m 20 "https://raw.githubusercontent.com/${BASH_REMATCH[1]}/$COMMIT/$MANIFEST" >/dev/null ||
 		die "$MANIFEST not found at $COMMIT in $CLIENT_REPO; use --rows none for the environment only"
+fi
+# Read the chosen chart's CRD now, since a chart without networkLoadBalancer fails only at install.
+if [ "$ALTERNATE_ACCESS" = "nlb" ]; then
+	ako_chart="$(curl -sf -m 30 "${AKO_HELM_REPO%/}/index.yaml" | awk '
+		/^  [^ -]/ { chart = ($0 == "  aerospike-kubernetes-operator:") }
+		chart && /^    - https?:\/\/.*\.tgz$/ { url = $2 }
+		chart && /^    version: / { print $2, url }')" || die "cannot read $AKO_HELM_REPO/index.yaml"
+	if [ "$AKO_VERSION" = "latest" ]; then
+		ako_chart="$(grep -v '^[^ ]*-' <<<"$ako_chart" | sort -V | tail -1)"
+	else
+		ako_chart="$(awk -v v="$AKO_VERSION" '$1 == v' <<<"$ako_chart")"
+	fi
+	[ -n "$ako_chart" ] || die "AKO chart $AKO_VERSION not found in $AKO_HELM_REPO"
+	curl -sf -m 60 "${ako_chart#* }" | tar -xzOf - \
+		aerospike-kubernetes-operator/crds/customresourcedefinition_aerospikeclusters.asdb.aerospike.com.yaml |
+		grep -- '- networkLoadBalancer$' >/dev/null ||
+		die "AKO ${ako_chart%% *} does not offer alternateAccess networkLoadBalancer; --alternate-access nlb needs an --ako-version that does (4.8.0-dev1 today)"
+	echo "AKO ${ako_chart%% *} offers networkLoadBalancer"
 fi
 
 OPERATOR="${CALLER##*/}"
@@ -196,6 +243,8 @@ echo "Caller:  $CALLER"
 echo "Region:  $AWS_REGION"
 echo "Stack:   $STACK"
 echo "Server:  $SERVER_IMAGE"
+echo "AKO:     $AKO_VERSION from $AKO_HELM_REPO"
+echo "Access:  $ALTERNATE_ACCESS$([ "$ONE_POD_PER_HOST" = "1" ] && echo ", one pod per host")"
 echo "Control: ${CONTROL:-none}"
 echo "SSH from $OPERATOR_IP/32"
 
@@ -250,7 +299,8 @@ else
 		--capabilities CAPABILITY_IAM --tags "Key=$RUN_TAG,Value=$STACK" "Key=$OPERATOR_TAG,Value=$OPERATOR" \
 		--parameters "ParameterKey=OperatorCidr,ParameterValue=$OPERATOR_IP/32" \
 		"ParameterKey=PermissionsBoundaryArn,ParameterValue=$AWS_PERMISSIONS_BOUNDARY" \
-		"ParameterKey=ProducerRecord,ParameterValue=$PRODUCER_RECORD" >/dev/null
+		"ParameterKey=ProducerRecord,ParameterValue=$PRODUCER_RECORD" \
+		"ParameterKey=NodeLabel,ParameterValue=$NODE_LABEL" >/dev/null
 	echo "Waiting for stack create (EKS takes 15 to 20 minutes)"
 	if ! aws cloudformation wait stack-create-complete --stack-name "$STACK"; then
 		# shellcheck disable=SC2016 # backticks are JMESPath literals
@@ -269,12 +319,15 @@ RUNNER_IP="$(output RunnerPublicIp)"
 ENDPOINT_NAME="$(output EndpointName)"
 [ "$(output ProducerRecord)" = "$PRODUCER_RECORD" ] ||
 	die "stack $STACK has ProducerRecord=$(output ProducerRecord), this run needs $PRODUCER_RECORD"
+[ "$(output NodeLabel)" = "$NODE_LABEL" ] ||
+	die "stack $STACK has NodeLabel=$(output NodeLabel), --alternate-access $ALTERNATE_ACCESS needs $NODE_LABEL"
 {
 	echo "L5_STACK=$STACK"
 	echo "AWS_REGION=$AWS_REGION"
 	echo "L5_CLUSTER=$(output ClusterName)"
 	echo "L5_ENDPOINT_NAME=$ENDPOINT_NAME"
 	echo "L5_PRODUCER_RECORD=$(output ProducerRecord)"
+	echo "L5_ALTERNATE_ACCESS=$ALTERNATE_ACCESS"
 	echo "L5_NLB_ARN=$(output NlbArn)"
 	echo "L5_PRODUCER_VPC=$(output ProducerVpcId)"
 	echo "L5_NODEGROUPS=$(output AerospikeNodegroups)"
@@ -346,7 +399,9 @@ helm version
 aws --version
 EOF
 
-install_args=(--server-image "$SERVER_IMAGE" --features-conf l5/features.conf)
+install_args=(--server-image "$SERVER_IMAGE" --features-conf l5/features.conf --ako-version "$AKO_VERSION"
+	--ako-helm-repo "$AKO_HELM_REPO" --alternate-access "$ALTERNATE_ACCESS")
+[ "$ONE_POD_PER_HOST" = "0" ] || install_args+=(--one-pod-per-host)
 [ -z "$REGISTRY_AUTH" ] || install_args+=(--registry-auth l5/registry-auth.json)
 [ "$CONTROL" != "unresolvable" ] || install_args+=(--expect-start-failure)
 echo "Installing AKO and the AerospikeCluster"

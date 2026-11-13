@@ -18,7 +18,7 @@ Parameters:
     Type: String
     Description: >-
       Name the client dials and every pod advertises. It resolves in the consumer VPC only, unless
-      ProducerRecord is true. At most 63 characters, since it is also a node label value.
+      ProducerRecord is true. At most 63 characters, since with NodeLabel it is also a node label value.
     Default: db.l5.aerospike.internal
     AllowedPattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$
     MaxLength: 63
@@ -27,6 +27,14 @@ Parameters:
     Description: true also makes EndpointName resolve in the producer VPC, for the control run on a released server.
     AllowedValues: ["true", "false"]
     Default: "false"
+  NodeLabel:
+    Type: String
+    Description: >-
+      true labels every Aerospike node with EndpointName as
+      aerospike.com/configured-alternate-access-address, for AKO's configuredIP alternate access;
+      false for networkLoadBalancer, which needs no label.
+    AllowedValues: ["true", "false"]
+    Default: "true"
   KubernetesVersion:
     Type: String
     Default: "1.33"
@@ -46,6 +54,7 @@ Parameters:
 
 Conditions:
   WithProducerRecord: !Equals [!Ref ProducerRecord, "true"]
+  WithNodeLabel: !Equals [!Ref NodeLabel, "true"]
 
 Resources:
   # Producer: EKS, AKO and the NLB. Public subnets give the nodes egress without a NAT gateway; the
@@ -284,9 +293,10 @@ Resources:
       Tags:
         l5-aws-run: !Ref AWS::StackName
 
-  # One node group per AZ, so a pod Pending in one rack's zone gets a node in that zone, and every
-  # Aerospike node carries the endpoint name as AKO's configuredIP label. Only A is Spot, for the Spot
-  # interruption W-2 sends to the first pod; unplanned reclaims in B and C only failed rows.
+  # One node group per AZ, so a pod Pending in one rack's zone gets a node in that zone. With
+  # NodeLabel every Aerospike node carries the endpoint name as AKO's configuredIP label. Only A is
+  # Spot, for the Spot interruption W-2 sends to the first pod; unplanned reclaims in B and C only
+  # failed rows.
   AerospikeNodegroupA:
     Type: AWS::EKS::Nodegroup
     Properties:
@@ -306,9 +316,11 @@ Resources:
       LaunchTemplate:
         Id: !Ref NodeLaunchTemplate
         Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
-      Labels:
-        l5-aws/role: aerospike
-        aerospike.com/configured-alternate-access-address: !Ref EndpointName
+      Labels: !If
+        - WithNodeLabel
+        - l5-aws/role: aerospike
+          aerospike.com/configured-alternate-access-address: !Ref EndpointName
+        - l5-aws/role: aerospike
       Taints:
         - Key: l5-aws/aerospike
           Value: "true"
@@ -335,9 +347,11 @@ Resources:
       LaunchTemplate:
         Id: !Ref NodeLaunchTemplate
         Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
-      Labels:
-        l5-aws/role: aerospike
-        aerospike.com/configured-alternate-access-address: !Ref EndpointName
+      Labels: !If
+        - WithNodeLabel
+        - l5-aws/role: aerospike
+          aerospike.com/configured-alternate-access-address: !Ref EndpointName
+        - l5-aws/role: aerospike
       Taints:
         - Key: l5-aws/aerospike
           Value: "true"
@@ -364,9 +378,11 @@ Resources:
       LaunchTemplate:
         Id: !Ref NodeLaunchTemplate
         Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
-      Labels:
-        l5-aws/role: aerospike
-        aerospike.com/configured-alternate-access-address: !Ref EndpointName
+      Labels: !If
+        - WithNodeLabel
+        - l5-aws/role: aerospike
+          aerospike.com/configured-alternate-access-address: !Ref EndpointName
+        - l5-aws/role: aerospike
       Taints:
         - Key: l5-aws/aerospike
           Value: "true"
@@ -788,6 +804,8 @@ Outputs:
     Value: !Ref EndpointName
   ProducerRecord:
     Value: !Ref ProducerRecord
+  NodeLabel:
+    Value: !Ref NodeLabel
   NlbArn:
     Value: !Ref Nlb
   ProducerVpcId:

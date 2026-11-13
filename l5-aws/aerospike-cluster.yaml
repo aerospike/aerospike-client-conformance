@@ -1,5 +1,6 @@
-# Rendered by l5ctl install: @SIZE@, @IMAGE@, @ZONE_A@, @ZONE_B@ and @ZONE_C@ are replaced, and
-# imagePullSecrets is added when a registry auth file is given.
+# Rendered by l5ctl install: @SIZE@, @IMAGE@, @MULTI_POD_PER_HOST@, @ZONE_A@, @ZONE_B@, @ZONE_C@ and
+# @ALTERNATE_ACCESS@ are replaced, loadBalancerAlternateAccessAddress is added for
+# networkLoadBalancer, and imagePullSecrets is added when a registry auth file is given.
 apiVersion: asdb.aerospike.com/v1
 kind: AerospikeCluster
 metadata:
@@ -9,7 +10,7 @@ spec:
   size: @SIZE@
   image: @IMAGE@
   podSpec:
-    multiPodPerHost: true
+    multiPodPerHost: @MULTI_POD_PER_HOST@
     nodeSelector:
       l5-aws/role: aerospike
     tolerations:
@@ -38,7 +39,7 @@ spec:
     skipWorkDirValidate: true
   aerospikeNetworkPolicy:
     access: pod
-    alternateAccess: configuredIP
+    alternateAccess: @ALTERNATE_ACCESS@
   storage:
     filesystemVolumePolicy:
       cascadeDelete: true

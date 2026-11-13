@@ -9,10 +9,14 @@
 # L5_STACK and AWS_REGION, and the rest is read from the stack outputs.
 #
 # Commands:
-#   install --server-image IMAGE --features-conf FILE [--registry-auth FILE] [--size N]
-#           [--expect-start-failure]
+#   install --server-image IMAGE --features-conf FILE --ako-version VERSION|latest --ako-helm-repo URL
+#           [--alternate-access configured-ip|nlb] [--one-pod-per-host] [--registry-auth FILE]
+#           [--size N] [--expect-start-failure]
 #       Install cert-manager, AKO and the AerospikeCluster (one rack per AZ) and wait for Completed.
-#       With --expect-start-failure, succeed only if the server fails to start.
+#       latest installs the newest released AKO chart. --alternate-access (default L5_ALTERNATE_ACCESS,
+#       else configured-ip) picks configuredIP with the node label or networkLoadBalancer at the
+#       endpoint name; --one-pod-per-host sets multiPodPerHost false and needs nlb. With
+#       --expect-start-failure, succeed only if the server fails to start.
 #   sync-listeners [--prune]
 #       One TCP listener and target group per per-pod Service NodePort. --prune removes listeners
 #       for NodePorts no Service has.
@@ -56,7 +60,9 @@
 #   verify
 #       Check each pod's build and advertised addresses, the per-pod Service settings, that each
 #       listener's only healthy target is the pod's node, and that the endpoint name on each
-#       NodePort reaches that pod's server from this host.
+#       NodePort reaches that pod's server from this host. With L5_ALTERNATE_ACCESS=nlb also check
+#       the AerospikeCluster's loadBalancerAlternateAccessAddress, that no Aerospike container has a
+#       hostPort and that no Aerospike node has the configuredIP label.
 #   status
 #       Nodes, pods, Services, rendered access addresses, listeners and target health.
 #   cleanup
@@ -70,8 +76,7 @@ RUN_TAG=l5-aws-run
 NS=aerospike
 CR=aerocluster
 AKO_NS=ako
-AKO_CHART_VERSION=4.6.0
-AKO_HELM_REPO=https://aerospike.github.io/aerospike-kubernetes-enterprise
+AKO_RELEASE=aerospike-kubernetes-operator
 CERT_MANAGER_CHART_VERSION=v1.21.3
 CERT_MANAGER_HELM_REPO=https://charts.jetstack.io
 RESOLVE_IMAGE=public.ecr.aws/docker/library/busybox:1.36
@@ -100,6 +105,7 @@ fi
 [ -n "${L5_STACK:-}" ] || die "L5_STACK is not set"
 export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION" AWS_PAGER=""
 L5_DIR="${L5_DIR:-$HOME/l5}"
+L5_ALTERNATE_ACCESS="${L5_ALTERNATE_ACCESS:-configured-ip}"
 export KUBECONFIG="${L5_KUBECONFIG:-$L5_DIR/kubeconfig}"
 
 output() {
@@ -758,6 +764,34 @@ info_value() {
 	awk -F'\t' -v k="$1" '$1 == k { print $2 }'
 }
 
+# networkLoadBalancer alternate access: the AerospikeCluster advertises the endpoint name, and no pod
+# relies on a hostPort or a node on the configuredIP label.
+verify_nlb() {
+	local rc=0 address host_ports labelled
+	address="$(kubectl -n "$NS" get aerospikecluster "$CR" \
+		-o jsonpath='{.spec.aerospikeNetworkPolicy.alternateAccess} {.spec.aerospikeNetworkPolicy.loadBalancerAlternateAccessAddress}')"
+	echo "L5-VERIFY-ACCESS alternateAccess=${address% *} loadBalancerAlternateAccessAddress=${address#* }"
+	if [ "$address" != "networkLoadBalancer $L5_ENDPOINT_NAME" ]; then
+		echo "ERROR: AerospikeCluster has alternateAccess=${address% *} loadBalancerAlternateAccessAddress=${address#* }, expected networkLoadBalancer $L5_ENDPOINT_NAME" >&2
+		rc=1
+	fi
+	host_ports="$(kubectl -n "$NS" get pods -l "aerospike.com/cr=$CR" -o json | jq -r '[.items[] | .metadata.name as $p
+		| .spec.containers[] | .name as $c | .ports[]? | select(.hostPort != null) | "\($p)/\($c):\(.hostPort)"] | join(",")')"
+	echo "L5-VERIFY-HOSTPORT hostPorts=${host_ports:-none}"
+	if [ -n "$host_ports" ]; then
+		echo "ERROR: Aerospike containers with a hostPort: $host_ports" >&2
+		rc=1
+	fi
+	labelled="$(kubectl get nodes -l "l5-aws/role=aerospike,$ALTERNATE_ACCESS_LABEL" -o jsonpath='{.items[*].metadata.name}')"
+	labelled="${labelled// /,}"
+	echo "L5-VERIFY-NODE-LABEL label=$ALTERNATE_ACCESS_LABEL nodes=${labelled:-none}"
+	if [ -n "$labelled" ]; then
+		echo "ERROR: Aerospike nodes with the $ALTERNATE_ACCESS_LABEL label: $labelled" >&2
+		rc=1
+	fi
+	return $rc
+}
+
 # Checks the setup a row relies on: what each pod's server reports, the per-pod Service settings,
 # that each listener's healthy target is the node running the pod, and that the endpoint name on
 # each NodePort reaches that pod's server from this host.
@@ -769,6 +803,7 @@ cmd_verify() {
 		port_of[$svc]="$port"
 	done <<<"$(pod_service_ports)"
 	[ ${#port_of[@]} -gt 0 ] || die "no per-pod Services in namespace $NS"
+	[ "$L5_ALTERNATE_ACCESS" != "nlb" ] || verify_nlb || rc=1
 
 	for pod in $(kubectl -n "$NS" get pods -l "aerospike.com/cr=$CR" -o jsonpath='{.items[*].metadata.name}'); do
 		port="${port_of[$pod]:-}"
@@ -876,10 +911,16 @@ cmd_status() {
 }
 
 cmd_install() {
-	local image="" features="" auth="" size=3 expect_failure=0 password manifest zone_a zone_b zone_c i
+	local image="" features="" auth="" size=3 expect_failure=0 ako_version="" ako_repo="" \
+		access="$L5_ALTERNATE_ACCESS" multi_pod=true policy lb_address="" password manifest zone_a zone_b zone_c i
+	local -a ako_args=()
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--server-image) image="${2:-}"; shift ;;
+			--ako-version) ako_version="${2:-}"; shift ;;
+			--ako-helm-repo) ako_repo="${2:-}"; shift ;;
+			--alternate-access) access="${2:-}"; shift ;;
+			--one-pod-per-host) multi_pod=false ;;
 			--features-conf) features="${2:-}"; shift ;;
 			--registry-auth) auth="${2:-}"; shift ;;
 			--size) size="${2:-}"; shift ;;
@@ -892,6 +933,17 @@ cmd_install() {
 	[ -r "$features" ] || die "--features-conf must be a readable file"
 	[ -z "$auth" ] || [ -r "$auth" ] || die "--registry-auth must be a readable file"
 	[[ "$size" =~ ^[1-9]$ ]] || die "--size must be 1-9"
+	[[ "$ako_version" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?)$ ]] ||
+		die "--ako-version must be latest or a chart version like 4.6.0"
+	[[ "$ako_repo" =~ ^https://[A-Za-z0-9./_-]+$ ]] || die "--ako-helm-repo must be an https URL"
+	case "$access" in
+		configured-ip) policy=configuredIP ;;
+		nlb) policy=networkLoadBalancer lb_address="$L5_ENDPOINT_NAME" ;;
+		*) die "--alternate-access must be configured-ip or nlb" ;;
+	esac
+	[ "$multi_pod" = "true" ] || [ "$access" = "nlb" ] || die "--one-pod-per-host needs --alternate-access nlb"
+	[ "$ako_version" = "latest" ] || ako_args+=(--version "$ako_version")
+	[[ "$ako_version" != *-dev* ]] || ako_args+=(--set operatorImage.pullPolicy=Always)
 	read -r zone_a zone_b zone_c <<<"$(zones | paste -sd' ' -)"
 	[ -n "$zone_c" ] || die "expected three Aerospike node groups in L5_NODEGROUPS"
 
@@ -900,15 +952,21 @@ cmd_install() {
 	kubectl wait --for=condition=Ready nodes --all --timeout=15m
 
 	helm repo add jetstack "$CERT_MANAGER_HELM_REPO" --force-update
-	helm repo add aerospike "$AKO_HELM_REPO" --force-update
+	helm repo add aerospike "$ako_repo" --force-update
 	helm repo update
 	helm upgrade --install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace \
 		--version "$CERT_MANAGER_CHART_VERSION" --set crds.enabled=true --wait --timeout 10m
 	kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
-	helm upgrade --install aerospike-kubernetes-operator aerospike/aerospike-kubernetes-operator \
-		--namespace "$AKO_NS" --create-namespace --version "$AKO_CHART_VERSION" \
+	helm upgrade --install "$AKO_RELEASE" aerospike/aerospike-kubernetes-operator \
+		--namespace "$AKO_NS" --create-namespace "${ako_args[@]}" \
 		--set "watchNamespaces=$NS" --wait --timeout 10m
+	ako_version="$(helm -n "$AKO_NS" get metadata "$AKO_RELEASE" -o json | jq -r .version)"
 	kubectl wait --for=condition=Established crd/aerospikeclusters.asdb.aerospike.com --timeout=180s
+	if [ "$policy" = "networkLoadBalancer" ]; then
+		kubectl get crd aerospikeclusters.asdb.aerospike.com -o json |
+			jq -e '[.. | .alternateAccess? | objects | .enum[]?] | index("networkLoadBalancer")' >/dev/null ||
+			die "AKO $ako_version does not offer alternateAccess networkLoadBalancer; --alternate-access nlb needs an --ako-version that does"
+	fi
 	kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ServiceAccount
@@ -945,12 +1003,13 @@ EOF
 	fi
 
 	manifest="$L5_DIR/aerospike-cluster.rendered.yaml"
-	sed -e "s|@SIZE@|$size|" -e "s|@IMAGE@|$image|" -e "s|@ZONE_A@|$zone_a|" -e "s|@ZONE_B@|$zone_b|" \
-		-e "s|@ZONE_C@|$zone_c|" "$SCRIPT_DIR/aerospike-cluster.yaml" >"$manifest"
-	if [ -n "$auth" ]; then
-		awk '{ print } /^    multiPodPerHost: true$/ { print "    imagePullSecrets:\n      - name: l5-registry" }' \
-			"$manifest" >"$manifest.tmp" && mv "$manifest.tmp" "$manifest"
-	fi
+	sed -e "s|@SIZE@|$size|" -e "s|@IMAGE@|$image|" -e "s|@MULTI_POD_PER_HOST@|$multi_pod|" \
+		-e "s|@ZONE_A@|$zone_a|" -e "s|@ZONE_B@|$zone_b|" -e "s|@ZONE_C@|$zone_c|" \
+		-e "s|@ALTERNATE_ACCESS@|$policy|" "$SCRIPT_DIR/aerospike-cluster.yaml" >"$manifest"
+	awk -v auth="$auth" -v lb="$lb_address" '{ print }
+		auth != "" && /^    multiPodPerHost: (true|false)$/ { print "    imagePullSecrets:\n      - name: l5-registry" }
+		lb != "" && /^    alternateAccess: networkLoadBalancer$/ { print "    loadBalancerAlternateAccessAddress: " lb }' \
+		"$manifest" >"$manifest.tmp" && mv "$manifest.tmp" "$manifest"
 	! grep -q '@[A-Z_]*@' "$manifest" || die "unreplaced placeholder in $manifest"
 
 	# helm --wait returns before the operator's webhook accepts connections.
@@ -960,7 +1019,7 @@ EOF
 		sleep 3
 	done
 	kubectl apply -f "$manifest"
-	echo "L5-INSTALL ako=$AKO_CHART_VERSION image=$image size=$size zones=$zone_a,$zone_b,$zone_c"
+	echo "L5-INSTALL ako=$ako_version ako-repo=$ako_repo alternateAccess=$policy multiPodPerHost=$multi_pod image=$image size=$size zones=$zone_a,$zone_b,$zone_c"
 
 	if [ "$expect_failure" = "0" ]; then
 		cmd_wait_ready --timeout 1800
