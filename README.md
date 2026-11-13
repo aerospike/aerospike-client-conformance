@@ -40,13 +40,16 @@ discovery/merge/*.yaml            seed merge policy (kind: merge)
 discovery/providers/dns.yaml      dns seed provider (kind: dns)
 discovery/providers/aws-tags.yaml aws-tags seed provider (kind: aws-tags)
 discovery/providers/fixture-server.py  serves dns and aws-tags refreshes to a runner (python3, standard library only)
+discovery/providers/stub-ec2-server.py stub EC2 DescribeInstances endpoint for aws-tags integration tests (python3, standard library only)
 tls/name-matching.yaml            certificate name matching (kind: tls)
 tls/certs/<shape>.pem             one certificate per shape in name-matching.yaml (no private keys)
 tls/generate-certs.sh             regenerates tls/certs from the shapes (openssl, yq)
 scripts/validate-fixtures.py      the CI check for every fixture file (see Validation)
 scripts/test_fixture_server.py    tests for the fixture server
+scripts/test_stub_ec2_server.py   tests for the stub EC2 server
 .github/actions/<name>/           actions every client workflow can use; not part of the fixture set
 aws-real/                         aws-tags against real AWS for any client (aws-real/README.md); not part of the fixture set
+envs/                             test environments any client's integration suites run against (envs/README.md); not part of the fixture set
 ```
 
 The fixture set is every `*.yaml` under `discovery/` and `tls/`. Runners and tools read fixtures only from
