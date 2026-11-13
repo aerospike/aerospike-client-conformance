@@ -6,15 +6,17 @@ This document is for the engineer writing a client's driver, and is what the har
 
 Contract version: **5**.
 
-Changed from 3: a `--port-map` key may be an advertised `HOST:PORT` as well as a node name, and the `large` command writes and reads records of a given size. Version 4 is reserved for the optional TLS flags being added in a separate change, which is not merged yet; version 5 does not include them.
+Changed from 4 to 5: a `--port-map` key may be an advertised `HOST:PORT` as well as a node name, and the `large` command writes and reads records of a given size. Version 5 includes the TLS flags of version 4.
+
+Changed from 3 to 4: the optional `--tls-name` and `--tls-ca-file` flags connect over TLS. A driver that reports version 3 or earlier has no TLS support; a harness still runs every row that needs no TLS with it, and skips the TLS rows.
 
 Changed from 2 to 3: each failed attempt of the load writes a `failure` with the `t` its attempt started, so the harness can tell an attempt sent before a routing change from one sent after it.
 
 Changed from 1 to 2: `watch` probes every address `HOST` resolves to, and `servingAt` is the start of the first of 3 consecutive rounds in which every address connected, where in 1 it was the start of the first attempt that connected to the first address. The `watch` reply adds `addresses`.
 
-Status: the harness side is [`rows.py`](rows.py), which `run.sh` runs for each row when the manifest sets `L5_DRIVER`. A manifest without `L5_DRIVER` still runs its rows through `L5_RUN`, as described in the README. The L2 harness, [`l2-proxy/rows.py`](../l2-proxy/rows.py), runs the same driver against a local proxy topology.
+Status: the harness side is [`rows.py`](rows.py), which `run.sh` runs for each row when the manifest sets `L5_DRIVER`. A manifest without `L5_DRIVER` still runs its rows through `L5_RUN`, as described in the README. The L2 harness, [`l2-proxy/rows.py`](../l2-proxy/rows.py), runs the same driver against a local proxy topology, and the L3 harness, [`l3-kind/rows.py`](../l3-kind/rows.py), against kind and the Aerospike Kubernetes Operator.
 
-A harness reads the version from `ready` and skips, with the reason, every row that needs a later version than the driver reports; a version 1 to 3 driver still runs every other row. `rows.py` here reads versions 1 to 3 and `l2-proxy/rows.py` reads 1, 2, 3 and 5.
+A harness reads the version from `ready` and skips, with the reason, every row that needs a later version than the driver reports; a version 1 to 3 driver still runs every other row. `rows.py` here reads versions 1 to 3, `l2-proxy/rows.py` reads 1, 2, 3 and 5, and `l3-kind/rows.py` reads 1 to 5.
 
 ## Packaging
 
@@ -33,6 +35,7 @@ The runner is Amazon Linux 2023 on x86_64. The driver gets the harness environme
 ```text
 $L5_DRIVER --seed HOST:PORT --shape pass-through|port-map [--port-map NODE=HOST:PORT,...] [--on-miss strict|pass-through]
            [--user USER] --tend-interval MS --timeout MS --namespace NS --set SET [--workers N] [--keys N]
+           [--tls-name NAME --tls-ca-file PATH]
 ```
 
 | Flag                   | Meaning                                                                                                |
@@ -48,8 +51,12 @@ $L5_DRIVER --seed HOST:PORT --shape pass-through|port-map [--port-map NODE=HOST:
 | `--namespace`, `--set` | Where the load and `serve` write                                                                       |
 | `--workers`            | Concurrent load workers. Default 4                                                                     |
 | `--keys`               | Keys the load cycles over. Default 1000                                                                |
+| `--tls-name`           | Version 4. Connect to every node over TLS, validating its certificate against this name                |
+| `--tls-ca-file`        | Version 4. PEM file of the CA that signed the server certificates. Only with `--tls-name`              |
 
 A `--port-map` key that contains `:` is an advertised `HOST:PORT` (version 5), matched against the endpoint as the node advertises it on the standard list; any other key is a node name. Pass every key to the client's port-map translator as given.
+
+With `--tls-name`, the seed and every node are TLS endpoints: `--shape pass-through` uses the TLS services-alternate list, and the client validates each node's certificate against `--tls-name`, never against the host it dials. When the certificate does not match, the client is not created (exit status 3). Without `--tls-name`, connect in the clear.
 
 Map each flag to the client's own configuration of the same meaning. In Java, `pass-through` is `useServicesAlternate = true` with `PassThroughAddressTranslator.INSTANCE`, and `port-map` is `useServicesAlternate = false` with `new PortMapAddressTranslator(map)` and `translationOnMiss`.
 
