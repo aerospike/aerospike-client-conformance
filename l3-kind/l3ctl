@@ -1,0 +1,727 @@
+#!/usr/bin/env bash
+#
+# Control for one L3 cluster that run.sh built: the AerospikeCluster, its pods and their Services, the
+# Kubernetes Nodes and the kind node containers under them, and what each pod advertises, read through
+# asinfo in the pod. Every command prints L3-* lines and exits non-zero on failure. The cluster is read
+# from $L3_STATE/topology.env, which run.sh writes, and the admin password from $L3_STATE/admin-password.
+#
+# kubectl reaches the API server through the kubeconfig kind wrote, which works from the host on Linux
+# and from macOS with a Podman machine. Pod addresses are not reachable from the host there, so asinfo
+# runs in each pod.
+#
+# Usage: l3ctl <command> [arguments]; l3ctl with no command lists the commands.
+
+set -euo pipefail
+
+usage() {
+	cat >&2 <<'EOF'
+Usage: l3ctl <command> [arguments]
+
+  pods                                   L3-CLUSTER, then L3-POD per pod: Kubernetes node, IP, phase,
+                                         Ready, UID, Service NodePorts and UID, container hostPort, and
+                                         through asinfo its node name, service-clear-alt, service-tls-alt
+  nodes                                  L3-NODE per Kubernetes Node: UID, InternalIP, role, labels,
+                                         unschedulable, Ready
+  resize N                               Set the AerospikeCluster size to N and return
+  scale N [--timeout S]                  Set the size to N and wait until it is Completed with N Ready pods
+  join-watch POD OBSERVER --resize N --host HOST [--timeout S]
+                                         Read OBSERVER's peers-generation, set the size to N, then poll it,
+                                         POD's Ready condition, and from the driver's network a login and
+                                         info request at HOST and POD's NodePort, until each changes;
+                                         L3-JOINED with the wall-clock milliseconds of each
+  wait-pod POD [--timeout S]             Wait until POD's Service has a NodePort and its container has its
+                                         node-id; L3-POD-UP pod= node= nodePort= ready=
+  wait-completed [--timeout S]           Wait until the AerospikeCluster is Completed with every pod Ready
+  delete-pod POD                         Delete POD and wait until it is gone
+  wait-ready POD [--old-uid UID] [--timeout S]
+                                         Wait until POD exists with another UID and is Ready
+  service NAME [PORT]                    L3-SERVICE: UID and NodePort of PORT (default the service port)
+  service-create NAME POD NODEPORT       NodePort Service on NODEPORT for the service port of POD alone
+  service-delete NAME                    Delete a Service and wait until it is gone
+  node-port-range                        L3-NODE-PORT-RANGE: the API server's NodePort range
+  node-ports                             L3-NODE-PORTS: every NodePort allocated in the cluster
+  label-node NODE KEY VALUE              Set a label on a Kubernetes Node through the API
+  cordon-others NODE                     Cordon every Node but NODE; L3-CORDONED per Node
+  uncordon NODE...                       Uncordon each Node
+  delete-node NODE                       Delete a worker's Node object, never a control-plane one, and
+                                         force-delete the AerospikeCluster pods bound to it
+  reregister NODE [--timeout S]          Once NODE's Node object is gone, restart kubelet in its kind node
+                                         container and wait until it registers again and is Ready
+  enable-tls [--tls-endpoint HOST]       Serve TLS from a generated certificate whose only SAN is the
+                                         tls-name; L3-TLS tlsName= caFile= tlsEndpoint= tlsPort=
+  certificate                            L3-CERT: subject and SANs of the certificate the tls-name serves
+  drivers-stop                           Remove every driver container of this cluster
+  status                                 Nodes, the AerospikeCluster, pods and Services
+EOF
+	exit 2
+}
+
+die() {
+	echo "ERROR: $*" >&2
+	exit 1
+}
+
+[ -n "${L3_STATE:-}" ] && [ -f "$L3_STATE/topology.env" ] || die "L3_STATE must name a cluster state directory"
+while IFS= read -r line; do
+	if [[ "$line" =~ ^[A-Z0-9_]+= ]]; then
+		printf -v "${line%%=*}" '%s' "${line#*=}"
+	fi
+done <"$L3_STATE/topology.env"
+export KUBECONFIG="$L3_KUBECONFIG"
+
+TIMEOUT_S=300
+ALTERNATE_ACCESS_LABEL=aerospike.com/configured-alternate-access-address
+NS=$L3_NAMESPACE
+CR=$L3_CR
+
+k() {
+	kubectl --request-timeout=30s "$@"
+}
+
+cr() {
+	k -n "$NS" get aerospikecluster "$CR" -o "jsonpath={$1}"
+}
+
+timeout_arg() {
+	if [ "${1:-}" = --timeout ]; then
+		[[ "${2:-}" =~ ^[0-9]+$ ]] || die "--timeout needs seconds"
+		TIMEOUT_S=$2
+	elif [ -n "${1:-}" ]; then
+		usage
+	fi
+}
+
+service_port() {
+	cr .spec.aerospikeConfig.network.service.port
+}
+
+# AKO creates each pod Service with externalTrafficPolicy Local, so with one pod per host its NodePort
+# answers only on the pod's node; the endpoint hostname resolves to one node, as a load balancer address
+# fronts them all. setup-kind-ako patches the pods it starts with; this patches the ones added later.
+serve_node_ports_on_every_node() {
+	local service
+	[ "$(cr .spec.podSpec.multiPodPerHost)" = false ] || return 0
+	for service in $(k -n "$NS" get service -o \
+		'jsonpath={range .items[?(@.spec.externalTrafficPolicy=="Local")]}{.metadata.name}{"\n"}{end}'); do
+		if [[ "$service" =~ ^$CR-[0-9]+-[0-9]+$ ]]; then
+			k -n "$NS" patch service "$service" -p '{"spec":{"externalTrafficPolicy":"Cluster"}}' >/dev/null
+			echo "L3-SERVICE-EVERY-NODE service=$service"
+		fi
+	done
+}
+
+node_port() {
+	k -n "$NS" get service "$1" --ignore-not-found -o "jsonpath={.spec.ports[?(@.port==$2)].nodePort}"
+}
+
+pod_info() {
+	# shellcheck disable=SC2016 # expanded in the pod
+	k -n "$NS" exec "$1" -c aerospike-server -- sh -c \
+		'for v in node service-clear-alt service-tls-alt; do printf "%s|" "$(asinfo -U admin -P "$1" -v "$v" 2>/dev/null | tr -d "\r\n " | grep -v "^ERROR")"; done' \
+		sh "$(cat "$L3_STATE/admin-password")" 2>/dev/null
+}
+
+cluster_line() {
+	echo "L3-CLUSTER name=$CR namespace=$NS size=$(cr .spec.size) phase=$(cr .status.phase)" \
+		"alternateAccess=$(cr .spec.aerospikeNetworkPolicy.alternateAccess)" \
+		"multiPodPerHost=$(cr .spec.podSpec.multiPodPerHost)" \
+		"lbAddress=$(cr .spec.aerospikeNetworkPolicy.loadBalancerAlternateAccessAddress)" \
+		"lbTlsAddress=$(cr .spec.aerospikeNetworkPolicy.loadBalancerTLSAlternateAccessAddress)" \
+		"servicePort=$(service_port) tlsPort=$(cr ".spec.aerospikeConfig.network.service['tls-port']")" \
+		"tlsName=$(cr ".spec.aerospikeConfig.network.service['tls-name']")"
+}
+
+cmd_pods() {
+	local port tls_port pod worker ip phase uid ready node_port tls_node_port service_uid host_port info node clear_alt tls_alt
+	cluster_line
+	port=$(service_port)
+	tls_port=$(cr ".spec.aerospikeConfig.network.service['tls-port']")
+	while IFS='|' read -r pod worker ip phase uid ready; do
+		[ -n "$pod" ] || continue
+		node_port=$(node_port "$pod" "$port")
+		tls_node_port=""
+		[ -z "$tls_port" ] || tls_node_port=$(node_port "$pod" "$tls_port")
+		service_uid=$(k -n "$NS" get service "$pod" --ignore-not-found -o 'jsonpath={.metadata.uid}')
+		host_port=$(k -n "$NS" get pod "$pod" -o \
+			"jsonpath={.spec.containers[?(@.name==\"aerospike-server\")].ports[?(@.containerPort==$port)].hostPort}")
+		info="||"
+		[ "$phase" != Running ] || info=$(pod_info "$pod") || info="||"
+		IFS='|' read -r node clear_alt tls_alt <<<"$info"
+		echo "L3-POD pod=$pod worker=$worker ip=$ip phase=$phase ready=$ready uid=$uid nodePort=$node_port" \
+			"tlsNodePort=$tls_node_port serviceUid=$service_uid hostPort=$host_port node=$node clearAlt=$clear_alt" \
+			"tlsAlt=$tls_alt"
+	done < <(k -n "$NS" get pods -l "aerospike.com/cr=$CR" -o \
+		'jsonpath={range .items[*]}{.metadata.name}|{.spec.nodeName}|{.status.podIP}|{.status.phase}|{.metadata.uid}|{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' |
+		sort -t- -k3,3n -k4,4n)
+}
+
+cmd_nodes() {
+	local control name uid ip labels unschedulable ready role
+	control=" $(k get nodes -l node-role.kubernetes.io/control-plane -o 'jsonpath={.items[*].metadata.name}') "
+	while IFS='|' read -r name uid ip labels unschedulable ready; do
+		[ -n "$name" ] || continue
+		role=worker
+		[[ "$control" != *" $name "* ]] || role="control-plane"
+		echo "L3-NODE name=$name uid=$uid ip=$ip role=$role unschedulable=${unschedulable:-false} ready=$ready" \
+			"labels=${labels// /}"
+	done < <(k get nodes -o \
+		'jsonpath={range .items[*]}{.metadata.name}|{.metadata.uid}|{.status.addresses[?(@.type=="InternalIP")].address}|{.metadata.labels}|{.spec.unschedulable}|{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}')
+}
+
+ready_pods() {
+	k -n "$NS" get pods -l "aerospike.com/cr=$CR" -o \
+		'jsonpath={range .items[*]}{.metadata.name} {.status.phase} {.status.conditions[?(@.type=="Ready")].status} {.metadata.deletionTimestamp}{"\n"}{end}' |
+		awk '$2 == "Running" && $3 == "True" && NF == 3' | wc -l | tr -d ' '
+}
+
+all_pods() {
+	k -n "$NS" get pods -l "aerospike.com/cr=$CR" -o name | wc -l | tr -d ' '
+}
+
+wait_completed() {
+	local size=$1 deadline=$((SECONDS + TIMEOUT_S)) state=""
+	while :; do
+		serve_node_ports_on_every_node
+		state="size=$(cr .status.size) phase=$(cr .status.phase) ready=$(ready_pods) pods=$(all_pods)"
+		[ "$state" != "size=$size phase=Completed ready=$size pods=$size" ] || break
+		((SECONDS < deadline)) || die "AerospikeCluster $CR not Completed at size $size within ${TIMEOUT_S}s: $state"
+		sleep 2
+	done
+	echo "L3-COMPLETED size=$size $state"
+}
+
+# One login, then peers-generation on the same connection every 10 ms, so no sample starts a process. The
+# password is sent as the server stores it: bcrypt with the fixed salt every Aerospike client uses.
+# shellcheck disable=SC2016 # perl
+PEERS_POLLER='
+use strict;
+use IO::Socket::INET;
+$| = 1;
+my ($password, $seconds) = @ARGV;
+my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => 3000, Proto => "tcp") or die "connect: $!";
+sub frame { my ($type, $body) = @_; syswrite($s, pack("CC", 2, $type) . substr(pack("Q>", length $body), 2) . $body) }
+sub take {
+	my $n = shift;
+	my $b = "";
+	while (length($b) < $n) { sysread($s, $b, $n - length($b), length($b)) or die "closed" }
+	return $b;
+}
+sub reply { my $h = take(8); return take(unpack("Q>", "\0\0" . substr($h, 2))) }
+sub field { my ($id, $v) = @_; return pack("NC", length($v) + 1, $id) . $v }
+frame(2, pack("C4", 0, 0, 20, 2) . ("\0" x 12) . field(0, "admin") . field(3, crypt($password, q($2a$10$7EqJtq98hPqEX7fNZaFWoO))));
+my $result = ord(substr(reply(), 1, 1));
+die "login result $result" if $result;
+my $end = time + $seconds;
+while (time < $end) {
+	frame(1, "peers-generation\n");
+	my ($generation) = reply() =~ /\t(\d+)/;
+	print "$generation\n";
+	select(undef, undef, undef, 0.01);
+}
+'
+
+# The pod's Ready condition every 10 ms through one kubectl proxy connection.
+# shellcheck disable=SC2016 # perl
+READY_POLLER='
+use strict;
+use HTTP::Tiny;
+use JSON::PP;
+use Time::HiRes qw(time sleep);
+$| = 1;
+my ($url, $seconds) = @ARGV;
+my $http = HTTP::Tiny->new(keep_alive => 1, timeout => 5);
+my $end = time + $seconds;
+while (time < $end) {
+	my $r = $http->get($url);
+	my $ready = "none";
+	if ($r->{success}) {
+		my @c = grep { $_->{type} eq "Ready" } @{decode_json($r->{content})->{status}{conditions} || []};
+		$ready = @c ? $c[0]{status} : "none";
+	}
+	printf "%d %s\n", time * 1000, $ready;
+	sleep 0.01;
+}
+'
+
+# From the driver's network, what the client does to add a node: connect to its advertised address, log in
+# with the driver's user and ask for its node name, every 10 ms until it answers. The address arrives on
+# standard input once the pod's Service has a NodePort, so the probe is running before the node can answer.
+# shellcheck disable=SC2016 # perl
+ANSWER_PROBER='
+use strict;
+use IO::Socket::INET;
+use IO::Select;
+$| = 1;
+my ($user, $password, $seconds) = @ARGV;
+my ($host, $port) = <STDIN> =~ /^(.*):(\d+)\s*$/ or die "no address";
+my $credential = crypt($password, q($2a$10$7EqJtq98hPqEX7fNZaFWoO));
+sub field { my ($id, $v) = @_; return pack("NC", length($v) + 1, $id) . $v }
+sub attempt {
+	my $s = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port, Proto => "tcp", Timeout => 0.05) or return "connect";
+	my $select = IO::Select->new($s);
+	my $frame = sub { my ($type, $body) = @_; syswrite($s, pack("CC", 2, $type) . substr(pack("Q>", length $body), 2) . $body) };
+	my $take = sub {
+		my $n = shift;
+		my $b = "";
+		while (length($b) < $n) {
+			$select->can_read(0.05) or return undef;
+			sysread($s, $b, $n - length($b), length($b)) or return undef;
+		}
+		return $b;
+	};
+	my $reply = sub { my $h = $take->(8); return defined $h ? $take->(unpack("Q>", "\0\0" . substr($h, 2))) : undef };
+	$frame->(2, pack("C4", 0, 0, 20, 2) . ("\0" x 12) . field(0, $user) . field(3, $credential));
+	my $login = $reply->();
+	return "login-closed" unless defined $login;
+	my $code = ord(substr($login, 1, 1));
+	return "login-$code" if $code;
+	$frame->(1, "node\n");
+	my $info = $reply->();
+	return "info-closed" unless defined $info;
+	my ($node) = $info =~ /node\t(\S+)/;
+	return defined $node ? "ok $node" : "info-empty";
+}
+my $end = time + $seconds;
+while (time < $end) {
+	my $result = attempt();
+	print "$result\n";
+	exit 0 if $result =~ /^ok/;
+	select(undef, undef, undef, 0.01);
+}
+exit 1;
+'
+
+now_ms() {
+	local now=$EPOCHREALTIME
+	echo "${now%[.,]*}${now: -6:3}"
+}
+
+# The first sample of the change and the sample before it, each at the wall-clock time it was taken.
+first_change() {
+	awk -v from="$2" '$2 != "" && $2 != from { print $1, before, $2; found = 1; exit } { before = $1 }
+		END { exit ! found }' "$1"
+}
+
+max_interval() {
+	awk 'NR > 1 && $1 - last > max { max = $1 - last } { last = $1 } END { print max + 0 }' "$1"
+}
+
+stop_pollers() {
+	local poller
+	for poller in "${POLLERS[@]}"; do
+		pkill -P "$poller" 2>/dev/null || true
+		kill "$poller" 2>/dev/null || true
+	done
+	"$L3_DOCKER" rm -f "$PROBE" >/dev/null 2>&1 || true
+	exec 7>&-
+	rm -f "$PEERS" "$PEERS.err" "$READY" "$PROXY_LOG" "$ANSWER" "$ANSWER.in"
+}
+
+cmd_join_watch() {
+	local pod=${1:-} observer=${2:-} size="" host="" deadline gen0="" bump="" ready="" answer="" port="" node_port=""
+	local hosts=() entry probe_port
+	[ -n "$pod" ] && [ -n "$observer" ] || usage
+	shift 2
+	while [ $# -gt 0 ] && [[ "$1" =~ ^--(resize|host)$ ]]; do
+		case "$1" in
+			--resize) size=${2:-} ;;
+			--host) host=${2:-} ;;
+		esac
+		shift 2
+	done
+	[ -n "$size" ] && [ -n "$host" ] || usage
+	timeout_arg "$@"
+	PEERS=$(mktemp "$L3_STATE/peers.XXXXXX")
+	READY=$(mktemp "$L3_STATE/ready.XXXXXX")
+	ANSWER=$(mktemp "$L3_STATE/answer.XXXXXX")
+	PROXY_LOG=$(mktemp "$L3_STATE/proxy.XXXXXX")
+	PROBE="$L3_CLUSTER-driver-probe-$$"
+	POLLERS=()
+	trap stop_pollers EXIT
+	(
+		k -n "$NS" exec -i "$observer" -c aerospike-server -- perl -e "$PEERS_POLLER" "$(cat "$L3_STATE/admin-password")" \
+			"$TIMEOUT_S" 2>"$PEERS.err" | while IFS= read -r value; do echo "$(now_ms) $value"; done >"$PEERS"
+	) </dev/null >/dev/null 2>&1 &
+	POLLERS+=($!)
+	(kubectl proxy --port=0 >"$PROXY_LOG" 2>&1) </dev/null >/dev/null 2>&1 &
+	POLLERS+=($!)
+	IFS=, read -r -a entries <<<"$L3_CLIENT_HOSTS"
+	for entry in "${entries[@]}"; do
+		hosts+=(--add-host "$entry")
+	done
+	mkfifo "$ANSWER.in"
+	(
+		"$L3_DOCKER" run --rm -i --name "$PROBE" --network "$L3_DRIVER_NETWORK" "${hosts[@]}" --entrypoint perl \
+			"$L3_PROBE_IMAGE" -e "$ANSWER_PROBER" admin "$(cat "$L3_STATE/admin-password")" "$TIMEOUT_S" <"$ANSWER.in" 2>&1 |
+			while IFS= read -r value; do echo "$(now_ms) $value"; done >"$ANSWER"
+	) </dev/null >/dev/null 2>&1 &
+	POLLERS+=($!)
+	exec 7>"$ANSWER.in"
+	deadline=$((SECONDS + 60))
+	while [ -z "$gen0" ] || [ -z "$port" ] || [ "$("$L3_DOCKER" inspect -f '{{.State.Running}}' "$PROBE" 2>/dev/null)" != true ]; do
+		gen0=$(awk 'NR == 1 { print $2 }' "$PEERS")
+		port=$(sed -n 's/^Starting to serve on 127.0.0.1:\([0-9]*\).*/\1/p' "$PROXY_LOG")
+		((SECONDS < deadline)) || die "no peers-generation from $observer ($(cat "$PEERS.err" 2>/dev/null)), no kubectl proxy or no probe container"
+		sleep 0.05
+	done
+	(perl -e "$READY_POLLER" "http://127.0.0.1:$port/api/v1/namespaces/$NS/pods/$pod" "$TIMEOUT_S" >"$READY") \
+		</dev/null 2>/dev/null &
+	POLLERS+=($!)
+	until [ -s "$READY" ]; do sleep 0.01; done
+	cmd_resize "$size"
+	probe_port=$(service_port)
+	deadline=$((SECONDS + TIMEOUT_S))
+	while [ -z "$bump" ] || [ -z "$ready" ] || [ -z "$answer" ]; do
+		serve_node_ports_on_every_node >/dev/null
+		if [ -z "$node_port" ]; then
+			node_port=$(node_port "$pod" "$probe_port")
+			[ -z "$node_port" ] || echo "$host:$node_port" >&7
+		fi
+		[ -n "$bump" ] || bump=$(first_change "$PEERS" "$gen0") || bump=""
+		[ -n "$ready" ] || ready=$(awk '$2 == "True" { print $1, before; found = 1; exit } { before = $1 } END { exit ! found }' \
+			"$READY") || ready=""
+		[ -n "$answer" ] || answer=$(awk '$2 == "ok" { print $1, (before == "" ? "none" : before), $3; found = 1; exit }
+			{ before = $1 } END { exit ! found }' "$ANSWER") || answer=""
+		((SECONDS < deadline)) || die "within ${TIMEOUT_S}s: bump ${bump:-none} on $observer, $pod Ready ${ready:-no}, answer ${answer:-none} at $host:${node_port:-no NodePort}"
+		sleep 0.05
+	done
+	read -r bump_at bump_before gen1 <<<"$bump"
+	read -r ready_at ready_before <<<"$ready"
+	read -r answer_at answer_before node <<<"$answer"
+	echo "L3-JOINED pod=$pod observer=$observer address=$host:$node_port node=$node generation=$gen0-$gen1" \
+		"bumpEpochMs=$bump_at bumpPollMs=$((bump_at - bump_before)) peersMaxPollMs=$(max_interval "$PEERS")" \
+		"answerEpochMs=$answer_at answerPollMs=$([ "$answer_before" = none ] && echo none || echo $((answer_at - answer_before)))" \
+		"answerMaxPollMs=$(max_interval "$ANSWER") answerAttempts=$(grep -c . "$ANSWER")" \
+		"answerFailures=$(awk '$2 != "ok" { n[$2]++ } END { for (k in n) printf "%s%s:%d", (s++ ? "," : ""), k, n[k] }' "$ANSWER")" \
+		"readyEpochMs=$ready_at readyPollMs=$((ready_at - ready_before)) readyMaxPollMs=$(max_interval "$READY")" \
+		"readyToAnswerMs=$((answer_at - ready_at)) readyTransition=$(k -n "$NS" get pod "$pod" -o \
+		'jsonpath={.status.conditions[?(@.type=="Ready")].lastTransitionTime}')"
+}
+
+cmd_resize() {
+	[[ "${1:-}" =~ ^[1-8]$ ]] || die "resize needs a size from 1 to 8"
+	k -n "$NS" patch aerospikecluster "$CR" --type merge -p "{\"spec\":{\"size\":$1}}" >/dev/null
+	echo "L3-RESIZED size=$1"
+}
+
+cmd_scale() {
+	local size=${1:-}
+	shift || true
+	timeout_arg "$@"
+	cmd_resize "$size"
+	wait_completed "$size"
+}
+
+cmd_wait_completed() {
+	timeout_arg "$@"
+	wait_completed "$(cr .spec.size)"
+}
+
+# The node name is read from the node-id the operator renders into the pod's configuration, which is there
+# before the server accepts the admin user, and printed as the server prints it: in hex, upper case.
+cmd_wait_pod() {
+	local pod=${1:-} port deadline node_port="" node_id="" node=""
+	[ -n "$pod" ] || usage
+	shift
+	timeout_arg "$@"
+	port=$(service_port)
+	deadline=$((SECONDS + TIMEOUT_S))
+	while :; do
+		serve_node_ports_on_every_node
+		node_port=$(node_port "$pod" "$port")
+		if [ -n "$node_port" ]; then
+			node_id=$(k -n "$NS" exec "$pod" -c aerospike-server -- \
+				sed -n 's/^[[:space:]]*node-id[[:space:]]*\([0-9A-Fa-f]*\)[[:space:]]*$/\1/p' /etc/aerospike/aerospike.conf 2>/dev/null) ||
+				node_id=""
+			[ -z "$node_id" ] || break
+		fi
+		((SECONDS < deadline)) || die "$pod has no Service NodePort or no node-id within ${TIMEOUT_S}s"
+		sleep 0.5
+	done
+	node=$(printf '%X' "0x$node_id")
+	echo "L3-POD-UP pod=$pod node=$node nodePort=$node_port ready=$(k -n "$NS" get pod "$pod" -o \
+		'jsonpath={.status.conditions[?(@.type=="Ready")].status}')"
+}
+
+cmd_delete_pod() {
+	local pod=${1:-} uid
+	[ -n "$pod" ] || usage
+	uid=$(k -n "$NS" get pod "$pod" -o 'jsonpath={.metadata.uid}')
+	kubectl --request-timeout=0 -n "$NS" delete pod "$pod" --wait=true --timeout=300s >/dev/null
+	echo "L3-POD-DELETED pod=$pod uid=$uid"
+}
+
+cmd_wait_ready() {
+	local pod=${1:-} old="" deadline state=""
+	[ -n "$pod" ] || usage
+	shift
+	if [ "${1:-}" = --old-uid ]; then
+		old=${2:-}
+		shift 2
+	fi
+	timeout_arg "$@"
+	deadline=$((SECONDS + TIMEOUT_S))
+	while :; do
+		state=$(k -n "$NS" get pod "$pod" --ignore-not-found -o \
+			'jsonpath={.metadata.uid} {.status.conditions[?(@.type=="Ready")].status} {.spec.nodeName} {.status.podIP}')
+		read -r uid ready worker ip <<<"$state"
+		[ -z "${uid:-}" ] || [ "$uid" = "$old" ] || [ "${ready:-}" != True ] || break
+		((SECONDS < deadline)) || die "$pod not Ready with a UID other than ${old:-none} within ${TIMEOUT_S}s: $state"
+		sleep 2
+	done
+	echo "L3-POD-READY pod=$pod uid=$uid oldUid=$old worker=$worker ip=$ip"
+}
+
+cmd_service() {
+	local name=${1:-} port=${2:-}
+	[ -n "$name" ] || usage
+	port=${port:-$(service_port)}
+	echo "L3-SERVICE name=$name uid=$(k -n "$NS" get service "$name" --ignore-not-found -o 'jsonpath={.metadata.uid}')" \
+		"nodePort=$(node_port "$name" "$port")"
+}
+
+cmd_service_create() {
+	local name=${1:-} pod=${2:-} node_port=${3:-} port
+	[ -n "$name" ] && [ -n "$pod" ] && [[ "$node_port" =~ ^[0-9]+$ ]] || usage
+	port=$(service_port)
+	k -n "$NS" create service nodeport "$name" "--tcp=$port:$port" "--node-port=$node_port" >/dev/null
+	k -n "$NS" set selector service "$name" "statefulset.kubernetes.io/pod-name=$pod" >/dev/null
+	cmd_service "$name"
+}
+
+cmd_service_delete() {
+	[ -n "${1:-}" ] || usage
+	kubectl --request-timeout=0 -n "$NS" delete service "$1" --ignore-not-found --wait=true --timeout=120s >/dev/null
+	echo "L3-SERVICE-DELETED name=$1"
+}
+
+cmd_node_port_range() {
+	local probe="$CR-node-port-range" error range
+	[ -z "$(k -n "$NS" get service "$probe" --ignore-not-found -o name)" ] || die "Service $probe exists"
+	error=$(k -n "$NS" create service nodeport "$probe" --tcp=1:1 --node-port=1 2>&1 >/dev/null) || true
+	k -n "$NS" delete service "$probe" --ignore-not-found >/dev/null
+	range=$(grep -oE 'range of valid ports is [0-9]+-[0-9]+' <<<"$error" | grep -oE '[0-9]+-[0-9]+') ||
+		die "no NodePort range in: $error"
+	echo "L3-NODE-PORT-RANGE first=${range%-*} last=${range#*-}"
+}
+
+cmd_node_ports() {
+	echo "L3-NODE-PORTS ports=$(k get service --all-namespaces -o 'jsonpath={range .items[*].spec.ports[*]}{.nodePort}{"\n"}{end}' |
+		grep -E '^[0-9]+$' | sort -n | paste -sd, -)"
+}
+
+cmd_label_node() {
+	[ $# -eq 3 ] || usage
+	k label node "$1" "$2=$3" --overwrite >/dev/null
+	echo "L3-LABELLED node=$1 $2=$3"
+}
+
+cmd_cordon_others() {
+	local keep=${1:-} node
+	[ -n "$keep" ] || usage
+	k get node "$keep" -o name >/dev/null
+	for node in $(k get nodes -o 'jsonpath={.items[*].metadata.name}'); do
+		[ "$node" != "$keep" ] || continue
+		k cordon "$node" >/dev/null
+		echo "L3-CORDONED node=$node"
+	done
+}
+
+cmd_uncordon() {
+	local node status=0
+	for node in "$@"; do
+		if k uncordon "$node" >/dev/null; then
+			echo "L3-UNCORDONED node=$node"
+		else
+			status=1
+		fi
+	done
+	return $status
+}
+
+cmd_delete_node() {
+	local node=${1:-} uid pods pod
+	[ -n "$node" ] || usage
+	[ -z "$(k get nodes -l node-role.kubernetes.io/control-plane --field-selector "metadata.name=$node" -o name)" ] ||
+		die "$node is a control-plane node; only a worker's Node is deleted"
+	uid=$(k get node "$node" -o 'jsonpath={.metadata.uid}')
+	kubectl --request-timeout=0 delete node "$node" --wait=true --timeout=120s >/dev/null
+	# Pod garbage collection races the kubelet restart that registers the Node again.
+	pods=$(k -n "$NS" get pods -l "aerospike.com/cr=$CR" --field-selector "spec.nodeName=$node" \
+		-o 'jsonpath={.items[*].metadata.name}')
+	for pod in $pods; do
+		k -n "$NS" delete pod "$pod" --force --grace-period=0 --ignore-not-found >/dev/null 2>&1
+	done
+	echo "L3-NODE-DELETED node=$node uid=$uid pods=${pods// /,}"
+}
+
+# kind's kubelet does not register a deleted Node again on its own; restarted, it registers a new Node
+# that carries none of the labels set through the API.
+cmd_reregister() {
+	local node=${1:-} deadline start=$SECONDS state
+	[ -n "$node" ] || usage
+	shift
+	timeout_arg "$@"
+	deadline=$((SECONDS + TIMEOUT_S))
+	while [ -n "$(k get node "$node" --ignore-not-found -o name)" ]; do
+		((SECONDS < deadline)) || die "Node $node still exists after ${TIMEOUT_S}s"
+		sleep 1
+	done
+	"$L3_DOCKER" exec "$node" systemctl restart kubelet || die "cannot restart kubelet in $node"
+	echo "L3-KUBELET-RESTARTED node=$node"
+	while :; do
+		state=$(k get node "$node" --ignore-not-found -o \
+			'jsonpath={.metadata.uid} {.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null) || state=""
+		read -r uid ready <<<"$state"
+		[ -z "${uid:-}" ] || [ "${ready:-}" != True ] || break
+		((SECONDS < deadline)) || die "Node $node not registered again and Ready within ${TIMEOUT_S}s"
+		sleep 1
+	done
+	echo "L3-NODE-REGISTERED node=$node uid=$uid afterS=$((SECONDS - start))"
+}
+
+# A CA and a server certificate whose only dNSName SAN is the tls-name, in a secret the AerospikeCluster
+# mounts; TLS alternate access configured as alternate access is. Under networkLoadBalancer it also sets
+# loadBalancerTLSAlternateAccessAddress, after adding a CoreDNS entry for it at the address the clear one
+# has, since the server resolves its access addresses at startup.
+cmd_enable_tls() {
+	local tls_name=aerospike-tls tls_port=4333 secret=aerospike-tls-secret volume=aerospike-tls path=/etc/aerospike/tls
+	local dir="$L3_STATE/tls" alternate tls_endpoint="" clear_endpoint="" corefile ip lb_patch="" name state
+	if [ "${1:-}" = --tls-endpoint ]; then
+		tls_endpoint=${2:-}
+		[[ "$tls_endpoint" =~ ^[A-Za-z0-9.-]+$ ]] || die "--tls-endpoint must be a hostname"
+	elif [ -n "${1:-}" ]; then
+		usage
+	fi
+	alternate=$(cr .spec.aerospikeNetworkPolicy.alternateAccess)
+	if [ "$alternate" = networkLoadBalancer ]; then
+		clear_endpoint=$(cr .spec.aerospikeNetworkPolicy.loadBalancerAlternateAccessAddress)
+		[ -n "$clear_endpoint" ] || die "networkLoadBalancer without loadBalancerAlternateAccessAddress"
+		tls_endpoint=${tls_endpoint:-$clear_endpoint}
+	elif [ -n "$tls_endpoint" ]; then
+		die "--tls-endpoint applies to networkLoadBalancer only"
+	fi
+
+	mkdir -p "$dir"
+	(
+		cd "$dir"
+		printf '[v3_req]\nsubjectAltName = DNS:%s\n' "$tls_name" >san.ext
+		openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=Aerospike-L3-Test-CA"
+		openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=$tls_name"
+		openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 30 \
+			-extensions v3_req -extfile san.ext
+		rm -f server.csr ca.srl san.ext
+	) >"$dir/openssl.log" 2>&1 || die "certificate generation failed: $(tail -5 "$dir/openssl.log")"
+	k -n "$NS" create secret generic "$secret" --from-file="ca.crt=$dir/ca.crt" \
+		--from-file="server.crt=$dir/server.crt" --from-file="server.key=$dir/server.key" \
+		--dry-run=client -o yaml | k apply -f - >/dev/null
+	rm -f "$dir/ca.key" "$dir/server.key"
+
+	if [ -n "$tls_endpoint" ] && [ "$tls_endpoint" != "$clear_endpoint" ]; then
+		corefile=$(k -n kube-system get cm coredns -o 'jsonpath={.data.Corefile}')
+		ip=$(awk -v name="$clear_endpoint" 'NF == 2 && $2 == name { print $1; exit }' <<<"$corefile")
+		[ -n "$ip" ] || die "CoreDNS has no hosts entry for $clear_endpoint"
+		if ! awk -v name="$tls_endpoint" 'NF == 2 && $2 == name { found = 1 } END { exit ! found }' <<<"$corefile"; then
+			awk -v name="$clear_endpoint" -v entry="        $ip $tls_endpoint" \
+				'{ print } NF == 2 && $2 == name { print entry }' <<<"$corefile" >"$dir/Corefile"
+			k -n kube-system create configmap coredns --from-file="Corefile=$dir/Corefile" \
+				--dry-run=client -o yaml | k apply -f - >/dev/null
+			k -n kube-system rollout restart deploy/coredns >/dev/null
+			kubectl -n kube-system rollout status deploy/coredns --timeout=180s >/dev/null
+		fi
+		echo "L3-COREDNS name=$tls_endpoint address=$ip as=$clear_endpoint"
+	fi
+	[ -z "$tls_endpoint" ] || lb_patch=',
+  {"op": "add", "path": "/spec/aerospikeNetworkPolicy/loadBalancerTLSAlternateAccessAddress", "value": "'"$tls_endpoint"'"}'
+	cat >"$dir/patch.json" <<EOF
+[
+  {"op": "add", "path": "/spec/storage/volumes/-", "value": {
+    "name": "$volume",
+    "source": {"secret": {"secretName": "$secret"}},
+    "aerospike": {"path": "$path"}}},
+  {"op": "add", "path": "/spec/aerospikeConfig/network/tls", "value": [{
+    "name": "$tls_name",
+    "cert-file": "$path/server.crt",
+    "key-file": "$path/server.key",
+    "ca-file": "$path/ca.crt"}]},
+  {"op": "add", "path": "/spec/aerospikeConfig/network/service/tls-name", "value": "$tls_name"},
+  {"op": "add", "path": "/spec/aerospikeConfig/network/service/tls-port", "value": $tls_port},
+  {"op": "add", "path": "/spec/aerospikeConfig/network/service/tls-authenticate-client", "value": "false"},
+  {"op": "add", "path": "/spec/aerospikeNetworkPolicy/tlsAccess", "value": "$(cr .spec.aerospikeNetworkPolicy.access)"},
+  {"op": "add", "path": "/spec/aerospikeNetworkPolicy/tlsAlternateAccess", "value": "$alternate"},
+  {"op": "add", "path": "/spec/operatorClientCert", "value": {
+    "secretCertSource": {"secretName": "$secret", "caCertsFilename": "ca.crt"}}}$lb_patch
+]
+EOF
+	k -n "$NS" patch aerospikecluster "$CR" --type json --patch-file "$dir/patch.json" >/dev/null
+	TIMEOUT_S=900
+	local deadline=$((SECONDS + TIMEOUT_S)) size
+	size=$(cr .spec.size)
+	while :; do
+		serve_node_ports_on_every_node >/dev/null
+		name=$(cr ".status.aerospikeConfig.network.service['tls-name']")
+		state="tls-name=$name phase=$(cr .status.phase) ready=$(ready_pods) pods=$(all_pods)"
+		[ "$state" != "tls-name=$tls_name phase=Completed ready=$size pods=$size" ] || break
+		((SECONDS < deadline)) || die "AerospikeCluster $CR not Completed with tls-name $tls_name within ${TIMEOUT_S}s: $state"
+		sleep 5
+	done
+	echo "L3-TLS tlsName=$tls_name caFile=$dir/ca.crt tlsEndpoint=$tls_endpoint tlsPort=$tls_port $state"
+}
+
+cmd_certificate() {
+	local cert_file dir secret path name pem
+	cert_file=$(cr ".spec.aerospikeConfig.network.tls[0]['cert-file']")
+	[ -n "$cert_file" ] || die "the AerospikeCluster serves no TLS"
+	dir=$(dirname "$cert_file")
+	secret=""
+	while IFS='|' read -r path name; do
+		[ "${path%/}" != "$dir" ] || secret=$name
+	done < <(k -n "$NS" get aerospikecluster "$CR" -o \
+		'jsonpath={range .spec.storage.volumes[*]}{.aerospike.path}|{.source.secret.secretName}{"\n"}{end}')
+	[ -n "$secret" ] || die "no secret volume mounted at $dir"
+	pem=$(k -n "$NS" get secret "$secret" -o "jsonpath={.data.$(basename "$cert_file" | sed 's/\./\\./g')}" | base64 -d)
+	echo "L3-CERT secret=$secret file=$cert_file" \
+		"subject=$(openssl x509 -noout -subject -nameopt compat <<<"$pem" | sed 's/^subject=//; s/ //g')" \
+		"sans=$(openssl x509 -noout -ext subjectAltName <<<"$pem" | tail -n +2 | tr -d ' ' | paste -sd, -)"
+}
+
+cmd_status() {
+	k get nodes -o wide
+	k get nodes -L "$ALTERNATE_ACCESS_LABEL"
+	k -n "$NS" get aerospikecluster,pods,svc -o wide
+}
+
+[ $# -gt 0 ] || usage
+command=$1
+shift
+case "$command" in
+	pods) cmd_pods ;;
+	nodes) cmd_nodes ;;
+	resize) cmd_resize "$@" ;;
+	scale) cmd_scale "$@" ;;
+	join-watch) cmd_join_watch "$@" ;;
+	wait-pod) cmd_wait_pod "$@" ;;
+	wait-completed) cmd_wait_completed "$@" ;;
+	delete-pod) cmd_delete_pod "$@" ;;
+	wait-ready) cmd_wait_ready "$@" ;;
+	service) cmd_service "$@" ;;
+	service-create) cmd_service_create "$@" ;;
+	service-delete) cmd_service_delete "$@" ;;
+	node-port-range) cmd_node_port_range ;;
+	node-ports) cmd_node_ports ;;
+	label-node) cmd_label_node "$@" ;;
+	cordon-others) cmd_cordon_others "$@" ;;
+	uncordon) cmd_uncordon "$@" ;;
+	delete-node) cmd_delete_node "$@" ;;
+	reregister) cmd_reregister "$@" ;;
+	enable-tls) cmd_enable_tls "$@" ;;
+	certificate) cmd_certificate ;;
+	drivers-stop)
+		for container in $("$L3_DOCKER" ps -aq --filter "name=^${L3_CLUSTER}-driver-"); do
+			"$L3_DOCKER" rm -f "$container" >/dev/null || die "cannot remove driver container $container"
+			echo "L3-DRIVER-REMOVED container=$container"
+		done
+		;;
+	status) cmd_status ;;
+	*) usage ;;
+esac

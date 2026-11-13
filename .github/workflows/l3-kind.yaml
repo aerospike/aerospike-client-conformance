@@ -1,0 +1,136 @@
+name: L3 kind run
+
+on:
+  workflow_call:
+    inputs:
+      client-repository:
+        description: Client repository on GitHub, owner/name
+        type: string
+        required: true
+      commit:
+        description: Client commit to build and run
+        type: string
+        required: true
+      manifest:
+        description: Manifest path in the client repository (l3-kind/README.md)
+        type: string
+        required: true
+      profile:
+        description: >-
+          Comma-separated profiles, or all: default, per-node, tls, nlb, nlb-per-pod, nlb-tls
+        type: string
+        required: false
+        default: all
+      rows:
+        description: Comma-separated rows to run; empty runs every row of each profile
+        type: string
+        required: false
+        default: ""
+      ako-version:
+        description: AKO chart version, or latest; empty takes the profile's default (l3-kind/README.md)
+        type: string
+        required: false
+        default: ""
+      ako-helm-repo:
+        description: Helm repository of the AKO and cluster charts; empty takes the profile's default
+        type: string
+        required: false
+        default: ""
+      cluster-chart-version:
+        description: aerospike-cluster chart version; empty takes the profile's default
+        type: string
+        required: false
+        default: ""
+      conformance-ref:
+        description: Ref of aerospike/aerospike-client-conformance to run l3-kind from
+        type: string
+        required: false
+        default: main
+    secrets:
+      FEATURES_CONF:
+        description: Enterprise feature-key file content
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  l3:
+    name: L3 kind (${{ inputs.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - name: Checkout the harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: aerospike/aerospike-client-conformance
+          ref: ${{ inputs.conformance-ref }}
+          path: conformance
+          persist-credentials: false
+
+      - name: Install kind and kubectl
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.33.0
+          kubectl_version: v1.35.0
+          install_only: true
+          ignore_failed_clean: true
+
+      - name: Install helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.1
+
+      - name: Write the feature key
+        env:
+          FEATURES_CONF: ${{ secrets.FEATURES_CONF }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${FEATURES_CONF}" ]]; then
+            echo "::error::L3 needs the FEATURES_CONF secret"
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "${FEATURES_CONF}" > "${RUNNER_TEMP}/features.conf"
+
+      - name: Run L3
+        env:
+          CLIENT_REPOSITORY: ${{ inputs.client-repository }}
+          COMMIT: ${{ inputs.commit }}
+          MANIFEST: ${{ inputs.manifest }}
+          PROFILE: ${{ inputs.profile }}
+          ROWS: ${{ inputs.rows }}
+          AKO_VERSION: ${{ inputs.ako-version }}
+          AKO_HELM_REPO: ${{ inputs.ako-helm-repo }}
+          CLUSTER_CHART_VERSION: ${{ inputs.cluster-chart-version }}
+        run: |
+          set -euo pipefail
+          args=(
+            --client-repo "https://github.com/${CLIENT_REPOSITORY}"
+            --commit "${COMMIT}"
+            --manifest "${MANIFEST}"
+            --profile "${PROFILE}"
+            --results "${RUNNER_TEMP}/l3-kind-results"
+          )
+          [[ -z "${ROWS}" ]] || args+=(--rows "${ROWS}")
+          [[ -z "${AKO_VERSION}" ]] || args+=(--ako-version "${AKO_VERSION}")
+          [[ -z "${AKO_HELM_REPO}" ]] || args+=(--ako-helm-repo "${AKO_HELM_REPO}")
+          [[ -z "${CLUSTER_CHART_VERSION}" ]] || args+=(--cluster-chart-version "${CLUSTER_CHART_VERSION}")
+          FEATURES_CONF_PATH="${RUNNER_TEMP}/features.conf" conformance/l3-kind/run.sh "${args[@]}"
+
+      - name: Remove the feature key
+        if: ${{ always() }}
+        run: rm -f "${RUNNER_TEMP}/features.conf"
+
+      - name: Upload results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: l3-kind-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/l3-kind-results
+          if-no-files-found: warn
