@@ -191,3 +191,21 @@ rows:
         sourceList: alternate,
       }
     expect: { host: 203.0.113.1, port: 3000, tlsName: db1.example.com }
+
+  - case: host-port-value-keeps-advertised-port
+    because: Spec static-map treats a host:port value as the hostname and keeps the advertised port.
+    config:
+      translation:
+        {
+          provider: static-map,
+          static_map: { "10.0.0.1": nlb.example.com:4001 },
+        }
+    input:
+      {
+        nodeName: BB9020011AC4202,
+        tlsName: null,
+        host: 10.0.0.1,
+        port: 3000,
+        sourceList: standard,
+      }
+    expect: { host: nlb.example.com:4001, port: 3000, tlsName: null }
