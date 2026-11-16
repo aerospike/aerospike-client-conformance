@@ -21,6 +21,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -63,6 +64,9 @@ USABLE_BOUND_MS = l5.USABLE_TEND_INTERVALS * TEND_INTERVAL_MS
 POLL_BOUND_MS = 20
 LISTENER_WAIT_MS = 300000
 QUIET_WINDOW_MS = l5.QUIET_TEND_INTERVALS * TEND_INTERVAL_MS
+MIGRATION_WAIT_MS = 300000
+MIGRATION_POLL_S = 2
+STATS = ("proxied", "writes", "reads")
 ALTERNATE_ACCESS_LABEL = "aerospike.com/configured-alternate-access-address"
 NODE_MARK = "l3-kind-mark"
 NODE_MARK_VALUE = "set-through-api"
@@ -270,13 +274,52 @@ def at_advertised(pods, field="clearAlt"):
 	return {p["node"]: split_address(p[field]) for p in pods}
 
 
+def server_stats(env):
+	"""Each node's namespace statistics, read in its pod: commands it proxied to another node, writes and reads
+	it served, and partitions it is migrating."""
+	return {line["node"]: {k: int(line[k]) for k in STATS + ("migrating",)}
+		for line in env.ctl.ok("stats", NAMESPACE).tagged("L3-STATS")}
+
+
+def settled(env, step):
+	"""Wait until no node migrates a partition, so the partition map a driver reads from then on is the one it
+	serves with."""
+	start = time.monotonic()
+	while True:
+		stats = server_stats(env)
+		waited = int((time.monotonic() - start) * 1000)
+		migrating = {n: v["migrating"] for n, v in stats.items() if v["migrating"]}
+		if not migrating or waited >= MIGRATION_WAIT_MS:
+			break
+		time.sleep(MIGRATION_POLL_S)
+	check("migrations-done", bool(stats) and not migrating, step=step, migrating=migrating, waitedMs=waited,
+		boundMs=MIGRATION_WAIT_MS)
+
+
+def serve_direct(env, drv, step, expected):
+	"""serve, and from the servers' statistics around it: no node proxied a command to another, and the nodes
+	served every write and read themselves, each node some."""
+	before = server_stats(env)
+	l5.serve(drv, step)
+	after = server_stats(env)
+	delta = {n: {k: after[n][k] - before[n][k] for k in STATS} for n in sorted(after) if n in before}
+	check("no-proxy-hop", sorted(before) == sorted(after) == sorted(delta) == sorted(expected) and
+		not any(d["proxied"] for d in delta.values()), step=step, proxied={n: d["proxied"] for n, d in delta.items()},
+		before=sorted(before), after=sorted(after), expected=sorted(expected))
+	writes, reads = ({n: d[k] for n, d in delta.items()} for k in ("writes", "reads"))
+	check("served-by-nodes", all(v > 0 for v in list(writes.values()) + list(reads.values())) and
+		sum(writes.values()) >= l5.PARTITIONS and sum(reads.values()) >= l5.PARTITIONS, step=step, writes=writes,
+		reads=reads, partitions=l5.PARTITIONS)
+
+
 def routes_every_pod(env, step, pods, expected, seed=None):
-	"""A driver seeded once holds one node per pod at its expected address, nothing unowned, and serve writes
-	and reads every partition."""
+	"""Once no partition migrates, a driver seeded once holds one node per pod at its expected address, nothing
+	unowned, and serve writes and reads every partition, each at a node that holds it."""
+	settled(env, step)
 	with env.driver("l3-" + step, seed or pods[0]["clearAlt"]) as drv:
 		snapshot = l5.await_routing(drv, step, [p["node"] for p in pods], ROUTING_WAIT_MS)
 		assert_nodes_at(env, step, snapshot, expected)
-		l5.serve(drv, step)
+		serve_direct(env, drv, step, [p["node"] for p in pods])
 
 
 def never_empty(drv, step, since):
@@ -657,6 +700,27 @@ def tls_expected(env, cluster, pods):
 	return host, {p["pod"]: "%s:%d" % (host, p["tlsNodePort"]) for p in pods}
 
 
+def parse_peers(value):
+	"""A peers reply, gen,port,[[node,tls-name,[address[:port],...]],...], as each node's tls-name and addresses,
+	each with its port."""
+	_, _, rest = value.partition(",")
+	port, _, rest = rest.partition(",")
+	return {node: (name, [a if ":" in a else "%s:%s" % (a, port) for a in addresses.split(",") if a])
+		for node, name, addresses in re.findall(r"\[([^,\[\]]+),([^,\[\]]*),\[([^\[\]]*)\]\]", rest)}
+
+
+def assert_peers_tls(env, pods, expected):
+	"""Each pod lists every other pod's node as a TLS peer under the tls-name, at the TLS address that pod
+	advertises."""
+	wrong = {}
+	for pod in pods:
+		peers = parse_peers(pod.get("peersTlsAlt", ""))
+		want = {p["node"]: (env.tls_name, [expected[p["pod"]]]) for p in pods if p is not pod}
+		if peers != want:
+			wrong[pod["pod"]] = pod.get("peersTlsAlt", "")
+	check("peers-tls-alt", not wrong, wrong=wrong, tlsName=env.tls_name, expected=expected)
+
+
 def row_tls_certificate(env):
 	"""The shared certificate carries the tls-name as a dNSName SAN and no SAN for the endpoint hostname, and
 	each pod advertises its TLS address with its own TLS Service NodePort: under networkLoadBalancer
@@ -672,8 +736,11 @@ def row_tls_certificate(env):
 		naming = [s for s in sans if any(e in s for e in endpoints)]
 		check("certificate-sans", dns == [env.tls_name] and not naming, sans=sans, tlsName=env.tls_name,
 			endpointSans=naming)
+		check("tls-alternate-access", cluster["tlsAlternateAccess"] == cluster["alternateAccess"],
+			tlsAlternateAccess=cluster["tlsAlternateAccess"], alternateAccess=cluster["alternateAccess"])
 		_, expected = tls_expected(env, cluster, pods)
 		advertised("tls", pods, "tlsAlt", expected)
+		assert_peers_tls(env, pods, expected)
 		if cluster["alternateAccess"] == NETWORK_LOAD_BALANCER:
 			advertised("tls-clear", pods, "clearAlt", {p["pod"]: "%s:%d" % (cluster["lbAddress"], p["nodePort"]) for p in pods})
 	finally:
@@ -690,10 +757,11 @@ def row_tls_name(env):
 		host, expected = tls_expected(env, cluster, pods)
 		advertised("tls", pods, "tlsAlt", expected)
 		seed = expected[pods[0]["pod"]]
+		settled(env, "tls-name")
 		with env.driver("l3-tls-name", seed, tls_name=env.tls_name) as drv:
 			snapshot = l5.await_routing(drv, "tls-name", [p["node"] for p in pods], ROUTING_WAIT_MS)
 			assert_nodes_at(env, "tls-name", snapshot, at_advertised(pods, "tlsAlt"))
-			l5.serve(drv, "tls-name")
+			serve_direct(env, drv, "tls-name", [p["node"] for p in pods])
 		drv = env.start("l3-tls-endpoint-name", seed, tls_name=host)
 		try:
 			try:
