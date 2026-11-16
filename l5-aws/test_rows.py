@@ -76,7 +76,7 @@ while True:
 	counters["succeeded"] += ph.get("succeed", 10)
 	failures = ph.get("fail", 0) + (ph.get("fail_first", 0) if first else 0)
 	counters["failed"] += failures
-	if contract == 3:
+	if contract >= 3:
 		for _ in range(failures):
 			failure = {"type": "failure", "t": t, "startedAt": entered_t + ph["started_ms"] if "started_ms" in ph else t - 500,
 				"message": ph.get("error", "timeout")}
@@ -431,8 +431,8 @@ class ContractTest(RowsTest):
 
 	def test_wrong_contract(self):
 		s = w1()
-		s["driver"]["ready_fields"] = {"contract": 4}
-		self.assertContract(*self.run_row("W-1", s), "ready with contract 4, harness speaks 1, 2 or 3")
+		s["driver"]["ready_fields"] = {"contract": 6}
+		self.assertContract(*self.run_row("W-1", s), "ready with contract 6, harness speaks 1, 2, 3, 4 or 5")
 
 	def test_no_ready(self):
 		s = w1()
@@ -840,6 +840,23 @@ class W5Test(RowsTest):
 		self.assertPasses(code, out)
 		self.assertIn(" basis=start startedBeforeMove=0 startedAfterMove=0 firstStartAfterRunningMs=null ", out)
 
+	def test_passes_contract_5_when_failures_started_before_move(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 5}
+		s["driver"]["phases"]["outage"]["later"] += [{"after_ms": 11000, "fail": 2, "started_ms": 9500},
+			{"after_ms": 13000, "fail": 0}]
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		self.assertIn("basis=start startedBeforeMove=4 startedAfterMove=0 firstStartAfterRunningMs=null message=null ",
+			out)
+
+	def test_no_failures_after_move_contract_5(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 5}
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 60000, "fail": 1, "error": "node-2A0-timeout"})
+		self.assertFailsCheck(*self.run_row("W-5", s), "no-failures-after-move", basis="start",
+			startedBeforeMove=0, message="node-2A0-timeout")
+
 	def test_failure_without_started_at(self):
 		s = w5()
 		s["driver"]["ready_fields"] = {"contract": 3}
@@ -860,6 +877,50 @@ class W5Test(RowsTest):
 		s = w5()
 		s["driver"]["served"] = {"read": 0, "mismatched": 4096}
 		self.assertFailsCheck(*self.run_row("W-5", s), "serve", step="after")
+
+
+class LaterContractTest(RowsTest):
+	def assertPassesWith(self, contract, row, scenario):
+		scenario["driver"]["ready_fields"] = {"contract": contract}
+		code, out = self.run_row(row, scenario)
+		self.assertPasses(code, out)
+		self.assertIn("L5-DRIVER-READY ", out)
+		self.assertIn(" contract=%d" % contract, out)
+		return out
+
+	def test_w1_contract_4(self):
+		out = self.assertPassesWith(4, "W-1", w1())
+		self.assertEqual(2, out.count("L5-CHECK check=serve "))
+
+	def test_w1_contract_5(self):
+		out = self.assertPassesWith(5, "W-1", w1())
+		self.assertEqual(2, out.count("L5-CHECK check=serve "))
+
+	def test_w2_contract_4(self):
+		out = self.assertPassesWith(4, "W-2", w2())
+		self.assertIn("L5-RECOVERY step=rollout", out)
+
+	def test_w2_contract_5(self):
+		out = self.assertPassesWith(5, "W-2", w2())
+		self.assertIn("L5-RECOVERY step=rollout", out)
+
+	def test_w3_contract_4(self):
+		out = self.assertPassesWith(4, "W-3", w3(free_port()))
+		self.assertIn(" contract=4 addresses=", out)
+		self.assertIn("L5-CHECK check=routing step=served", out)
+
+	def test_w3_contract_5(self):
+		out = self.assertPassesWith(5, "W-3", w3(free_port()))
+		self.assertIn(" contract=5 addresses=", out)
+		self.assertIn("L5-CHECK check=routing step=served", out)
+
+	def test_w5_contract_4(self):
+		out = self.assertPassesWith(4, "W-5", w5())
+		self.assertIn(" basis=start startedBeforeMove=", out)
+
+	def test_w5_contract_5(self):
+		out = self.assertPassesWith(5, "W-5", w5())
+		self.assertIn(" basis=start startedBeforeMove=", out)
 
 
 if __name__ == "__main__":

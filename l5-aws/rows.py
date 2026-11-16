@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# One L5 row (W-1, W-2, W-3 or W-5) through a client's driver (DRIVER.md, contract version 3, 2 or 1).
+# One L5 row (W-1, W-2, W-3 or W-5) through a client's driver (DRIVER.md, contract version 1 to 5).
 # run.sh runs it on the runner from the client checkout with the row environment of the README. It
 # starts the driver with bash -c from the current directory, sends it commands, reads its JSON lines
 # and makes every pass/fail call; it drives the cluster through $L5_CTL. Every interval it asserts on is
@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 
-CONTRACTS = (1, 2, 3)
+CONTRACTS = (1, 2, 3, 4, 5)
 # Tag of every line the shared driver code prints; l2-proxy/rows.py sets L2.
 TAG = "L5"
 NAMESPACE = "test"
@@ -940,7 +940,7 @@ def row_w5(env):
 			back = seen["back"] or {}
 			check("stays-off-zone", not back, address=address, t=back.get("t"),
 				afterRunningMs=back["t"] - running_t if back else None, nodes=back.get("nodes"), untilT=until_t)
-			if drv.contract == 3:
+			if drv.contract >= 3:
 				first = seen["firstStartAfterMove"]
 				check("no-failures-after-move", first is None, failedAtMove=moved["failed"], failedAtEnd=last["failed"],
 					basis="start", startedBeforeMove=seen["startedBeforeMove"], startedAfterMove=seen["startedAfterMove"],

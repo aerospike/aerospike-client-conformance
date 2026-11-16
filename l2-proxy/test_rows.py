@@ -156,9 +156,19 @@ def nodes_line(alt=lambda c, p: "", std=lambda c, a, p: a + ":3000", extra=()):
 		"clusterSize=3 state=up" % (c, n, a, c, p, std(c, a, p), alt(c, p)) for c, n, a, p in list(NODES) + list(extra)]}
 
 
+def stats(proxied=(0, 0, 0), writes=(1400, 1400, 1400), reads=(1400, 1400, 1400)):
+	"""l2ctl stats once no partition migrates, then before and after a serve: the last reading adds proxied,
+	writes and reads to the one before."""
+	line = "L2-STATS container=%s node=%s proxied=%d writes=%d reads=%d migrating=0"
+	base = {"lines": [line % (c, n, 7, 100, 100) for c, n, _, _ in NODES]}
+	return [base, base,
+		{"lines": [line % (c, n, 7 + p, 100 + w, 100 + r) for (c, n, _, _), p, w, r in zip(NODES, proxied, writes, reads)]}]
+
+
 def base_ctl():
 	return {
 		"nodes": nodes_line(),
+		"stats": stats(),
 		"route-check": {"lines": ["L2-ROUTE address=%s:3000 node=%s connects=false expected=false" % (a, c)
 			for c, _, a, _ in NODES] + ["L2-ROUTE address=%s:%d connects=true expected=true" % (ENDPOINT, p)
 			for _, _, _, p in NODES]},
@@ -347,6 +357,52 @@ class PortMapByNameTest(RowsTest):
 	def test_partition_not_served(self):
 		self.assertFailsCheck(self.row, scenario(served={"read": 4000, "failures": 96}), "serve")
 
+	def test_served_without_proxy_hop(self):
+		out = self.assertPasses(self.row, scenario())
+		self.assertEqual(3, self.ctl_log().count("stats test"))
+		self.assertIn("L2-CHECK check=migrations-done step=port-map-name migrating={}", out)
+		self.assertIn("L2-CHECK check=no-proxy-hop step=port-map-name proxied={\"A1\":0,\"B1\":0,\"C1\":0}", out)
+		self.assertIn("L2-CHECK check=served-by-nodes step=port-map-name", out)
+
+	def test_proxy_hop_fails(self):
+		s = scenario()
+		s["ctl"]["stats"] = stats(proxied=(0, 3, 0))
+		self.assertFailsCheck(self.row, s, "no-proxy-hop", proxied='{"A1":0,"B1":3,"C1":0}')
+
+	def test_node_missing_from_stats_fails(self):
+		s = scenario()
+		s["ctl"]["stats"][2]["lines"] = s["ctl"]["stats"][2]["lines"][:2]
+		self.assertFailsCheck(self.row, s, "no-proxy-hop", after='["A1","B1"]')
+
+	def test_node_without_writes_fails(self):
+		s = scenario()
+		s["ctl"]["stats"] = stats(writes=(4096, 0, 4096))
+		self.assertFailsCheck(self.row, s, "served-by-nodes", writes='{"A1":4096,"B1":0,"C1":4096}')
+
+	def test_too_few_reads_fails(self):
+		s = scenario()
+		s["ctl"]["stats"] = stats(reads=(1000, 1000, 1000))
+		self.assertFailsCheck(self.row, s, "served-by-nodes", partitions=4096)
+
+	def test_node_without_reads_fails(self):
+		s = scenario()
+		s["ctl"]["stats"] = stats(reads=(4096, 0, 4096))
+		self.assertFailsCheck(self.row, s, "served-by-nodes", reads='{"A1":4096,"B1":0,"C1":4096}')
+
+	def test_waits_for_migrations(self):
+		s = scenario()
+		migrating = {"lines": [line.replace("migrating=0", "migrating=12") for line in s["ctl"]["stats"][0]["lines"]]}
+		s["ctl"]["stats"] = [migrating] + s["ctl"]["stats"]
+		with mock.patch.object(rows, "MIGRATION_POLL_S", 0):
+			self.assertPasses(self.row, s)
+		self.assertEqual(4, self.ctl_log().count("stats test"))
+
+	def test_migrations_not_done_fails(self):
+		s = scenario()
+		s["ctl"]["stats"] = {"lines": [line.replace("migrating=0", "migrating=12") for line in s["ctl"]["stats"][0]["lines"]]}
+		with mock.patch.object(rows, "MIGRATION_WAIT_MS", 0):
+			self.assertFailsCheck(self.row, s, "migrations-done", step="port-map-name")
+
 
 class PortMapByAddressTest(RowsTest):
 	row = "port-map-by-advertised-address-routes-every-node"
@@ -363,6 +419,40 @@ class PortMapByAddressTest(RowsTest):
 
 	def test_older_driver_skips(self):
 		self.assertOlderDriverSkips(self.row, scenario(), 5)
+
+	def test_proxy_hop_fails(self):
+		s = scenario(contract=5)
+		s["ctl"]["stats"] = stats(proxied=(1, 0, 0))
+		self.assertFailsCheck(self.row, s, "no-proxy-hop", step="port-map-address")
+
+
+class PortMapCollisionTest(RowsTest):
+	row = "port-map-colliding-nodes-never-held"
+
+	def collision(self, later=None):
+		seed = {"nodes": three()[:1]}
+		if later:
+			seed["later"] = [{"after_ms": 1000, "nodes": later}]
+		return scenario({"start": {"nodes": three()}, "l2-port-map-collision:start": seed}, contract=5)
+
+	def test_passes(self):
+		out = self.assertPasses(self.row, self.collision())
+		self.assertIn("L2-CHECK check=others-held-and-served step=port-map-collision outcome=skip", out)
+		flags = self.driver_args()[-1]
+		self.assertEqual("10.0.0.11:3000=as-endpoint.test:4901,10.0.0.12:3000=as-endpoint.test:4902,"
+			"10.0.0.13:3000=as-endpoint.test:4902", flags[flags.index("--port-map") + 1])
+		self.assertEqual("strict", flags[flags.index("--on-miss") + 1])
+
+	def test_colliding_node_held_fails(self):
+		self.assertFailsCheck(self.row, self.collision(later=three()[:2]), "never-held", node='["B1","C1"]')
+
+	def test_seed_not_served_passes(self):
+		s = self.collision()
+		s["driver"]["served"] = {"read": 0, "failures": 4096}
+		self.assertPasses(self.row, s)
+
+	def test_older_driver_skips(self):
+		self.assertOlderDriverSkips(self.row, self.collision(), 5)
 
 
 class StrictMissTest(RowsTest):
@@ -424,6 +514,17 @@ class ListenerClosedTest(RowsTest):
 	def test_fault_not_applied(self):
 		out = self.assertFailsCheck(self.row, scenario(self.phases()), "fault-observed", "--no-fault")
 		self.assertIn("L2-FAULT skipped=listener c-2 off", out)
+
+	def test_others_serve_during_outage(self):
+		out = self.assertPasses(self.row, scenario(self.phases()))
+		self.assertIn("command=serve outage", out)
+		self.assertIn("L2-CHECK check=others-serve-during-outage read=4096", out)
+		self.assertIn('ownedByOthers=2 others=["A1","C1"]', out)
+
+	def test_others_not_served_during_outage_fails(self):
+		s = scenario(self.phases(), served={"read": 1, "written": 1, "failures": 4095})
+		self.assertFailsCheck(self.row, s, "others-serve-during-outage", read=1, ownedByOthers=2)
+		self.assertIn("listener c-2 on", self.ctl_log())
 
 	def test_latency_after_recovery(self):
 		phases = self.phases()
@@ -610,11 +711,88 @@ class PassThroughPortsTest(RowsTest):
 			usableMs=900, boundMs=500)
 		self.assertIn("stop-node c-4", self.ctl_log())
 
-	def test_unresolved_passes(self):
+	def test_new_node_held_at_its_address(self):
+		out = self.assertPasses("new-node-on-shared-name-usable-within-two-tend-intervals", self.new_node())
+		self.assertIn("L2-NODE-AT step=new-node-shared-name node=D1 at=as-pass-through.test:4910", out)
+
+	def test_new_node_at_wrong_port_fails(self):
+		s = self.new_node()
+		s["driver"]["phases"]["listener"]["nodes"][-1]["port"] = 4999
+		self.assertFailsCheck("new-node-on-shared-name-usable-within-two-tend-intervals", s, "node-address",
+			wrong='["D1@as-pass-through.test:4999"]')
+
+	def test_shared_name_proxy_hop_fails(self):
+		s = self.with_nodes(scenario({"start": {"nodes": three(A1={"host": "as-pass-through.test"}, B1={"host": PROXY},
+			C1={"host": "as-pass-through.test"})}}))
+		s["ctl"]["stats"] = stats(proxied=(0, 0, 2))
+		self.assertFailsCheck("shared-alternate-name-routes-every-node", s, "no-proxy-hop", step="shared-name")
+
+	def colliding(self, later=None):
+		start = {"nodes": three(A1={"host": "as-pass-through.test"})}
+		if later:
+			start["later"] = [{"after_ms": 1000, "nodes": later}]
+		s = self.with_nodes(scenario({"start": start}))
+		s["ctl"]["start-node"] = [{"lines": ["L2-STARTED container=c-4 address=10.0.0.14 conf=c-4.conf"]},
+			{"lines": ["L2-STARTED container=c-5 address=10.0.0.15 conf=c-5.conf"]}]
+		s["ctl"]["wait-advertised"] = [{"lines": ["L2-ADVERTISED container=c-4 node=D1 address=10.0.0.14 by=c-1"]},
+			{"lines": ["L2-ADVERTISED container=c-5 node=E1 address=10.0.0.15 by=c-1"]}]
+		s["ctl"]["listener-add"] = {"lines": ["L2-LISTENER name={1} added"]}
+		return s
+
+	def test_colliding_alternate_passes(self):
+		out = self.assertPasses("colliding-alternate-nodes-never-held", self.colliding())
+		self.assertIn("L2-CHECK check=others-held-and-served step=colliding-alternate outcome=skip", out)
+		log = self.ctl_log()
+		self.assertEqual(2, log.count("start-node --alternate as-pass-through.test:4911"))
+		self.assertIn("wait-cluster 5 --timeout 120", log)
+		self.assertIn("listener-add c-4 4911 c-4:3000", log)
+		self.assertIn("listener-remove c-4", log)
+		self.assertIn("stop-node c-5", log)
+		self.assertEqual("wait-cluster 3 --timeout 120", log[-1])
+		self.assertEqual("pass-through", self.driver_args()[-1][self.driver_args()[-1].index("--shape") + 1])
+
+	def test_colliding_alternate_held_fails(self):
+		s = self.colliding(later=three() + [node("D1", 4911, host="as-pass-through.test")])
+		self.assertFailsCheck("colliding-alternate-nodes-never-held", s, "never-held", node='["D1","E1"]')
+		self.assertIn("stop-node c-4", self.ctl_log())
+
+	def test_colliding_alternate_others_dropped_passes(self):
+		s = self.colliding()
+		s["driver"]["phases"]["start"]["nodes"] = []
+		self.assertPasses("colliding-alternate-nodes-never-held", s)
+
+	def test_colliding_alternate_client_not_created_passes(self):
+		s = self.colliding()
+		s["driver"]["not_created"] = {"l2-colliding-alternate": "D1 and E1 translate to as-pass-through.test:4911"}
+		out = self.assertPasses("colliding-alternate-nodes-never-held", s)
+		self.assertIn("L2-CHECK check=never-held step=colliding-alternate", out)
+		self.assertIn("clientCreated=false", out)
+		self.assertIn("stop-node c-5", self.ctl_log())
+
+	def test_colliding_newcomer_skips(self):
+		self.assertSkips("colliding-newcomer-never-held", self.colliding(), rows.NEWCOMER_UNDECIDED)
+		self.assertFalse(os.path.exists(os.path.join(self.state, "ctl.log")))
+
+	def unresolved(self, peer_host="as-pass-through.test"):
 		self.values["L2_UNRESOLVED"] = "1"
 		s = self.with_nodes(scenario())
+		s["ctl"]["nodes"]["lines"] = [line.replace(" state=up", " peersAlt=4,3000,[%s] state=up" % ",".join(
+			"[%s,,[%s:%d]]" % (n, peer_host, p) for _, n, _, p in NODES if "node=%s " % n not in line)) for line in
+			s["ctl"]["nodes"]["lines"]]
 		s["ctl"]["lookup"] = {"lines": ["L2-LOOKUP container=c-%d name={1} exit=2 resolves=false" % i for i in (1, 2, 3)]}
-		self.assertPasses("shared-name-unresolved-in-servers-advertised-verbatim", s)
+		return s
+
+	def test_unresolved_passes(self):
+		out = self.assertPasses("shared-name-unresolved-in-servers-advertised-verbatim", self.unresolved())
+		self.assertIn("L2-CHECK check=peers-verbatim wrong={}", out)
+
+	def test_unresolved_peer_listed_resolved_fails(self):
+		self.assertFailsCheck("shared-name-unresolved-in-servers-advertised-verbatim", self.unresolved(PROXY),
+			"peers-verbatim")
+
+	def test_peer_at_the_default_port(self):
+		self.assertEqual({"B1": ["as-pass-through.test:3000"], "C1": ["as-pass-through.test:4903"]},
+			rows.parse_peers("4,3000,[[B1,,[as-pass-through.test]],[C1,,[as-pass-through.test:4903]]]"))
 
 	def test_unresolved_resolving_fails(self):
 		self.values["L2_UNRESOLVED"] = "1"
@@ -673,12 +851,12 @@ class PortMapRangeTest(RowsTest):
 	def test_new_node_older_driver_skips(self):
 		self.assertOlderDriverSkips("new-node-in-range-usable-within-two-tend-intervals", self.new_node(), 5)
 
-	def outside(self, held_later=False):
+	def outside(self, held_later=False, set_name="l2-outside-range"):
 		started = {"nodes": self.ranged()}
 		if held_later:
 			started["later"] = [{"after_ms": 1000, "nodes": self.ranged() + [node("D1", 3000, host="10.0.0.40")]}]
-		s = scenario({"start": {"nodes": three()}, "l2-outside-range:start": {"nodes": self.ranged()},
-			"l2-outside-range:started": started}, contract=5)
+		s = scenario({"start": {"nodes": three()}, set_name + ":start": {"nodes": self.ranged()},
+			set_name + ":started": started}, contract=5)
 		s["ctl"]["start-node"] = {"lines": ["L2-STARTED container=c-4 address=10.0.0.40 conf=aerospike.conf"],
 			"phase": "started"}
 		s["ctl"]["wait-advertised"] = {"lines": ["L2-ADVERTISED container=c-4 node=D1 address=10.0.0.40 by=c-1"]}
@@ -696,6 +874,26 @@ class PortMapRangeTest(RowsTest):
 
 	def test_outside_older_driver_skips(self):
 		self.assertOlderDriverSkips("strict-never-holds-node-outside-range", self.outside(), 5)
+
+	def test_outside_pass_through_passes(self):
+		row = "pass-through-never-holds-unroutable-node-outside-range"
+		self.assertPasses(row, self.outside(set_name="l2-outside-range-pass-through"))
+		flags = self.driver_args()[-1]
+		self.assertEqual("pass-through", flags[flags.index("--on-miss") + 1])
+		self.assertIn("stop-node c-4", self.ctl_log())
+
+	def test_outside_pass_through_held_fails(self):
+		row = "pass-through-never-holds-unroutable-node-outside-range"
+		s = self.outside(held_later=True, set_name="l2-outside-range-pass-through")
+		self.assertFailsCheck(row, s, "never-held", node="D1")
+
+	def test_outside_pass_through_older_driver_skips(self):
+		self.assertOlderDriverSkips("pass-through-never-holds-unroutable-node-outside-range", self.outside(), 5)
+
+	def test_range_proxy_hop_fails(self):
+		s = scenario({"start": {"nodes": three()}, "l2-range:start": {"nodes": self.ranged()}}, contract=5)
+		s["ctl"]["stats"] = stats(proxied=(0, 1, 1))
+		self.assertFailsCheck("range-port-map-routes-every-node", s, "no-proxy-hop", step="range")
 
 
 class PortRangeTest(RowsTest):
@@ -758,6 +956,25 @@ class PortRangeTest(RowsTest):
 
 	def test_older_driver_skips(self):
 		self.assertOlderDriverSkips(self.row, self.exhausted(), 3)
+
+	def counting(self, errors_after):
+		s = self.exhausted()
+		heavy = s["driver"]["phases"]["l2-source-ports:start"]
+		heavy["fields"] = {"clientErrors": 0, "clientTimeouts": 0}
+		heavy["later"] = [{"after_ms": 1000, "fields": {"clientErrors": errors_after, "clientTimeouts": 0}}]
+		return s
+
+	def test_client_error_count_passes(self):
+		out = self.assertPasses(self.row, self.counting(4))
+		self.assertIn('L2-CHECK check=client-error-count before={"clientErrors":0,"clientTimeouts":0} '
+			'after={"clientErrors":4,"clientTimeouts":0}', out)
+
+	def test_client_error_count_flat_fails(self):
+		self.assertFailsCheck(self.row, self.counting(0), "client-error-count")
+
+	def test_client_error_count_left_out(self):
+		out = self.assertPasses(self.row, self.exhausted())
+		self.assertIn("L2-CLIENT-ERROR-COUNT skipped=the driver reports neither clientErrors nor clientTimeouts", out)
 
 
 def ports(used):

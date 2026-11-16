@@ -16,7 +16,7 @@ Changed from 1 to 2: `watch` probes every address `HOST` resolves to, and `servi
 
 Status: the harness side is [`rows.py`](rows.py), which `run.sh` runs for each row when the manifest sets `L5_DRIVER`. A manifest without `L5_DRIVER` still runs its rows through `L5_RUN`, as described in the README. The L2 harness, [`l2-proxy/rows.py`](../l2-proxy/rows.py), runs the same driver against a local proxy topology, and the L3 harness, [`l3-kind/rows.py`](../l3-kind/rows.py), against kind and the Aerospike Kubernetes Operator.
 
-A harness reads the version from `ready` and skips, with the reason, every row that needs a later version than the driver reports; a version 1 to 3 driver still runs every other row. `rows.py` here reads versions 1 to 3, `l2-proxy/rows.py` reads 1, 2, 3 and 5, and `l3-kind/rows.py` reads 1 to 5.
+A harness reads the version from `ready` and skips, with the reason, every row that needs a later version than the driver reports; a version 1 to 3 driver still runs every other row. `rows.py` here reads versions 1 to 5, `l2-proxy/rows.py` reads 1, 2, 3 and 5, and `l3-kind/rows.py` reads 1 to 5.
 
 ## Packaging
 
@@ -293,3 +293,65 @@ printf 'serve smoke\nwatch 127.0.0.1:3000 <node>\nquit\n' | (sleep 5; cat) | \
 ```
 
 Expect `ready`; snapshots about every 100 ms with one node, active and reachable; `served` with 4096 written and read and no failures; `watch` with a `usableMs` near 0; and exit status 0. Leave `--user` out against a server without security.
+
+## Proposed, not in effect: contract version 6
+
+This section is a proposal. It is not part of the contract: a driver reports at most version 5, no harness reads a field or sends a command below, and versions 1 to 5 keep their meaning. Each item names the rows that need it; the L2 and L3 rows it lists do not exist yet, except where an existing row gains a check.
+
+A harness that adopts version 6 adds each check below as a row of its own, or as a check that runs only for a version 6 driver, so a version 5 driver is never failed for what it cannot report. A row that needs version 6 is skipped against a version 5 driver with the reason `the driver speaks contract 5; this row needs 6`, as rows that need version 4 or 5 are skipped today. A check that version 6 adds to an existing row is reported as an `L2-CHECK` or `L3-CHECK` line with `outcome=skip` and the same reason, and the row's other checks decide it.
+
+### `route STEP`
+
+The node the client sends each partition's commands to, from its own partition map, without sending a command. For each partition of `--namespace`, in partition order, the name of the node the client would send a write to, and the node it would send a read to with its replica policy set to the master. `null` when the client would send it nowhere. Reply:
+
+```json
+{
+	"type": "route",
+	"t": 6120,
+	"step": "after",
+	"partitions": 4096,
+	"write": ["1A0", "2A0", "..."],
+	"read": ["1A0", "2A0", "..."]
+}
+```
+
+A client that does not expose its partition map replies with `write` and `read` as `null`, and the rows that need them skip.
+
+Needed by a row in every L2 profile and every L3 profile, `writes-and-reads-go-to-each-partition-master`: after routing every node, `route` before and after `serve`, compared with the master each node reports through asinfo (`replicas`); every partition routes to the server's master, and the two replies agree, so the partition map did not change under the comparison. The L2 rows and the L3 rows that route a cluster they did not change already assert this from the server side, through the namespace statistics (no command proxied to another node). What `route` adds is the client's own choice, attributed per partition, which the server cannot report while it migrates partitions: the L3 rows that change the cluster (`scale-up-new-node-usable-within-two-tend-intervals`, `scale-down-removed-node-leaves-without-retry-storm`, `node-ports-stable-across-reschedule-and-recreate`, `rescheduled-pod-keeps-address-and-node-port`, `pod-on-recreated-node-advertises-cluster-address`) would compare `route` with the masters once migrations end, retrying within two tend intervals.
+
+### `kind` on `error`, `failure` and `log`
+
+Rows today accept any exit status 3 or any failed attempt, because the message text is the client's. Version 6 adds `kind`, one of a fixed set, alongside `message`:
+
+| Line      | `kind`                                                                                                                                                                         |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `error`   | `tls-name-mismatch`, `alternate-address-missing`, `peers-unreachable`, `seed-unreachable`, `authentication`, `other`                                                           |
+| `failure` | `timeout`, `connection`, `node-unavailable`, `other`                                                                                                                           |
+| `log`     | `translation-miss`, `translation-collision`, `other`; with `translation-*`, `nodes`: the node names the message names, and `address`: the advertised or translated `host:port` |
+
+| Rows                                                                                                                                             | Check                                                                               |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| L3 `tls-name-holds-every-node-endpoint-name-not-created`                                                                                         | The endpoint name as tls-name exits 3 with `tls-name-mismatch`, not any exit 3      |
+| L2 `empty-alternate-list-client-not-created`, `seed-without-alternate-client-not-created`                                                        | `alternate-address-missing`                                                         |
+| L2 `pass-through-miss-without-route-client-not-created`                                                                                          | `peers-unreachable`                                                                 |
+| L2 `silent-drop-attempts-time-out-within-bound-and-recover`                                                                                      | Every failed attempt is a `timeout`                                                 |
+| L2 `source-port-exhaustion-fails-within-bound-and-recovers`, `reset-peer-attempts-fail-within-bound-and-recover`                                 | Every failed attempt is a `connection` failure, not a `timeout`                     |
+| L2 `strict-miss-never-holds-the-unmapped-node`, `strict-never-holds-node-outside-range`, `pass-through-miss-holds-reachable-node-at-its-address` | A `translation-miss` naming the unmapped node in every window of two tend intervals |
+| L2 `port-map-colliding-nodes-never-held`, `colliding-alternate-nodes-never-held`, and `colliding-newcomer-never-held` once it runs               | A `translation-collision` naming both nodes and the shared `host:port`              |
+| L2 rows that route every node                                                                                                                    | No `translation-miss` or `translation-collision` line                               |
+
+### `tlsName` and `replicas` in `snapshot`
+
+- Each object in `nodes` adds `tlsName`: the name the client validates that node's certificate against, `null` in the clear. Needed by L3 `tls-name-holds-every-node-endpoint-name-not-created`: every node held under the cluster's tls-name.
+- With `owners`, `replicas`: for each node, the partitions of `--namespace` that name it in the client's map at any replica position. Needed by L3 `scale-down-removed-node-leaves-without-retry-storm`: the removed node leaves `replicas` as well as `owners`.
+
+### `nodes` and `blob` in `large`
+
+`large STEP BYTES KEYS [blob]`: with `blob`, bin `v` is `BYTES` bytes, the key's name followed by bytes of any value, instead of a string. The reply adds `nodes`, the name of the node each put was sent to, in key order. Needed by L2 `large-records-over-low-mtu-within-timeout`: a blob of 64 KiB and one of 1 MiB to every node.
+
+### Flags
+
+| Flag                       | Meaning                                                                                                | Needed by                                                                                                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `--on-miss client-default` | Leave the translator miss mode at the client's own default                                             | An L2 row on `reachable`: with no miss mode set, the unmapped reachable node is held at its advertised address (`pass-through`) |
+| `--seed-dns NAME`          | Seed from the addresses `NAME` resolves to through the client's DNS seed provider, instead of `--seed` | An L2 row seeding through a DNS name the topology serves, which l2-proxy would add                                              |
