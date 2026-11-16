@@ -16,7 +16,7 @@ Changed from 1 to 2: `watch` probes every address `HOST` resolves to, and `servi
 
 Status: the harness side is [`rows.py`](rows.py), which `run.sh` runs for each row when the manifest sets `L5_DRIVER`. A manifest without `L5_DRIVER` still runs its rows through `L5_RUN`, as described in the README. The L2 harness, [`l2-proxy/rows.py`](../l2-proxy/rows.py), runs the same driver against a local proxy topology, and the L3 harness, [`l3-kind/rows.py`](../l3-kind/rows.py), against kind and the Aerospike Kubernetes Operator.
 
-A harness reads the version from `ready` and skips, with the reason, every row that needs a later version than the driver reports; a version 1 to 3 driver still runs every other row. `rows.py` here reads versions 1 to 3, `l2-proxy/rows.py` reads 1, 2, 3 and 5, and `l3-kind/rows.py` reads 1 to 5.
+A harness reads the version from `ready` and skips, with the reason, every row that needs a later version than the driver reports; a version 1 to 3 driver still runs every other row. `rows.py` here reads versions 1 to 5, `l2-proxy/rows.py` reads 1, 2, 3 and 5, and `l3-kind/rows.py` reads 1 to 5.
 
 ## Packaging
 
