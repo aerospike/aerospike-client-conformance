@@ -37,6 +37,13 @@ on:
         type: string
         required: false
         default: ""
+      unresolved-hostname:
+        description: >-
+          On pass-through-ports, which profile must then include, the shared alternate name does
+          not resolve in the servers; needs a server-image that advertises access addresses verbatim
+        type: boolean
+        required: false
+        default: false
       conformance-ref:
         description: Ref of aerospike/aerospike-client-conformance to run l2-proxy from
         type: string
@@ -91,6 +98,7 @@ jobs:
           ROWS: ${{ inputs.rows }}
           EDITION: ${{ inputs.edition }}
           SERVER_IMAGE: ${{ inputs.server-image }}
+          UNRESOLVED_HOSTNAME: ${{ inputs.unresolved-hostname }}
         run: |
           set -euo pipefail
           args=(
@@ -103,6 +111,7 @@ jobs:
           )
           [[ -z "${ROWS}" ]] || args+=(--rows "${ROWS}")
           [[ -z "${SERVER_IMAGE}" ]] || args+=(--server-image "${SERVER_IMAGE}")
+          [[ "${UNRESOLVED_HOSTNAME}" != "true" ]] || args+=(--unresolved-hostname)
           if [[ "${EDITION}" == "ee" ]]; then
             export FEATURES_CONF_PATH="${RUNNER_TEMP}/features.conf"
           fi
@@ -116,6 +125,6 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: l2-proxy-results-${{ github.run_id }}-${{ github.run_attempt }}
+          name: l2-proxy-results-${{ inputs.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/l2-proxy-results
           if-no-files-found: warn

@@ -144,19 +144,25 @@ PORTS = [31000, 31001, 31002]
 TLS_PORTS = [32000, 32001, 32002]
 
 
-def pod_line(i, worker="cp", host=ENDPOINT, port=None, host_port=0, uid=None, tls=None, service_uid=None):
+def pod_line(i, worker="cp", host=ENDPOINT, port=None, host_port=0, uid=None, tls=None, service_uid=None, peers=""):
 	port = PORTS[i] if port is None else port
 	tls_alt = "%s:%d" % (tls, TLS_PORTS[i]) if tls else ""
 	return ("L3-POD pod=aerocluster-0-%d worker=%s ip=10.244.0.%d phase=Running ready=True uid=%s nodePort=%d "
-		"tlsNodePort=%s serviceUid=%s hostPort=%s node=0A%d clearAlt=%s:%d tlsAlt=%s" % (i, worker, 10 + i,
+		"tlsNodePort=%s serviceUid=%s hostPort=%s node=0A%d clearAlt=%s:%d tlsAlt=%s peersTlsAlt=%s" % (i, worker, 10 + i,
 		uid or "p%d" % i, PORTS[i], TLS_PORTS[i] if tls else "", service_uid or "s%d" % i, host_port or "", i, host,
-		port, tls_alt))
+		port, tls_alt, peers))
 
 
-def cluster_line(size, access="configuredIP", multi="true", lb="", lb_tls="", tls=""):
+def peers_tls(i, size, tls_host, name=TLS_NAME):
+	"""Pod i's peers-tls-alt reply: every other pod's node under name at tls_host and its TLS NodePort."""
+	return "3,4333,[%s]" % ",".join("[0A%d,%s,[%s:%d]]" % (j, name, tls_host, TLS_PORTS[j]) for j in range(size) if j != i)
+
+
+def cluster_line(size, access="configuredIP", multi="true", lb="", lb_tls="", tls="", tls_access=None):
 	return ("L3-CLUSTER name=aerocluster namespace=aerospike size=%d phase=Completed alternateAccess=%s "
-		"multiPodPerHost=%s lbAddress=%s lbTlsAddress=%s servicePort=3000 tlsPort=%s tlsName=%s" % (size, access, multi,
-		lb, lb_tls, "4333" if tls else "", tls))
+		"multiPodPerHost=%s lbAddress=%s lbTlsAddress=%s servicePort=3000 tlsPort=%s tlsName=%s tlsAlternateAccess=%s" % (
+		size, access, multi, lb, lb_tls, "4333" if tls else "", tls, (access if tls else "") if tls_access is None else
+		tls_access))
 
 
 def pods_entry(size, cluster=None, **pod):
@@ -177,9 +183,18 @@ def node_line(name, role="worker", ip=ENDPOINT_IP, labels=None, uid=None):
 		ip, role, json.dumps(labels or {}, separators=(",", ":")).replace("{", "{{").replace("}", "}}"))
 
 
+def stats(size=2, proxied=None, writes=None, reads=None):
+	"""l3ctl stats when the cluster has settled, before a serve, and after it, which adds proxied, writes and reads."""
+	line = "L3-STATS pod=aerocluster-0-%d node=0A%d proxied=%d writes=%d reads=%d migrating=0"
+	proxied, writes, reads = proxied or [0] * size, writes or [2100] * size, reads or [2100] * size
+	first = {"lines": [line % (i, i, 7, 100, 100) for i in range(size)]}
+	return [first, first, {"lines": [line % (i, i, 7 + proxied[i], 100 + writes[i], 100 + reads[i]) for i in range(size)]}]
+
+
 def base_ctl():
 	return {
 		"pods": pods_entry(2),
+		"stats": stats(),
 		"nodes": {"lines": [node_line("cp", "control-plane", labels={LABEL: ENDPOINT})]},
 		"drivers-stop": {},
 		"wait-completed": {"lines": ["L3-COMPLETED size=2"]},
@@ -286,6 +301,45 @@ class SharedEndpointTest(RowsTest):
 	def test_unlabelled_node_fails(self):
 		self.assertFailsCheck(self.row, scenario(ctl={"nodes": {"lines": [node_line("cp", "control-plane")]}}),
 			"node-label")
+
+	def test_served_without_proxy_hop(self):
+		out = self.assertPasses(self.row, scenario())
+		self.assertEqual(3, self.ctl_log().count("stats test"))
+		self.assertIn("L3-CHECK check=migrations-done step=shared-endpoint migrating={}", out)
+		self.assertIn('L3-CHECK check=no-proxy-hop step=shared-endpoint proxied={"0A0":0,"0A1":0}', out)
+		self.assertIn('L3-CHECK check=served-by-nodes step=shared-endpoint writes={"0A0":2100,"0A1":2100}', out)
+
+	def test_proxy_hop_fails(self):
+		self.assertFailsCheck(self.row, scenario(ctl={"stats": stats(proxied=[0, 5])}), "no-proxy-hop",
+			proxied='{"0A0":0,"0A1":5}')
+
+	def test_stats_without_a_pod_fails(self):
+		s = stats()
+		s[2] = {"lines": s[2]["lines"][:1]}
+		self.assertFailsCheck(self.row, scenario(ctl={"stats": s}), "no-proxy-hop", after='["0A0"]')
+
+	def test_node_without_writes_fails(self):
+		self.assertFailsCheck(self.row, scenario(ctl={"stats": stats(writes=[4200, 0])}), "served-by-nodes",
+			writes='{"0A0":4200,"0A1":0}')
+
+	def test_node_without_reads_fails(self):
+		self.assertFailsCheck(self.row, scenario(ctl={"stats": stats(reads=[4200, 0])}), "served-by-nodes",
+			reads='{"0A0":4200,"0A1":0}')
+
+	def test_waits_for_migrations(self):
+		s = stats()
+		migrating = {"lines": [line.replace("migrating=0", "migrating=12") for line in s[0]["lines"]]}
+		with mock.patch.object(rows, "MIGRATION_POLL_S", 0):
+			self.assertPasses(self.row, scenario(ctl={"stats": [migrating] + s}))
+		self.assertEqual(4, self.ctl_log().count("stats test"))
+
+	def test_migrations_not_done_fails(self):
+		s = stats()
+		migrating = {"lines": [line.replace("migrating=0", "migrating=12") for line in s[0]["lines"]]}
+		with mock.patch.object(rows, "MIGRATION_WAIT_MS", 0):
+			self.assertFailsCheck(self.row, scenario(ctl={"stats": migrating}), "migrations-done",
+				migrating='{"0A0":12,"0A1":12}')
+		self.assertFalse(os.path.exists(os.path.join(self.state, "driver-args")))
 
 	def test_per_node_profile_skips(self):
 		self.profile = "per-node"
@@ -610,10 +664,11 @@ class RecreatedNodeTest(RowsTest):
 			"runs on one kind node (nlb-per-pod)")
 
 
-def tls_ctl(cluster=None, tls_host=ENDPOINT, sans="DNS:aerospike-tls", host=ENDPOINT):
+def tls_ctl(cluster=None, tls_host=ENDPOINT, sans="DNS:aerospike-tls", host=ENDPOINT, peers=None):
 	cluster = cluster or cluster_line(2, tls=TLS_NAME)
+	peers = peers or [peers_tls(i, 2, tls_host) for i in range(2)]
 	return {
-		"pods": {"lines": [cluster] + [pod_line(i, host=host, tls=tls_host) for i in range(2)]},
+		"pods": {"lines": [cluster] + [pod_line(i, host=host, tls=tls_host, peers=peers[i]) for i in range(2)]},
 		"certificate": {"lines": ["L3-CERT secret=aerospike-tls-secret file=/etc/aerospike/tls/server.crt "
 			"subject=CN=aerospike-tls sans=%s" % sans]},
 	}
@@ -634,6 +689,33 @@ class TlsCertificateTest(RowsTest):
 
 	def test_wrong_tls_address_fails(self):
 		self.assertFailsCheck(self.row, scenario(ctl=tls_ctl(tls_host="other.test")), "advertised-tlsAlt")
+
+	def test_peers_under_tls_name(self):
+		out = self.assertPasses(self.row, scenario(ctl=tls_ctl()))
+		self.assertIn("L3-CHECK check=peers-tls-alt wrong={}", out)
+		self.assertIn("L3-CHECK check=tls-alternate-access tlsAlternateAccess=configuredIP alternateAccess=configuredIP", out)
+
+	def test_peer_under_another_tls_name_fails(self):
+		peers = [peers_tls(0, 2, ENDPOINT), peers_tls(1, 2, ENDPOINT, name=ENDPOINT)]
+		self.assertFailsCheck(self.row, scenario(ctl=tls_ctl(peers=peers)), "peers-tls-alt",
+			wrong='{"aerocluster-0-1":"3,4333,[[0A0,as-endpoint.test,[as-endpoint.test:32000]]]"}')
+
+	def test_peer_missing_fails(self):
+		self.assertFailsCheck(self.row, scenario(ctl=tls_ctl(peers=["3,4333,[]", peers_tls(1, 2, ENDPOINT)])),
+			"peers-tls-alt", wrong='{"aerocluster-0-0":"3,4333,[]"}')
+
+	def test_peer_at_another_address_fails(self):
+		peers = [peers_tls(0, 2, "other.test"), peers_tls(1, 2, ENDPOINT)]
+		self.assertFailsCheck(self.row, scenario(ctl=tls_ctl(peers=peers)), "peers-tls-alt")
+
+	def test_peer_address_at_the_default_port(self):
+		self.assertEqual({"0A1": (TLS_NAME, ["as-endpoint.test:4333", "10.0.0.1:32001"])},
+			rows.parse_peers("3,4333,[[0A1,aerospike-tls,[as-endpoint.test,10.0.0.1:32001]]]"))
+
+	def test_tls_alternate_access_differs_fails(self):
+		cluster = cluster_line(2, tls=TLS_NAME, tls_access="hostInternalIP")
+		self.assertFailsCheck(self.row, scenario(ctl=tls_ctl(cluster)), "tls-alternate-access",
+			tlsAlternateAccess="hostInternalIP")
 
 	def test_default_profile_skips(self):
 		self.profile = "default"
@@ -679,6 +761,11 @@ class TlsNameTest(RowsTest):
 	def test_node_at_clear_port_fails(self):
 		self.assertFailsCheck(self.row, scenario({"start": {"nodes": nodes(2)}}, contract=4, ctl=tls_ctl(),
 			not_created=self.not_created), "node-address")
+
+	def test_proxy_hop_fails(self):
+		ctl = dict(tls_ctl(), stats=stats(proxied=[3, 0]))
+		self.assertFailsCheck(self.row, scenario(self.phases, contract=4, ctl=ctl, not_created=self.not_created),
+			"no-proxy-hop", step="tls-name")
 
 	def test_contract_3_driver_skips(self):
 		out = self.assertSkips(self.row, scenario(self.phases, contract=3, ctl=tls_ctl()),

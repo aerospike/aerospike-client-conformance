@@ -20,6 +20,7 @@ import argparse
 import contextlib
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import time
@@ -69,6 +70,12 @@ LIGHT_WORKERS = 2
 EXHAUSTED_QUIET_WAIT_MS = 180000
 PORTS_FREE_WAIT_MS = 90000
 PORTS_POLL_S = 5
+MIGRATION_WAIT_MS = 300000
+MIGRATION_POLL_S = 2
+STATS = ("proxied", "writes", "reads")
+CLIENT_COUNTERS = ("clientErrors", "clientTimeouts")
+COLLISION_UNDECIDED = "whether the client keeps serving the other nodes when two peers collide is not decided"
+NEWCOMER_UNDECIDED = "what the client does when a peer collides with a node it already holds is not decided"
 
 
 def contract_problem(msg, contract=None):
@@ -166,7 +173,8 @@ class Env:
 		lines = self.ctl.ok("nodes").tagged("L2-NODE")
 		nodes = [{"container": line["container"], "node": line["node"], "address": line["address"],
 			"listener": line["listener"], "port": int(line["port"] or 0), "std": line.fields.get("std", ""),
-			"alt": line.fields.get("alt", ""), "state": line["state"]} for line in lines]
+			"alt": line.fields.get("alt", ""), "peersAlt": line.fields.get("peersAlt", ""), "state": line["state"]}
+		for line in lines]
 		down = [n["container"] for n in nodes if n["state"] != "up" or not n["node"] or n["port"] <= 0]
 		check("topology", not down and len(nodes) == size, nodes=["%s=%s@%s" % (n["container"], n["node"], n["port"])
 			for n in nodes], downOrWithoutListener=down, expected=size)
@@ -240,12 +248,13 @@ def await_held(drv, step, expected, bound_ms=ROUTING_WAIT_MS):
 
 
 def assert_never_held(drv, step, node, window_ms=MISS_WINDOW_MS):
-	"""Watch window_ms of driver t from now; fail if any snapshot holds node."""
+	"""Watch window_ms of driver t from now; fail if any snapshot holds node, a name or a list of names."""
 	since = drv.mark()
 	end, observed = drv.wait(lambda m: m if m["type"] == "snapshot" and m["t"] - since[1] >= window_ms else None,
 		window_ms + ROUTING_WAIT_MS, since=since)
 	check("window", end is not None, step=step, observedMs=observed, windowMs=window_ms)
-	holding = [s["t"] for s in drv.between(since[0], end["_index"]) if node in names(s)]
+	never = {node} if isinstance(node, str) else set(node)
+	holding = [s["t"] for s in drv.between(since[0], end["_index"]) if never & set(names(s))]
 	check("never-held", not holding, step=step, node=node, heldAt=holding[:5], windowMs=window_ms,
 		unowned=end.get("unowned"))
 	return end
@@ -273,6 +282,67 @@ def serve_held(drv, step, snapshot):
 	check("serve-held", served["mismatched"] == 0 and served["read"] >= owned, step=step, read=served["read"],
 		written=served["written"],
 		failures=served["failures"], mismatched=served["mismatched"], ownedByHeld=owned, firstFailure=served["firstFailure"])
+
+
+def server_stats(env):
+	"""Each node's namespace statistics: commands it proxied to another node, writes and reads it served, and
+	partitions it is migrating."""
+	return {line["node"]: {k: int(line[k]) for k in STATS + ("migrating",)}
+		for line in env.ctl.ok("stats", NAMESPACE).tagged("L2-STATS")}
+
+
+def settled(env, step):
+	"""Wait until no node migrates a partition, so the partition map a driver reads from then on is the one it
+	serves with."""
+	start = time.monotonic()
+	while True:
+		stats = server_stats(env)
+		waited = int((time.monotonic() - start) * 1000)
+		migrating = {n: v["migrating"] for n, v in stats.items() if v["migrating"]}
+		if not migrating or waited >= MIGRATION_WAIT_MS:
+			break
+		time.sleep(MIGRATION_POLL_S)
+	check("migrations-done", bool(stats) and not migrating, step=step, migrating=migrating, waitedMs=waited,
+		boundMs=MIGRATION_WAIT_MS)
+
+
+def serve_direct(env, drv, step, expected):
+	"""serve, and from the servers' statistics around it: no node proxied a command to another, and the nodes
+	served every write and read themselves, each node some."""
+	before = server_stats(env)
+	l5.serve(drv, step)
+	after = server_stats(env)
+	delta = {n: {k: after[n][k] - before[n][k] for k in STATS} for n in sorted(after) if n in before}
+	check("no-proxy-hop", sorted(before) == sorted(after) == sorted(delta) == sorted(expected) and
+		not any(d["proxied"] for d in delta.values()), step=step, proxied={n: d["proxied"] for n, d in delta.items()},
+		before=sorted(before), after=sorted(after), expected=sorted(expected))
+	writes, reads = ({n: d[k] for n, d in delta.items()} for k in ("writes", "reads"))
+	check("served-by-nodes", all(v > 0 for v in list(writes.values()) + list(reads.values())) and
+		sum(writes.values()) >= PARTITIONS and sum(reads.values()) >= PARTITIONS, step=step, writes=writes, reads=reads,
+		partitions=PARTITIONS)
+
+
+def collision_never_held(env, set_name, step, colliding, **flags):
+	"""Neither colliding node is held for MISS_WINDOW_MS, or the client exits 3 and holds nothing. Whether the
+	client must keep serving the other nodes is not decided, so that check is reported as skipped."""
+	drv = env.start(set_name, **flags)
+	try:
+		try:
+			drv.await_ready()
+			env.contract = drv.contract
+			assert_never_held(drv, step, colliding)
+		except RowFailure as e:
+			if not str(e).startswith("client-created"):
+				raise
+			check("never-held", True, step=step, node=colliding, clientCreated=False)
+	finally:
+		try:
+			drv.close()
+		except RowFailure as e:
+			if not str(e).startswith("client-created"):
+				raise
+		env.stop_drivers()
+	emit("L2-CHECK", check="others-held-and-served", step=step, outcome="skip", reason=COLLISION_UNDECIDED)
 
 
 def expect_not_created(env, step, named=(), **flags):
@@ -346,10 +416,11 @@ def row_port_map_by_name(env):
 	"""Port-map keyed by node name: every node at its listener, every partition owned by a distinct node and
 	served."""
 	nodes = env.topology()
+	settled(env, "port-map-name")
 	with env.driver("l2-port-map-name", port_map=port_map_by_name(env, nodes)) as drv:
 		snapshot = l5.await_routing(drv, "port-map-name", [n["node"] for n in nodes], ROUTING_WAIT_MS)
 		assert_nodes_at(env, "port-map-name", snapshot, {n["node"]: (env.endpoint, n["port"]) for n in nodes})
-		l5.serve(drv, "port-map-name")
+		serve_direct(env, drv, "port-map-name", [n["node"] for n in nodes])
 
 
 def row_port_map_by_address(env):
@@ -358,10 +429,11 @@ def row_port_map_by_address(env):
 	nodes = env.topology()
 	bad = [n["container"] + "=" + n["std"] for n in nodes if not n["std"].endswith(":3000") or n["std"].count(":") != 1]
 	check("advertised-standard", not bad, unexpected=bad)
+	settled(env, "port-map-address")
 	with env.driver("l2-port-map-address", port_map=port_map_by_address(env, nodes), on_miss="strict") as drv:
 		snapshot = l5.await_routing(drv, "port-map-address", [n["node"] for n in nodes], ROUTING_WAIT_MS)
 		assert_nodes_at(env, "port-map-address", snapshot, {n["node"]: (env.endpoint, n["port"]) for n in nodes})
-		l5.serve(drv, "port-map-address")
+		serve_direct(env, drv, "port-map-address", [n["node"] for n in nodes])
 
 
 def subset_row(env, step, mapped, missed, on_miss):
@@ -436,6 +508,13 @@ def row_listener_closed(env):
 		snapshot, waited = drv.wait(gone, FAULT_WAIT_MS, since=since)
 		check("fault-observed", snapshot is not None, node=node["node"], waitedMs=waited, boundMs=FAULT_WAIT_MS,
 			nodes=describe((snapshot or drv.latest())["nodes"]))
+		others = [n["name"] for n in snapshot["nodes"] if n["name"] != node["node"] and n["active"] is True and
+			n["reachable"] is True]
+		owned = sum(snapshot.get("owners", {}).get(name, 0) for name in others)
+		served, waited = drv.request("serve outage", "served", l5.SERVE_WAIT_MS, lambda m: m["step"] == "outage")
+		check("served-reply", served is not None, step="outage", waitedMs=waited, boundMs=l5.SERVE_WAIT_MS)
+		check("others-serve-during-outage", served["read"] >= max(owned, 1), read=served["read"], written=served["written"],
+			failures=served["failures"], ownedByOthers=owned, others=others, firstFailure=served["firstFailure"])
 
 	fault_row(env, "listener-closed", [node], [("listener", node["listener"], "off")],
 		[("listener", node["listener"], "on")], observe)
@@ -537,13 +616,14 @@ def row_reachable_passes_through(env):
 	host = env.value("L2_ACCESS_HOSTNAME")
 	check("advertised-reachable", reachable["std"] == env.address(reachable["port"], host), container=reachable["container"],
 		std=reachable["std"], expected=env.address(reachable["port"], host))
+	settled(env, "reachable")
 	with env.driver("l2-reachable", port_map=port_map_by_name(env, mapped), on_miss="pass-through") as drv:
 		everyone = mapped + [reachable]
 		snapshot = l5.await_routing(drv, "reachable", [n["node"] for n in everyone], ROUTING_WAIT_MS)
 		expected = {n["node"]: (env.endpoint, n["port"]) for n in mapped}
 		expected[reachable["node"]] = (host, reachable["port"])
 		assert_nodes_at(env, "reachable", snapshot, expected)
-		l5.serve(drv, "reachable")
+		serve_direct(env, drv, "reachable", [n["node"] for n in everyone])
 
 
 def row_reachable_strict(env):
@@ -583,10 +663,11 @@ def pass_through_row(env, step):
 	wrong = [n["container"] + "=" + n["alt"] for n in nodes if expected[n["node"]][1] != n["port"] or
 		not expected[n["node"]][0]]
 	check("alternate-advertised", not wrong, wrong=wrong)
+	settled(env, step)
 	with env.driver("l2-" + step, shape="pass-through") as drv:
 		snapshot = l5.await_routing(drv, step, [n["node"] for n in nodes], ROUTING_WAIT_MS)
 		assert_nodes_at(env, step, snapshot, expected)
-		l5.serve(drv, step)
+		serve_direct(env, drv, step, [n["node"] for n in nodes])
 
 
 def row_distinct_names(env):
@@ -632,7 +713,10 @@ def new_node_row(env, step, drv_args, start_args, address, listener_off, listene
 				servingAt=reply["servingAt"], usableAt=reply["usableAt"])
 			budget = USABLE_TEND_INTERVALS * TEND_INTERVAL_MS
 			check("usable-ms", reply["usableMs"] <= budget, node=node, usableMs=reply["usableMs"], boundMs=budget)
-			l5.await_routing(drv, step, [n["node"] for n in nodes] + [node], ROUTING_WAIT_MS)
+			snapshot = l5.await_routing(drv, step, [n["node"] for n in nodes] + [node], ROUTING_WAIT_MS)
+			host, _, port = address.rpartition(":")
+			joined = {"nodes": [n for n in snapshot["nodes"] if n["name"] == node]}
+			assert_nodes_at(env, step, joined, {node: (host, int(port))})
 			l5.serve(drv, step)
 	finally:
 		if state["container"]:
@@ -658,6 +742,50 @@ def row_new_node_shared_name(env):
 		lambda container: env.ctl.ok("listener-add", container, str(port), container + ":3000"), restore)
 
 
+def row_colliding_alternate(env):
+	"""Two nodes started advertising one alternate address and port, whose listener reaches one of them: the
+	pass-through client never holds either."""
+	env.topology()
+	address = "%s:%d" % (env.value("L2_ACCESS_HOSTNAME"), int(env.value("L2_EXTRA_PORT_BASE")) + 1)
+	state = {"containers": [], "listener": None}
+	try:
+		for _ in range(2):
+			state["containers"].append(env.ctl.ok("start-node", "--alternate", address).first("L2-STARTED")["container"])
+		env.wait_cluster(CLUSTER_SIZE + 2)
+		state["listener"] = state["containers"][0]
+		env.ctl.ok("listener-add", state["listener"], address.rpartition(":")[2], state["listener"] + ":3000")
+		colliding = [env.ctl.ok("wait-advertised", c, "--timeout", str(NODE_WAIT_S),
+			bound_ms=NODE_WAIT_S * 1000 + CTL_TIMEOUT_MS).first("L2-ADVERTISED")["node"] for c in state["containers"]]
+		emit("L2-COLLIDING", address=address, nodes=colliding, listener=state["listener"])
+		collision_never_held(env, "l2-colliding-alternate", "colliding-alternate", colliding, shape="pass-through")
+	finally:
+		if state["listener"]:
+			env.outcome.guard(env.ctl.ok, "listener-remove", state["listener"])
+		for container in state["containers"]:
+			env.outcome.guard(env.ctl.ok, "stop-node", container)
+		if state["containers"]:
+			env.outcome.guard(env.wait_cluster)
+
+
+def row_colliding_newcomer(env):
+	"""A node started advertising the alternate address and port of a node the pass-through client holds. Not run
+	until what the client must do then is decided."""
+
+
+def row_port_map_collision(env):
+	"""Port-map keyed by advertised address with two nodes mapped to one node's listener, seeded at the third:
+	the client never holds either colliding node."""
+	nodes = env.topology()
+	seed = [n for n in nodes if n["port"] == env.ports[0]]
+	check("seed-node", len(seed) == 1, seedPort=env.ports[0])
+	a, b = [n for n in nodes if n is not seed[0]]
+	port_map = port_map_by_address(env, nodes)
+	port_map[b["std"]] = env.address(a["port"])
+	emit("L2-COLLIDING", address=env.address(a["port"]), nodes=[a["node"], b["node"]])
+	collision_never_held(env, "l2-port-map-collision", "port-map-collision", [a["node"], b["node"]], port_map=port_map,
+		on_miss="strict")
+
+
 def range_map(env):
 	subnet = env.value("L2_SUBNET")
 	first, last = (int(a.rpartition(".")[2]) for a in env.value("DISCOVERY_PORT_MAP_RANGE").split("-"))
@@ -671,11 +799,12 @@ def row_range_routes(env):
 	nodes = env.topology()
 	outside = [n["address"] for n in nodes if n["std"] not in port_map]
 	check("nodes-in-range", not outside, outside=outside, range="%s.%d-%d" % (subnet, first, last))
+	settled(env, "range")
 	with env.driver("l2-range", port_map=port_map, on_miss="strict") as drv:
 		snapshot = l5.await_routing(drv, "range", [n["node"] for n in nodes], ROUTING_WAIT_MS)
 		assert_nodes_at(env, "range", snapshot, {n["node"]: (env.endpoint, base + int(n["address"].rpartition(".")[2]))
 			for n in nodes})
-		l5.serve(drv, "range")
+		serve_direct(env, drv, "range", [n["node"] for n in nodes])
 
 
 def row_new_node_in_range(env):
@@ -694,12 +823,23 @@ def row_new_node_in_range(env):
 def row_outside_range_strict(env):
 	"""A node started on an address the pre-filled port-map does not cover is never held under on_miss strict,
 	and the other nodes stay held."""
+	outside_range(env, "strict")
+
+
+def row_outside_range_pass_through(env):
+	"""A node started on an address the pre-filled port-map does not cover is used unchanged under on_miss
+	pass-through, which the client has no route to, so it is never held, and the other nodes stay held."""
+	outside_range(env, "pass-through")
+
+
+def outside_range(env, on_miss):
 	port_map, subnet, first, last, base = range_map(env)
 	nodes = env.topology()
 	outside = "%s.%d" % (subnet, int(env.value("L2_OUTSIDE_OCTET")))
 	state = {"container": None}
 	try:
-		with env.driver("l2-outside-range", port_map=port_map, on_miss="strict") as drv:
+		set_name = "l2-outside-range" + ("" if on_miss == "strict" else "-" + on_miss)
+		with env.driver(set_name, port_map=port_map, on_miss=on_miss) as drv:
 			l5.await_routing(drv, "outside-range-before", [n["node"] for n in nodes], ROUTING_WAIT_MS)
 			started = env.ctl.ok("start-node", "--address", outside).first("L2-STARTED")
 			state["container"] = started["container"]
@@ -724,6 +864,18 @@ def row_unresolved_shared_name(env):
 	nodes = env.topology()
 	wrong = [n["container"] + "=" + n["alt"] for n in nodes if n["alt"] != env.address(n["port"], host)]
 	check("advertised-verbatim", not wrong, wrong=wrong, hostname=host)
+	listed = {n["container"]: n["peersAlt"] for n in nodes
+		if parse_peers(n["peersAlt"]) != {p["node"]: [p["alt"]] for p in nodes if p is not n}}
+	check("peers-verbatim", not listed, wrong=listed, hostname=host)
+
+
+def parse_peers(value):
+	"""A peers reply, gen,port,[[node,tls-name,[address[:port],...]],...], as each node's addresses, each with its
+	port."""
+	_, _, rest = value.partition(",")
+	port, _, rest = rest.partition(",")
+	return {node: [a if ":" in a else "%s:%s" % (a, port) for a in addresses.split(",") if a]
+		for node, addresses in re.findall(r"\[([^,\[\]]+),[^,\[\]]*,\[([^\[\]]*)\]\]", rest)}
 
 
 def row_source_ports(env):
@@ -736,8 +888,15 @@ def row_source_ports(env):
 	nodes = env.topology()
 	with env.driver("l2-source-ports", port_map=port_map_by_name(env, nodes), workers=HEAVY_WORKERS) as drv:
 		since = drv.mark()
+		base = drv.latest() or {}
 		failures, end = failures_after(drv, since, FAULT_HOLD_MS, "source-ports")
 		assert_bounded_failures("source-ports", failures, end, since[1])
+		counted = [k for k in CLIENT_COUNTERS if k in end]
+		if counted:
+			check("client-error-count", sum(end[k] for k in counted) > sum(base.get(k, 0) for k in counted),
+				before={k: base.get(k, 0) for k in counted}, after={k: end[k] for k in counted}, failures=len(failures))
+		else:
+			emit("L2-CLIENT-ERROR-COUNT", skipped="the driver reports neither clientErrors nor clientTimeouts")
 	await_proxy_ports_free(env, "low-load")
 	with env.driver("l2-source-ports-low", port_map=port_map_by_name(env, nodes), workers=LIGHT_WORKERS) as drv:
 		snapshot = l5.await_routing(drv, "low-load", [n["node"] for n in nodes], RECOVERY_MS)
@@ -797,6 +956,7 @@ ROWS = {
 	"default": [ROUTE, BY_NAME,
 		Row("port-map-by-advertised-address-routes-every-node", row_port_map_by_address, contract=5),
 		Row("strict-miss-never-holds-the-unmapped-node", row_strict_miss),
+		Row("port-map-colliding-nodes-never-held", row_port_map_collision, contract=5),
 		Row("pass-through-miss-without-route-client-not-created", row_unmapped_peers),
 		Row("empty-alternate-list-client-not-created", row_empty_alternate),
 		Row("closed-listener-node-returns-with-bounded-latency", row_listener_closed, fault=True),
@@ -813,13 +973,16 @@ ROWS = {
 	"pass-through-ports": [ROUTE, BY_NAME,
 		Row("shared-alternate-name-routes-every-node", row_shared_name),
 		Row("new-node-on-shared-name-usable-within-two-tend-intervals", row_new_node_shared_name),
+		Row("colliding-alternate-nodes-never-held", row_colliding_alternate),
+		Row("colliding-newcomer-never-held", row_colliding_newcomer, applies=lambda env: NEWCOMER_UNDECIDED),
 		Row("shared-name-unresolved-in-servers-advertised-verbatim", row_unresolved_shared_name, contract=0,
 			applies=lambda env: None if env.values.get("L2_UNRESOLVED") == "1" else
 			"the topology maps the shared name in the servers; run with --unresolved-hostname")],
 	"port-map-range": [ROUTE, BY_NAME,
 		Row("range-port-map-routes-every-node", row_range_routes, contract=5),
 		Row("new-node-in-range-usable-within-two-tend-intervals", row_new_node_in_range, contract=5),
-		Row("strict-never-holds-node-outside-range", row_outside_range_strict, contract=5)],
+		Row("strict-never-holds-node-outside-range", row_outside_range_strict, contract=5),
+		Row("pass-through-never-holds-unroutable-node-outside-range", row_outside_range_pass_through, contract=5)],
 	"port-range": [ROUTE, BY_NAME,
 		Row("source-port-exhaustion-fails-within-bound-and-recovers", row_source_ports, contract=3, fault=True)],
 	"low-mtu": [ROUTE, BY_NAME,

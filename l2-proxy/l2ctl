@@ -43,6 +43,8 @@ Usage: l2ctl <command> [arguments]
   proxy-port-range                       L2-PORT-RANGE: Toxiproxy's local port range
   proxy-ports                            L2-PROXY-PORTS: Toxiproxy's sockets on a port in that range,
                                          and how many are in TIME_WAIT
+  stats NAMESPACE                        L2-STATS per node: commands it proxied to another node, writes
+                                         and reads it served for a client, partitions migrating
   drivers-stop                           Remove every driver container of this topology
   status                                 nodes and listeners
 EOF
@@ -121,6 +123,25 @@ cmd_nodes() {
 			"peersStd=$(info_value peers-clear-std "$values") peersAlt=$(info_value peers-clear-alt "$values") state=up"
 	done
 	rm -rf "$VALUES_DIR"
+}
+
+cmd_stats() {
+	[ $# -eq 1 ] || usage
+	local container node stats
+	for container in $(node_containers); do
+		node="$(docker exec "$container" asinfo -v node 2>/dev/null | tr -d ' \n')" || node=""
+		stats="$(docker exec "$container" asinfo -v "namespace/$1" -l 2>/dev/null)" || stats=""
+		if [ -z "$node" ] || ! grep -q '^client_write_success=' <<<"$stats"; then
+			die "cannot read namespace $1 statistics of $container"
+		fi
+		awk -F= -v c="$container" -v n="$node" '
+			/^client_proxy_(complete|error|timeout)=/ { proxied += $2 }
+			$1 == "client_write_success" { writes = $2 }
+			$1 == "client_read_success" { reads = $2 }
+			/^migrate_(tx|rx)_partitions_remaining=/ { migrating += $2 }
+			END { printf "L2-STATS container=%s node=%s proxied=%.0f writes=%.0f reads=%.0f migrating=%.0f\n", c, n, proxied, writes,
+				reads, migrating }' <<<"$stats"
+	done
 }
 
 cmd_listeners() {
@@ -414,6 +435,7 @@ case "$command" in
 	client-mtu) cmd_client_mtu ;;
 	proxy-port-range) cmd_proxy_port_range ;;
 	proxy-ports) cmd_proxy_ports ;;
+	stats) cmd_stats "$@" ;;
 	drivers-stop)
 		for container in $(docker ps -aq --filter "name=^${L2_PREFIX}-driver-"); do
 			docker rm -f "$container" >/dev/null || die "cannot remove driver container $container"

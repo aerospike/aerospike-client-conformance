@@ -19,7 +19,10 @@ Usage: l3ctl <command> [arguments]
 
   pods                                   L3-CLUSTER, then L3-POD per pod: Kubernetes node, IP, phase,
                                          Ready, UID, Service NodePorts and UID, container hostPort, and
-                                         through asinfo its node name, service-clear-alt, service-tls-alt
+                                         through asinfo its node name, service-clear-alt, service-tls-alt,
+                                         peers-tls-alt
+  stats NAMESPACE                        L3-STATS per pod: commands its node proxied to another node,
+                                         writes and reads it served for a client, partitions migrating
   nodes                                  L3-NODE per Kubernetes Node: UID, InternalIP, role, labels,
                                          unschedulable, Ready
   resize N                               Set the AerospikeCluster size to N and return
@@ -117,7 +120,7 @@ node_port() {
 pod_info() {
 	# shellcheck disable=SC2016 # expanded in the pod
 	k -n "$NS" exec "$1" -c aerospike-server -- sh -c \
-		'for v in node service-clear-alt service-tls-alt; do printf "%s|" "$(asinfo -U admin -P "$1" -v "$v" 2>/dev/null | tr -d "\r\n " | grep -v "^ERROR")"; done' \
+		'for v in node service-clear-alt service-tls-alt peers-tls-alt; do printf "%s|" "$(asinfo -U admin -P "$1" -v "$v" 2>/dev/null | tr -d "\r\n " | grep -v "^ERROR")"; done' \
 		sh "$(cat "$L3_STATE/admin-password")" 2>/dev/null
 }
 
@@ -128,11 +131,13 @@ cluster_line() {
 		"lbAddress=$(cr .spec.aerospikeNetworkPolicy.loadBalancerAlternateAccessAddress)" \
 		"lbTlsAddress=$(cr .spec.aerospikeNetworkPolicy.loadBalancerTLSAlternateAccessAddress)" \
 		"servicePort=$(service_port) tlsPort=$(cr ".spec.aerospikeConfig.network.service['tls-port']")" \
-		"tlsName=$(cr ".spec.aerospikeConfig.network.service['tls-name']")"
+		"tlsName=$(cr ".spec.aerospikeConfig.network.service['tls-name']")" \
+		"tlsAlternateAccess=$(cr .spec.aerospikeNetworkPolicy.tlsAlternateAccess)"
 }
 
 cmd_pods() {
-	local port tls_port pod worker ip phase uid ready node_port tls_node_port service_uid host_port info node clear_alt tls_alt
+	local port tls_port pod worker ip phase uid ready node_port tls_node_port service_uid host_port info node clear_alt tls_alt \
+		peers_tls_alt
 	cluster_line
 	port=$(service_port)
 	tls_port=$(cr ".spec.aerospikeConfig.network.service['tls-port']")
@@ -144,15 +149,35 @@ cmd_pods() {
 		service_uid=$(k -n "$NS" get service "$pod" --ignore-not-found -o 'jsonpath={.metadata.uid}')
 		host_port=$(k -n "$NS" get pod "$pod" -o \
 			"jsonpath={.spec.containers[?(@.name==\"aerospike-server\")].ports[?(@.containerPort==$port)].hostPort}")
-		info="||"
-		[ "$phase" != Running ] || info=$(pod_info "$pod") || info="||"
-		IFS='|' read -r node clear_alt tls_alt <<<"$info"
+		info="|||"
+		[ "$phase" != Running ] || info=$(pod_info "$pod") || info="|||"
+		IFS='|' read -r node clear_alt tls_alt peers_tls_alt <<<"$info"
 		echo "L3-POD pod=$pod worker=$worker ip=$ip phase=$phase ready=$ready uid=$uid nodePort=$node_port" \
 			"tlsNodePort=$tls_node_port serviceUid=$service_uid hostPort=$host_port node=$node clearAlt=$clear_alt" \
-			"tlsAlt=$tls_alt"
+			"tlsAlt=$tls_alt peersTlsAlt=$peers_tls_alt"
 	done < <(k -n "$NS" get pods -l "aerospike.com/cr=$CR" -o \
 		'jsonpath={range .items[*]}{.metadata.name}|{.spec.nodeName}|{.status.podIP}|{.status.phase}|{.metadata.uid}|{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' |
 		sort -t- -k3,3n -k4,4n)
+}
+
+cmd_stats() {
+	[ $# -eq 1 ] || usage
+	local pod stats
+	for pod in $(k -n "$NS" get pods -l "aerospike.com/cr=$CR" -o 'jsonpath={.items[*].metadata.name}'); do
+		# shellcheck disable=SC2016 # expanded in the pod
+		stats=$(k -n "$NS" exec "$pod" -c aerospike-server -- sh -c \
+			'asinfo -U admin -P "$1" -v node; asinfo -U admin -P "$1" -v "namespace/$2" -l' \
+			sh "$(cat "$L3_STATE/admin-password")" "$1" 2>/dev/null) || stats=""
+		grep -q '^client_write_success=' <<<"$stats" || die "cannot read namespace $1 statistics of $pod"
+		awk -F= -v p="$pod" '
+			NR == 1 { node = $0; gsub(/[ \r]/, "", node) }
+			/^client_proxy_(complete|error|timeout)=/ { proxied += $2 }
+			$1 == "client_write_success" { writes = $2 }
+			$1 == "client_read_success" { reads = $2 }
+			/^migrate_(tx|rx)_partitions_remaining=/ { migrating += $2 }
+			END { printf "L3-STATS pod=%s node=%s proxied=%.0f writes=%.0f reads=%.0f migrating=%.0f\n", p, node, proxied, writes,
+				reads, migrating }' <<<"$stats"
+	done
 }
 
 cmd_nodes() {
@@ -697,6 +722,7 @@ shift
 case "$command" in
 	pods) cmd_pods ;;
 	nodes) cmd_nodes ;;
+	stats) cmd_stats "$@" ;;
 	resize) cmd_resize "$@" ;;
 	scale) cmd_scale "$@" ;;
 	join-watch) cmd_join_watch "$@" ;;
