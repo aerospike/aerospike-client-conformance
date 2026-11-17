@@ -828,6 +828,50 @@ class PassThroughPortsTest(RowsTest):
 			"the topology maps the shared name in the servers; run with --unresolved-hostname")
 
 
+class UnresolvedAccessTest(RowsTest):
+	profile = "unresolved-access"
+	row = "unresolved-alternate-name-advertised-verbatim-or-refused"
+	address = "as-unresolved.test:4910"
+
+	def scenario(self, verbatim, alt=address, exit_code=1, critical=1, resolves=False):
+		self.values.update(L2_ALTERNATE_HOSTNAME="as-unresolved.test", DISCOVERY_VERBATIM_ACCESS_ADDRESS=verbatim)
+		s = scenario()
+		s["ctl"]["lookup"] = {"lines": ["L2-LOOKUP container=c-%d name={1} exit=%d resolves=%s" % (i, 0 if resolves else 2,
+			"true" if resolves else "false") for i in (1, 2, 3)]}
+		s["ctl"]["start-node"] = {"lines": ["L2-STARTED container=c-4 address=10.0.0.14 conf=c-4.conf"]}
+		s["ctl"]["wait-advertised"] = {"lines": ["L2-ADVERTISED container=c-4 node=D1 address=10.0.0.14 by=c-1"]}
+		s["ctl"]["nodes"] = nodes_line(alt=lambda c, p: alt if c == "c-4" else "", extra=[("c-4", "D1", "10.0.0.14", 0)])
+		s["ctl"]["wait-exit"] = {"lines": ["L2-EXITED container={1} exit=%d critical=%d" % (exit_code, critical)]}
+		return s
+
+	def test_verbatim_passes(self):
+		self.assertPasses(self.row, self.scenario("1"))
+		log = self.ctl_log()
+		self.assertIn("start-node --alternate as-unresolved.test:4910", log)
+		self.assertIn("stop-node c-4", log)
+		self.assertNotIn("wait-exit", " ".join(log))
+
+	def test_verbatim_resolved_address_fails(self):
+		self.assertFailsCheck(self.row, self.scenario("1", alt="10.1.0.2:4910"), "advertised-verbatim")
+		self.assertIn("stop-node c-4", self.ctl_log())
+
+	def test_refused_passes(self):
+		self.assertPasses(self.row, self.scenario("0"))
+		log = self.ctl_log()
+		self.assertIn("wait-exit c-4 --timeout 120 --naming as-unresolved.test", log)
+		self.assertNotIn("wait-advertised", " ".join(log))
+
+	def test_refused_without_critical_line_fails(self):
+		self.assertFailsCheck(self.row, self.scenario("0", critical=0), "refused-at-startup", criticalLines=0)
+
+	def test_refused_with_exit_zero_fails(self):
+		self.assertFailsCheck(self.row, self.scenario("0", exit_code=0), "refused-at-startup")
+
+	def test_name_resolving_in_servers_fails(self):
+		self.assertFailsCheck(self.row, self.scenario("0", resolves=True), "unresolved-in-servers")
+		self.assertNotIn("start-node", " ".join(self.ctl_log()))
+
+
 class PortMapRangeTest(RowsTest):
 	profile = "port-map-range"
 

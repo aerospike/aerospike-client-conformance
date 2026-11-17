@@ -26,13 +26,13 @@
 #
 # Usage: l2-proxy/run.sh --client-repo <https url or local path> --commit <commit> --manifest <path>
 #                        [--profile default,...|all] [--rows ROW,...] [--edition ce|ee]
-#                        [--server-image <image>] [--unresolved-hostname] [--no-fault]
+#                        [--server-image <image>] [--unresolved-hostname] [--verbatim-access-address] [--no-fault]
 #                        [--prefix <prefix>] [--port-base <port>] [--cache <dir>] [--results <dir>] [--plan]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ALL_PROFILES="default reachable pass-through-names pass-through-ports port-map-range port-range low-mtu idle-reset cn-only"
+ALL_PROFILES="default reachable pass-through-names pass-through-ports port-map-range port-range low-mtu idle-reset unresolved-access cn-only"
 SHARED_WORKFLOWS_COMMIT=318e453bea7f3c068ead24057dab07312a7fe62e
 ACTION_PATH=.github/actions/setup-discovery-topology
 DNS_ACTION_PATH=.github/actions/setup-dns-server
@@ -43,6 +43,7 @@ ENDPOINT_HOSTNAME=as-endpoint.test
 REACHABLE_HOSTNAME=as-reachable.test
 PASS_THROUGH_HOSTNAME=as-pass-through.test
 PASS_THROUGH_DOMAIN=pass-through.test
+UNRESOLVED_HOSTNAME=as-unresolved.test
 TLS_NAME=aerospike-tls
 TLS_PORT=4333
 NODES=3
@@ -71,6 +72,7 @@ ROWS=""
 EDITION=ce
 SERVER_IMAGE=""
 UNRESOLVED=0
+VERBATIM=0
 NO_FAULT=0
 PORT_BASE="${L2_PORT_BASE:-4900}"
 PREFIX="${L2_PREFIX:-}"
@@ -87,6 +89,7 @@ while [ $# -gt 0 ]; do
 		--edition) EDITION="${2:-}"; shift ;;
 		--server-image) SERVER_IMAGE="${2:-}"; shift ;;
 		--unresolved-hostname) UNRESOLVED=1 ;;
+		--verbatim-access-address) VERBATIM=1 ;;
 		--no-fault) NO_FAULT=1 ;;
 		--prefix) PREFIX="${2:-}"; shift ;;
 		--port-base) PORT_BASE="${2:-}"; shift ;;
@@ -113,6 +116,8 @@ for profile in "${PROFILE_LIST[@]}"; do
 done
 [ "$UNRESOLVED" = 0 ] || [[ ",$PROFILES," == *",pass-through-ports,"* ]] ||
 	die "--unresolved-hostname applies to the pass-through-ports profile only"
+[ "$VERBATIM" = 0 ] || [[ ",$PROFILES," == *",unresolved-access,"* ]] ||
+	die "--verbatim-access-address applies to the unresolved-access profile only"
 [ "$EDITION" = ee ] || [[ ",$PROFILES," != *",cn-only,"* ]] || die "the cn-only profile needs --edition ee"
 case "$EDITION" in
 	ce) SERVER_IMAGE="${SERVER_IMAGE:-aerospike/aerospike-server:latest}" ;;
@@ -142,6 +147,13 @@ CONTROL_MOUNT=/l2-control
 TLS_MOUNT=/l2-tls
 NODE_SERVER_PID=""
 
+alternate_hostname() {
+	case "$1" in
+		pass-through-ports) echo "$PASS_THROUGH_HOSTNAME" ;;
+		unresolved-access) echo "$UNRESOLVED_HOSTNAME" ;;
+	esac
+}
+
 cert_shape() {
 	[ "$1" = cn-only ] && echo cn-only || echo san-only
 }
@@ -158,13 +170,14 @@ describe_profile() {
 		reachable) echo "  advertises     node $NODES: access-address $REACHABLE_HOSTNAME and its listener port; the others: private address, alternate $REACHABLE_HOSTNAME and their listener port" ;;
 		pass-through-names) echo "  advertises     node N: alternate node-N.$PASS_THROUGH_DOMAIN and its listener port" ;;
 		pass-through-ports) echo "  advertises     every node: alternate $PASS_THROUGH_HOSTNAME and its listener port; $([ "$UNRESOLVED" = 1 ] && echo "the name does not resolve in the servers" || echo "the name resolves to Toxiproxy in the servers")" ;;
+		unresolved-access) echo "  advertises     private address only; a node started with an alternate port advertises $UNRESOLVED_HOSTNAME, which resolves nowhere; the server $([ "$VERBATIM" = 1 ] && echo "advertises it verbatim" || echo "refuses it at startup")" ;;
 		port-map-range) echo "  listeners      $SUBNET.$RANGE_FIRST-$RANGE_LAST on $RANGE_PORT_BASE plus the last octet" ;;
 		low-mtu) echo "  namespace      max-record-size 8M" ;;
 		*) echo "  advertises     private address only" ;;
 	esac
 	echo "  dns            $PREFIX-dns on $CLIENT_NETWORK: $ENDPOINT_HOSTNAME A at Toxiproxy, _aerospike._tcp.$ENDPOINT_HOSTNAME SRV per clear listener"
 	echo "  control        $CTL_CONTAINER (curl on $NODE_NETWORK); new-node listeners from port $EXTRA_PORT_BASE"
-	echo "  node requests  node-server during L2_RUN, at $CONTROL_MOUNT in the client container$([ "$profile" = pass-through-ports ] && echo "; alternate-port advertises $PASS_THROUGH_HOSTNAME")"
+	echo "  node requests  node-server during L2_RUN, at $CONTROL_MOUNT in the client container$(alternate_hostname "$profile" | sed 's/^./; alternate-port advertises &/')"
 	echo "  driver         $PREFIX-driver-<pid> from $CLIENT_IMAGE on $CLIENT_NETWORK only"
 	python3 "$SCRIPT_DIR/rows.py" --plan --profile "$profile" | sed 's/^L2-PLAN-ROW profile=[^ ]* /  row            /'
 }
@@ -481,6 +494,8 @@ write_values() {
 		echo "DISCOVERY_IDLE_RESET=${IDLE_RESET:-}"
 		echo "DISCOVERY_CONTROL_DIR=$CONTROL_MOUNT"
 		echo "DISCOVERY_DNS_SERVER=${DNS_SERVER:-}"
+		echo "DISCOVERY_UNRESOLVED_HOSTNAME=$([ "$PROFILE" = unresolved-access ] && echo "$UNRESOLVED_HOSTNAME")"
+		echo "DISCOVERY_VERBATIM_ACCESS_ADDRESS=$([ "$PROFILE" = unresolved-access ] && echo "$VERBATIM")"
 	} >"$state/values.env"
 }
 
@@ -535,6 +550,7 @@ build_topology() {
 			[ "$NO_FAULT" = 1 ] || sysctls="net.ipv4.ip_local_port_range=$PORT_RANGE"
 			;;
 		idle-reset) IDLE_RESET=1 ;;
+		unresolved-access) ALTERNATE_HOSTNAME="$(alternate_hostname "$profile")" ;;
 	esac
 	docker network create "${network_args[@]+"${network_args[@]}"}" "$NODE_NETWORK" >/dev/null
 	docker network create "${client_args[@]}" "$CLIENT_NETWORK" >/dev/null
@@ -614,7 +630,7 @@ build_topology() {
 				pass-through-ports)
 					PASS_THROUGH_BRANCH=B
 					ACCESS_HOSTNAME=$PASS_THROUGH_HOSTNAME
-					ALTERNATE_HOSTNAME=$PASS_THROUGH_HOSTNAME
+					ALTERNATE_HOSTNAME="$(alternate_hostname "$profile")"
 					hostnames=("$PASS_THROUGH_HOSTNAME")
 					;;
 			esac
