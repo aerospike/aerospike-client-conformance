@@ -301,6 +301,10 @@ class UsageTest(RowsTest):
 		self.assertEqual(2, code)
 		self.assertIn("the topology is profile reachable, not default", out)
 
+	def test_cn_only_runs_the_clear_rows(self):
+		self.assertEqual([rows.ROUTE, rows.BY_NAME], rows.ROWS["cn-only"])
+		self.assertIn("cn-only", rows.PROFILES)
+
 	def test_rows_of_other_profiles_are_left_out(self):
 		code, out = self.run_rows("%s,large-records-over-low-mtu-within-timeout" % rows.BY_NAME.name, scenario())
 		self.assertEqual(0, code, out)

@@ -266,6 +266,7 @@ cmd_start_node() {
 		done
 	fi
 	[ ! -f "$L2_STATE/features.conf" ] || run_args+=(-v "$L2_STATE/features.conf:/etc/aerospike/features.conf:ro")
+	[ ! -d "$L2_STATE/tls" ] || run_args+=(-v "$L2_STATE/tls:/etc/aerospike/tls:ro")
 	docker run -d --name "$name" --network "$L2_NODE_NETWORK" --ulimit nofile=15000 "${options[@]+"${options[@]}"}" \
 		-v "$L2_STATE/conf:/etc/aerospike/conf:ro" "${run_args[@]+"${run_args[@]}"}" \
 		--entrypoint asd "$L2_SERVER_IMAGE" --foreground --config-file "/etc/aerospike/conf/$conf" >/dev/null ||

@@ -39,7 +39,7 @@ MESSAGE_FIELDS = dict(l5.MESSAGE_FIELDS, large=("step", "bytes", "keys", "writte
 	"firstFailure", "maxMs", "elapsedMs"))
 
 PROFILES = ("default", "reachable", "pass-through-names", "pass-through-ports", "port-map-range", "port-range",
-	"low-mtu", "idle-reset")
+	"low-mtu", "idle-reset", "cn-only")
 NAMESPACE = l5.NAMESPACE
 PARTITIONS = l5.PARTITIONS
 CLUSTER_SIZE = 3
@@ -1002,6 +1002,7 @@ ROWS = {
 		Row("large-records-over-low-mtu-within-timeout", row_large_record, contract=5)],
 	"idle-reset": [ROUTE, BY_NAME,
 		Row("reset-peer-attempts-fail-within-bound-and-recover", row_reset_peer, contract=3, fault=True)],
+	"cn-only": [ROUTE, BY_NAME],
 }
 
 

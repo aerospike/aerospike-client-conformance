@@ -32,7 +32,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ALL_PROFILES="default reachable pass-through-names pass-through-ports port-map-range port-range low-mtu idle-reset"
+ALL_PROFILES="default reachable pass-through-names pass-through-ports port-map-range port-range low-mtu idle-reset cn-only"
 SHARED_WORKFLOWS_COMMIT=318e453bea7f3c068ead24057dab07312a7fe62e
 ACTION_PATH=.github/actions/setup-discovery-topology
 TOXIPROXY_IMAGE=ghcr.io/shopify/toxiproxy:2.12.0
@@ -42,6 +42,8 @@ ENDPOINT_HOSTNAME=as-endpoint.test
 REACHABLE_HOSTNAME=as-reachable.test
 PASS_THROUGH_HOSTNAME=as-pass-through.test
 PASS_THROUGH_DOMAIN=pass-through.test
+TLS_NAME=aerospike-tls
+TLS_PORT=4333
 NODES=3
 RANGE_FIRST=11
 RANGE_LAST=26
@@ -99,13 +101,18 @@ done
 	die "--port-base must be a port from 1024 to $((65535 - PORT_SPAN))"
 PREFIX="${PREFIX:-l2-proxy-$PORT_BASE}"
 [[ "$PREFIX" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "--prefix must be lower-case letters, digits and dashes, at most 31"
-[ "$PROFILES" != all ] || PROFILES="${ALL_PROFILES// /,}"
+if [ "$PROFILES" = all ]; then
+	PROFILES="${ALL_PROFILES// /,}"
+	# cn-only needs server TLS, which only Enterprise has.
+	[ "$EDITION" = ee ] || PROFILES="${PROFILES/,cn-only/}"
+fi
 IFS=, read -r -a PROFILE_LIST <<<"$PROFILES"
 for profile in "${PROFILE_LIST[@]}"; do
 	[[ " $ALL_PROFILES " == *" $profile "* ]] || die "unknown profile $profile (profiles: $ALL_PROFILES, or all)"
 done
 [ "$UNRESOLVED" = 0 ] || [[ ",$PROFILES," == *",pass-through-ports,"* ]] ||
 	die "--unresolved-hostname applies to the pass-through-ports profile only"
+[ "$EDITION" = ee ] || [[ ",$PROFILES," != *",cn-only,"* ]] || die "the cn-only profile needs --edition ee"
 case "$EDITION" in
 	ce) SERVER_IMAGE="${SERVER_IMAGE:-aerospike/aerospike-server:latest}" ;;
 	ee) SERVER_IMAGE="${SERVER_IMAGE:-aerospike/aerospike-server-enterprise:latest}" ;;
@@ -121,6 +128,7 @@ esac
 CONTROL_PORT=$PORT_BASE
 LISTEN_PORT_BASE=$((PORT_BASE + 1))
 EXTRA_PORT_BASE=$((PORT_BASE + 10))
+TLS_PORT_BASE=$((PORT_BASE + 50))
 RANGE_PORT_BASE=$((PORT_BASE + 100))
 SUBNET="10.213.$((PORT_BASE / 100 % 256))"
 NODE_NETWORK="$PREFIX-nodes"
@@ -130,7 +138,12 @@ CTL_CONTAINER="$PREFIX-ctl"
 BUILD_CONTAINER="$PREFIX-build"
 CLIENT_IMAGE="localhost/$PREFIX-client:latest"
 CONTROL_MOUNT=/l2-control
+TLS_MOUNT=/l2-tls
 NODE_SERVER_PID=""
+
+cert_shape() {
+	[ "$1" = cn-only ] && echo cn-only || echo san-only
+}
 
 describe_profile() {
 	local profile=$1
@@ -139,6 +152,7 @@ describe_profile() {
 	echo "                 $CLIENT_NETWORK (internal$([ "$profile" = low-mtu ] && echo ", MTU $CLIENT_NETWORK_MTU"))"
 	echo "  nodes          $PREFIX-node-1..$NODES, $SERVER_IMAGE ($EDITION)$([ "$profile" = port-map-range ] && echo ", on $SUBNET.$RANGE_FIRST upwards")"
 	echo "  toxiproxy      $PROXY on both networks, API port $CONTROL_PORT, endpoint $ENDPOINT_HOSTNAME ports $LISTEN_PORT_BASE-$((LISTEN_PORT_BASE + NODES - 1))$([ "$profile" = port-range ] && echo ", net.ipv4.ip_local_port_range $PROXY_PORT_RANGE")"
+	[ "$EDITION" != ee ] || echo "  tls            tls-name $TLS_NAME on port $TLS_PORT, $(cert_shape "$profile") certificate; TLS listeners $TLS_PORT_BASE-$((TLS_PORT_BASE + NODES - 1)); the rows use the clear listeners"
 	case "$profile" in
 		reachable) echo "  advertises     node $NODES: access-address $REACHABLE_HOSTNAME and its listener port; the others: private address, alternate $REACHABLE_HOSTNAME and their listener port" ;;
 		pass-through-names) echo "  advertises     node N: alternate node-N.$PASS_THROUGH_DOMAIN and its listener port" ;;
@@ -170,6 +184,7 @@ for cmd in docker git jq python3 curl tar; do
 done
 docker info >/dev/null 2>&1 || die "the container runtime is not reachable through docker"
 if [ "$EDITION" = ee ]; then
+	command -v openssl >/dev/null 2>&1 || die "openssl not found; --edition ee generates the TLS certificates with it"
 	[ -n "${FEATURES_CONF_PATH:-}" ] || die "--edition ee needs FEATURES_CONF_PATH"
 	[ -r "$FEATURES_CONF_PATH" ] || die "FEATURES_CONF_PATH is not readable"
 fi
@@ -350,8 +365,20 @@ docker commit "$BUILD_CONTAINER" "$CLIENT_IMAGE" >/dev/null || die "cannot save 
 docker rm -f "$BUILD_CONTAINER" >/dev/null
 
 render_base_conf() {
-	local profile=$1 conf=$2 feature_key="" max_record="" mesh_seeds="" i
-	[ "$EDITION" != ee ] || feature_key="feature-key-file /etc/aerospike/features.conf"
+	local profile=$1 conf=$2 feature_key="" max_record="" mesh_seeds="" tls="" tls_service="" i
+	if [ "$EDITION" = ee ]; then
+		feature_key="feature-key-file /etc/aerospike/features.conf"
+		tls="    tls $TLS_NAME {
+        cert-file /etc/aerospike/tls/server.crt
+        key-file /etc/aerospike/tls/server.key
+        ca-file /etc/aerospike/tls/ca.crt
+    }
+"
+		tls_service="        tls-port $TLS_PORT
+        tls-authenticate-client false
+        tls-name $TLS_NAME
+"
+	fi
 	[ "$profile" != low-mtu ] || max_record="max-record-size 8M"
 	for i in $(seq 1 "$NODES"); do
 		mesh_seeds+="        mesh-seed-address-port $PREFIX-node-$i 3002"$'\n'
@@ -369,10 +396,10 @@ logging {
 }
 
 network {
-    service {
+$tls    service {
         address any
         port 3000
-    }
+$tls_service    }
     heartbeat {
         mode mesh
         address any
@@ -431,7 +458,10 @@ write_values() {
 		echo "DISCOVERY_ENDPOINT_HOSTNAME=$(output endpoint-hostname)"
 		echo "DISCOVERY_ENDPOINT_PORT_BASE=$(output listen-port-base)"
 		echo "DISCOVERY_ENDPOINT_PORTS=$(output endpoint-ports)"
-		echo "DISCOVERY_TLS_ENDPOINT_PORTS="
+		echo "DISCOVERY_TLS_ENDPOINT_PORTS=$(output tls-endpoint-ports)"
+		echo "DISCOVERY_TLS_CERT_SHAPE=${CERT_SHAPE:-}"
+		echo "DISCOVERY_TLS_NAME=$([ "$EDITION" = ee ] && echo "$TLS_NAME")"
+		echo "DISCOVERY_TLS_CA_FILE=$([ "$EDITION" = ee ] && echo "$TLS_MOUNT/ca.crt")"
 		echo "DISCOVERY_PROXY_MAP=$(output proxy-name-port-map)"
 		echo "TOXIPROXY_URL=$(output toxiproxy-url)"
 		echo "TOXIPROXY_HOST=$(output toxiproxy-container-name)"
@@ -483,9 +513,19 @@ build_topology() {
 
 	mkdir -p "$STATE/conf"
 	render_base_conf "$profile" "$STATE/conf/aerospike.conf"
+	CERT_SHAPE=""
 	if [ "$EDITION" = ee ]; then
 		cp "$FEATURES_CONF_PATH" "$STATE/features.conf"
 		chmod 644 "$STATE/features.conf"
+		CERT_SHAPE="$(cert_shape "$profile")"
+		# san-only carries the tls-name only as a SAN and a CN that is not it, so only SAN matching passes.
+		if [ "$CERT_SHAPE" = cn-only ]; then
+			sh "$SCRIPT_DIR/../tls/generate-certs.sh" --server "$STATE/tls" "$TLS_NAME" - >/dev/null
+		else
+			sh "$SCRIPT_DIR/../tls/generate-certs.sh" --server "$STATE/tls" "not-the-$TLS_NAME" "DNS:$TLS_NAME" >/dev/null
+		fi
+		mkdir -p "$STATE/tls-ca"
+		cp "$STATE/tls/ca.crt" "$STATE/tls-ca/ca.crt"
 	fi
 	CONTAINER_NAMES=""
 	for i in $(seq 1 "$NODES"); do
@@ -522,7 +562,7 @@ build_topology() {
 		LISTEN_PORT_BASE="$LISTEN_PORT_BASE" \
 		TOXIPROXY_IMAGE="$TOXIPROXY_IMAGE" \
 		TOXIPROXY_CONTROL_PORT="$CONTROL_PORT" \
-		TLS_LISTEN_PORT_BASE="" \
+		TLS_LISTEN_PORT_BASE="$([ "$EDITION" = ee ] && echo "$TLS_PORT_BASE")" \
 		CLIENT_NETWORK_MTU="" \
 		PROXY_SYSCTLS="$sysctls" \
 		GITHUB_OUTPUT="$STATE/topology.out" \
@@ -563,6 +603,7 @@ build_topology() {
 			for entry in "${proxies[@]}"; do
 				container="${entry%:*}"
 				port="${entry##*:}"
+				[[ "$container" != *-tls ]] || continue
 				index=$((index + 1))
 				"$L2_CTL" stop-node "$container" >/dev/null
 				case "$profile" in
@@ -579,6 +620,7 @@ build_topology() {
 			done
 			if ! "$L2_CTL" wait-cluster "$NODES" --timeout 120; then
 				for entry in "${proxies[@]}"; do
+					[[ "${entry%:*}" != *-tls ]] || continue
 					[ "$(docker inspect -f '{{.State.Running}}' "${entry%:*}" 2>/dev/null)" = true ] ||
 						echo "Node ${entry%:*} exited: $(docker logs "${entry%:*}" 2>&1 | grep -m1 -E 'CRITICAL|Invalid access address')"
 				done
@@ -674,10 +716,12 @@ for PROFILE in "${PROFILE_LIST[@]}"; do
 			run_hosts+=(--add-host "$entry")
 		done
 		set +e
+		tls_mount=()
+		[ "$EDITION" != ee ] || tls_mount=(-v "$STATE/tls-ca:$TLS_MOUNT:ro")
 		if start_node_server; then
 			# shellcheck disable=SC2016 # expanded in the client container
 			docker run --rm --name "$PREFIX-driver-run" --network "$CLIENT_NETWORK" "${run_hosts[@]+"${run_hosts[@]}"}" \
-				"${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"}" -v "$STATE/control:$CONTROL_MOUNT" \
+				"${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"}" -v "$STATE/control:$CONTROL_MOUNT" "${tls_mount[@]+"${tls_mount[@]}"}" \
 				--env-file "$STATE/values.env" -e L2_PROFILE="$PROFILE" -v "$WORK/client:/client" -w /client "$CLIENT_IMAGE" \
 				bash -c 'set -a; . "./$0"; set +a; bash -c "$L2_RUN"' "$MANIFEST" </dev/null >"$RES/l2-run.log" 2>&1
 			run_rc=$?

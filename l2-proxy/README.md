@@ -9,7 +9,7 @@ L2 covers what a client does when the only addresses it can reach are a proxy's 
 It cannot show:
 
 - A real load balancer or PrivateLink: idle timeouts, cross-zone balancing, zone outages and private DNS are L5 ([l5-aws](../l5-aws/README.md)).
-- TLS: the optional TLS flags of the driver contract are separate work.
+- TLS through the driver: the optional TLS flags of the driver contract are separate work, so every row uses the clear listeners. On `--edition ee` the topology has TLS for a client's own tests (below).
 - Client internals: blocked threads, the error-rate circuit breaker, behaviour per event loop and pool checks on checkout are visible only to the client's own tests. The topology and the control commands they use are below.
 - A path MTU black hole: both ends of the client network share its MTU, so the MTU row shows that large records cross a small MTU, not that a client survives a missing path MTU discovery.
 
@@ -22,7 +22,7 @@ For each profile `run.sh` builds:
 - A client network created as internal, so a container on it reaches Toxiproxy and nothing else: no node address and no internet. The `client-has-no-route-to-node-addresses` row checks this before any driver starts.
 - A control container with curl on the node network, through which `l2ctl` and the action call Toxiproxy's API, since the host cannot always route to container addresses (Docker Desktop, a Podman machine).
 
-Container names, network names and ports derive from `--prefix` (default `l2-proxy-<port base>`) and `--port-base` (default 4900): Toxiproxy's API on the port base, the endpoint listeners from the port base plus 1, listeners for nodes started mid-run from the port base plus 10, and the range listeners from the port base plus 100. The port-map-range subnet is `10.213.<port base / 100 mod 256>.0/24`. Before creating anything, the run checks that no container or network with the prefix exists, that the 200 ports from the port base are free on the host and not published by a container, and that no network uses the subnet. Two runs with different port bases run side by side.
+Container names, network names and ports derive from `--prefix` (default `l2-proxy-<port base>`) and `--port-base` (default 4900): Toxiproxy's API on the port base, the endpoint listeners from the port base plus 1, listeners for nodes started mid-run from the port base plus 10, the TLS listeners on `--edition ee` from the port base plus 50, and the range listeners from the port base plus 100. The port-map-range subnet is `10.213.<port base / 100 mod 256>.0/24`. Before creating anything, the run checks that no container or network with the prefix exists, that the 200 ports from the port base are free on the host and not published by a container, and that no network uses the subnet. Two runs with different port bases run side by side.
 
 ## What a client supplies
 
@@ -49,6 +49,7 @@ The driver needs no password: the cluster has no security, so rows pass no `--us
 | `port-range`         | Toxiproxy's `net.ipv4.ip_local_port_range` is `40000 40009`, which caps the connections it opens to each node                                                                           |
 | `low-mtu`            | The client network's MTU is 1200 and the namespace sets `max-record-size 8M`                                                                                                            |
 | `idle-reset`         | The default topology; the values file sets `DISCOVERY_IDLE_RESET=1` for a client's own idle reset tests                                                                                 |
+| `cn-only`            | `--edition ee` only: the default topology with a certificate that carries the tls-name only as its CN                                                                                   |
 
 Every name the nodes advertise resolves to Toxiproxy, in the servers (the server resolves access addresses at startup) and in the driver container. `--unresolved-hostname` needs a server that advertises access addresses verbatim; a server that resolves them at startup does not start, and the run reports the profile as not run with the node's log line.
 
@@ -111,20 +112,24 @@ The fault rows (`fault=true` in `--plan`) show that their fault had an effect be
 
 Rows that assert on client internals stay in the client: the timeout fault on each event loop with no blocked thread, the error-rate circuit breaker, and idle connections reset in the pool, synchronously and on each event loop. They run against the same topology through `L2_RUN`, which gets the values file as its environment. The values file is `values.env` in the profile's results:
 
-| Variable                                                     | Value                                                                                                   |
-| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
-| `DISCOVERY_SUBSET`                                           | `ce` or `ee`                                                                                            |
-| `DISCOVERY_ENDPOINT_HOSTNAME`                                | `as-endpoint.test`                                                                                      |
-| `DISCOVERY_ENDPOINT_PORT_BASE`, `DISCOVERY_ENDPOINT_PORTS`   | The first listener port, and every listener port, comma separated                                       |
-| `DISCOVERY_PROXY_MAP`                                        | `<listener>:<port>`, comma separated; a listener is named after its node's container                    |
-| `TOXIPROXY_URL`, `TOXIPROXY_HOST`, `TOXIPROXY_CONTROL_PORT`  | Toxiproxy's API, reachable from the client network                                                      |
-| `AEROSPIKE_CONTAINER_NAMES`                                  | The node containers, comma separated                                                                    |
-| `DISCOVERY_REACHABLE_NODE`, `DISCOVERY_PASS_THROUGH_BRANCH`  | `reachable`: the reachable node's container. `pass-through-names` and `pass-through-ports`: `A` and `B` |
-| `DISCOVERY_PORT_MAP_RANGE`, `DISCOVERY_PORT_MAP_PORT_BASE`   | `port-map-range`: the first and last address of the range, and the range listener base                  |
-| `DISCOVERY_CLIENT_NETWORK_MTU`, `DISCOVERY_PROXY_PORT_RANGE` | `low-mtu` and `port-range`                                                                              |
-| `DISCOVERY_IDLE_RESET`                                       | `1` on `idle-reset`                                                                                     |
-| `DISCOVERY_TLS_ENDPOINT_PORTS`                               | Empty                                                                                                   |
-| `DISCOVERY_CONTROL_DIR`                                      | `/l2-control`, where the test writes node requests (below)                                              |
+| Variable                                                     | Value                                                                                                                                  |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `DISCOVERY_SUBSET`                                           | `ce` or `ee`                                                                                                                           |
+| `DISCOVERY_ENDPOINT_HOSTNAME`                                | `as-endpoint.test`                                                                                                                     |
+| `DISCOVERY_ENDPOINT_PORT_BASE`, `DISCOVERY_ENDPOINT_PORTS`   | The first listener port, and every listener port, comma separated                                                                      |
+| `DISCOVERY_PROXY_MAP`                                        | `<listener>:<port>`, comma separated; a listener is named after its node's container                                                   |
+| `TOXIPROXY_URL`, `TOXIPROXY_HOST`, `TOXIPROXY_CONTROL_PORT`  | Toxiproxy's API, reachable from the client network                                                                                     |
+| `AEROSPIKE_CONTAINER_NAMES`                                  | The node containers, comma separated                                                                                                   |
+| `DISCOVERY_REACHABLE_NODE`, `DISCOVERY_PASS_THROUGH_BRANCH`  | `reachable`: the reachable node's container. `pass-through-names` and `pass-through-ports`: `A` and `B`                                |
+| `DISCOVERY_PORT_MAP_RANGE`, `DISCOVERY_PORT_MAP_PORT_BASE`   | `port-map-range`: the first and last address of the range, and the range listener base                                                 |
+| `DISCOVERY_CLIENT_NETWORK_MTU`, `DISCOVERY_PROXY_PORT_RANGE` | `low-mtu` and `port-range`                                                                                                             |
+| `DISCOVERY_IDLE_RESET`                                       | `1` on `idle-reset`                                                                                                                    |
+| `DISCOVERY_TLS_ENDPOINT_PORTS`                               | `--edition ee`: every TLS listener port, comma separated; their listeners are `<listener>-tls` in `DISCOVERY_PROXY_MAP`. Empty on `ce` |
+| `DISCOVERY_TLS_NAME`, `DISCOVERY_TLS_CERT_SHAPE`             | `--edition ee`: `aerospike-tls`, and `san-only` or, on `cn-only`, `cn-only`. Empty on `ce`                                             |
+| `DISCOVERY_TLS_CA_FILE`                                      | `--edition ee`: `/l2-tls/ca.crt` in the `L2_RUN` container, the CA that signed the server certificate. Empty on `ce`                   |
+| `DISCOVERY_CONTROL_DIR`                                      | `/l2-control`, where the test writes node requests (below)                                                                             |
+
+On `--edition ee` every node also serves TLS on port 4333 with tls-name `aerospike-tls`, behind one more Toxiproxy listener per node. Each profile gets its own CA and server certificate from [`tls/generate-certs.sh`](../tls/generate-certs.sh): `san-only` carries the tls-name only as a dNSName SAN with a CN that is not the tls-name, so only SAN matching accepts it, and `cn-only` carries it only as the CN. The test trusts `DISCOVERY_TLS_CA_FILE`.
 
 `L2_PROFILE` names the profile. The test controls the faults through Toxiproxy's API, the same calls `l2ctl` makes:
 
@@ -169,7 +174,7 @@ l2-proxy/run.sh --client-repo /path/to/aerospike-client-java --commit origin/plu
 - `--client-repo` is an https URL or a local repository; a local repository is read with `git archive` and never written.
 - `--profile` takes a comma-separated list or `all`; the client is built once.
 - `--rows` runs the named rows of each profile that has them.
-- `--edition ee` runs Aerospike Enterprise with `FEATURES_CONF_PATH`, which is mounted into the nodes, never printed, and checked absent from every result file. `--server-image` picks another image.
+- `--edition ee` runs Aerospike Enterprise with `FEATURES_CONF_PATH`, which is mounted into the nodes, never printed, and checked absent from every result file, and needs openssl for the certificates. `all` includes `cn-only` only with `--edition ee`. `--server-image` picks another image.
 - `--plan` prints each profile's topology and rows and creates nothing.
 - On a Podman machine the paths the containers mount (the work directory, results and cache) must be under a directory the machine shares, such as `/Users` or `/private`; `run.sh` resolves them to their real paths.
 
