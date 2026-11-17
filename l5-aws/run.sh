@@ -518,12 +518,20 @@ set -a
 . "./$1"
 set +a
 echo "L5-ROW $L5_ROW seed=$L5_ENDPOINT_NAME:$L5_SEED_PORT control=$L5_CONTROL"
-if [ -n "${L5_DRIVER:-}" ]; then
-	python3 "$HOME/l5/rows.py" --row "$L5_ROW" --driver "$L5_DRIVER" </dev/null
-else
-	bash -c "$L5_RUN" </dev/null
-fi
-rc=$?
+{
+	if [ -n "${L5_DRIVER:-}" ]; then
+		python3 "$HOME/l5/rows.py" --row "$L5_ROW" --driver "$L5_DRIVER"
+	else
+		bash -c "$L5_RUN"
+	fi
+} </dev/null 2>&1 | python3 -c '
+import os, sys
+secret = os.environb[b"AEROSPIKE_ADMIN_PASSWORD"]
+for line in sys.stdin.buffer:
+	sys.stdout.buffer.write(line.replace(secret, b"[redacted]") if secret else line)
+	sys.stdout.buffer.flush()
+'
+rc=${PIPESTATUS[0]}
 echo "L5-ROW $L5_ROW exit=$rc"
 exit $rc
 EOF

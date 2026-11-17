@@ -74,7 +74,7 @@ On a worker runtime without threads, run the workers as concurrent tasks; each s
 
 ## Output
 
-Stdout carries only JSON objects, one per line, each flushed as it is written. Everything else goes to stderr.
+Stdout carries only JSON objects, one per line, each flushed as it is written. Everything else goes to stderr. The harness copies stderr into the row log as `DRIVER-STDERR` lines, so a driver may write diagnostics there, such as a client debug log; client warnings and errors still go to stdout as `log` messages. On L5 the runner replaces the admin password with `[redacted]` in the row log.
 
 Every object has `type`, and `t`: milliseconds on a monotonic clock since the driver started, as a number. All intervals are differences of `t`, or are measured inside the driver on the same clock. The harness never times anything by when a line arrives.
 
