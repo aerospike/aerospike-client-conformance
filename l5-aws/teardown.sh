@@ -6,7 +6,7 @@
 # l5-aws-run=<stack name> is left. run.sh calls it; run it by hand for a stack kept with --keep or
 # left by an interrupted run.
 #
-# Required environment: AWS_PROFILE, AWS_REGION
+# Required environment: AWS_REGION, and AWS_PROFILE unless the environment holds the credentials
 #
 # Usage: l5-aws/teardown.sh <stack name>
 
@@ -22,9 +22,7 @@ die() {
 
 STACK="${1:-}"
 [[ "$STACK" =~ ^l5-aws-[0-9]{8}-[0-9]{6}$ ]] || die "usage: teardown.sh l5-aws-YYYYmmdd-HHMMSS"
-for name in AWS_PROFILE AWS_REGION; do
-	[ -n "${!name:-}" ] || die "$name is not set"
-done
+[ -n "${AWS_REGION:-}" ] || die "AWS_REGION is not set"
 export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION" AWS_PAGER=""
 
 remaining_resources() {

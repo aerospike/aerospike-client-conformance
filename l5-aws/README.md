@@ -88,10 +88,15 @@ Before creating a stack, `run.sh` checks that the region has room for one more: 
 
 Results go to `l5-aws/results/<stack name>/`: `env` (including `L5_ALTERNATE_ACCESS`), `install.log`, `setup.log`, `build.log`, one `<row>.log`, `<row>-status.txt` and `<row>-interruptions.txt` per row, `rows.txt` and `cleanup.txt`. AWS can reclaim the Spot nodes at any time; a failed row that overlapped a Spot interruption `spot-interrupt` did not send, or a Spot instance replaced after a rebalance recommendation, is reported as `INTERRUPTED` and should be rerun; when the interruption check itself fails, the row says so instead. A run takes well over an hour, so log in with `aws sso login` right before it. Before each row `run.sh` checks that the AWS credentials still work; once they stop, the remaining rows are reported as `NOT RUN`, and teardown fails and prints the command to run it again after logging in. The feature-key file is copied to the runner, loaded into a Kubernetes secret and deleted; the run fails if any result file contains its content.
 
+## From GitHub Actions
+
+`.github/workflows/l5-aws.yaml` is a reusable workflow that runs `run.sh` once on a GitHub-hosted runner, for a client repository's scheduled or manual job. With no `AWS_PROFILE`, `run.sh` and `teardown.sh` use the credentials in the environment, here those of the role the runner assumes through GitHub OIDC. The account needs the `token.actions.githubusercontent.com` identity provider and a role that trusts the calling repository, may create what `stack.yaml` creates under the permissions boundary, and allows sessions of 4 hours. The caller passes the role and boundary ARNs, the `FEATURES_CONF` secret and, for a private image, `REGISTRY_AUTH` with the content `--registry-auth` takes. Runs from one client repository queue behind each other; results are uploaded as an artifact.
+
 ## Not yet verified
 
 The Java and Python clients have both run all four rows through `rows.py` on AWS, which exercised `spot-interrupt` and `az-outage` through FIS and `rollout` through a new launch template version. Still unverified:
 
 - Whether the FIS `aws:network:disrupt-connectivity` action also cuts the EKS control plane ENIs in that subnet.
 - The teardown retry for CNI ENIs and the EKS cluster security group left after a Spot reclaim.
+- `l5-aws.yaml`: it has not run, since the account has no GitHub OIDC identity provider yet.
 - `--alternate-access nlb` on AWS: that nodes with no label bootstrap and pods advertise the endpoint name through AKO 4.8.0-dev1, including after W-2 replaces every Aerospike node, and that its per-pod Services match what `sync-listeners`, `pods` and `verify` read.
