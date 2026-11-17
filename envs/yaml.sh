@@ -5,8 +5,8 @@
 #
 # - pass-through: each node advertises alternate-access-address ENV_HOST and its own published host
 #   port. The YAML sets use_services_alternate: true and translation.provider: pass-through.
-# - port-map: each node advertises only its container address on port 3000, which the host cannot
-#   reach. The YAML sets translation.provider: port-map and on_miss: strict, mapping node A by its
+# - port-map: each node advertises only an unroutable address on port 3000, which no host reaches.
+#   The YAML sets translation.provider: port-map and on_miss: strict, mapping node A by its
 #   advertised host:port and node B by node name to their published host ports.
 #
 # Values: PASS_THROUGH_NODE_A_*, PASS_THROUGH_NODE_B_*, PASS_THROUGH_CLIENT_CONFIG, PORT_MAP_NODE_A_*,
@@ -25,7 +25,7 @@ PORT_OFFSET=40
 
 env_up() {
 	local pt_b=$((PORT + 1)) pm_a=$((PORT + 2)) pm_b=$((PORT + 3)) ip c
-	ip="$(subnet)"
+	ip="$(unroutable)"
 
 	require_server
 	require_ports "$ENV_HOST:$PORT" "$ENV_HOST:$pt_b" "$ENV_HOST:$pm_a" "$ENV_HOST:$pm_b"

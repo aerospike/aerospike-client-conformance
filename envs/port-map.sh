@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# port-map address translation: a two node cluster where each node advertises only its container
-# address on port 3000, which the host cannot reach, and is published on its own host port. Node
+# port-map address translation: a two node cluster where each node advertises only an unroutable
+# address on port 3000, which no host reaches, and is published on its own host port. Node
 # addresses are fixed so a port map can name node B before it exists. Node A is running; node B is
 # created but not started until start-node-b. Clients seed node A only.
 #
-# Values: NODE_A_*, NODE_B_* (ADVERTISED_HOST and ADVERTISED_PORT are the container address). Nodes:
+# Values: NODE_A_*, NODE_B_* (ADVERTISED_HOST and ADVERTISED_PORT are the unroutable address). Nodes:
 # a, b. Ports: ENV_PORT_BASE+20 and +21.
 #
 # Verbs: start-node-b starts node B and waits for the two node cluster; node-b-state prints running
@@ -23,7 +23,7 @@ PORT_OFFSET=20
 
 env_up() {
 	local port_b=$((PORT + 1)) ip
-	ip="$(subnet)"
+	ip="$(unroutable)"
 
 	require_server
 	require_ports "$ENV_HOST:$PORT" "$ENV_HOST:$port_b"
