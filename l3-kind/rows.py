@@ -58,10 +58,10 @@ CTL_TIMEOUT_MS = 180000
 SCALE_TIMEOUT_S = 600
 POD_TIMEOUT_S = 600
 NODE_TIMEOUT_S = 300
+INIT_FAILURE_TIMEOUT_S = 300
 MIN_PODS = 2
 
 USABLE_BOUND_MS = l5.USABLE_TEND_INTERVALS * TEND_INTERVAL_MS
-POLL_BOUND_MS = 20
 LISTENER_WAIT_MS = 300000
 QUIET_WINDOW_MS = l5.QUIET_TEND_INTERVALS * TEND_INTERVAL_MS
 MIGRATION_WAIT_MS = 300000
@@ -473,14 +473,16 @@ def row_scale_up(env):
 			check("watch-usable", usable_ms is not None, node=node, **times)
 			check("answered-node", joined["node"] == node, node=node, answeredBy=joined["node"], address=joined["address"])
 			polls = [joined["bumpPollMs"], joined["answerPollMs"]]
-			check("poll-interval", all(p.isdigit() and int(p) <= POLL_BOUND_MS for p in polls),
-				bumpPollMs=joined["bumpPollMs"], answerPollMs=joined["answerPollMs"], boundMs=POLL_BOUND_MS)
+			check("poll-interval", all(p.isdigit() for p in polls), bumpPollMs=joined["bumpPollMs"],
+				answerPollMs=joined["answerPollMs"])
 			# The start is when a poll first saw the bump or the answer, up to one poll interval after it happened.
 			start_poll = int(joined["answerPollMs"] if answer_at >= bump_at else joined["bumpPollMs"])
 			check("usable-after-start", usable_ms >= -start_poll, measurementError=usable_ms < -start_poll, usableMs=usable_ms,
 				startAt=start_at, startPollMs=start_poll, **times, clockErrorMs=round(error))
-			check("usable-ms", usable_ms <= USABLE_BOUND_MS, node=node, usableMs=usable_ms, startAt=start_at, **times,
-				readyToAnswerMs=answer_at - ready_at, boundMs=USABLE_BOUND_MS)
+			inconclusive = usable_ms <= USABLE_BOUND_MS < usable_ms + start_poll
+			check("usable-ms", usable_ms + start_poll <= USABLE_BOUND_MS, node=node, usableMs=usable_ms, startAt=start_at,
+				**times, readyToAnswerMs=answer_at - ready_at, boundMs=USABLE_BOUND_MS, startPollMs=start_poll,
+				inconclusive=inconclusive)
 			env.wait_completed()
 			_, after, _ = shared_expected(env, "scale-up-after")
 			added = [p for p in after if p["pod"] == new_pod]
@@ -701,6 +703,80 @@ def row_recreated_node(env):
 		env.outcome.guard(env.restore, size)
 
 
+def row_per_node_label_lost(env):
+	"""configuredIP with one pod per worker: with every other node cordoned, the Node under a pod away from the
+	endpoint is deleted and registered again with a new UID and without the alternate access label; the init
+	container of the pod scheduled there exits non-zero and the pod is not Ready, while the running driver never
+	holds no node and routes and serves through the remaining nodes. With the label set back to its value the
+	pod turns Ready, advertises it with its hostPort, and the driver holds every node and owns every partition.
+	When the init container or the operator stops depending on the Node label this row fails and is rewritten."""
+	cordoned = []
+	label = None
+	size = None
+	try:
+		cluster, pods = env.cluster()
+		size = cluster["size"]
+		nodes = env.nodes()
+		labels = {p["pod"]: nodes.get(p["worker"], {}).get("labels", {}).get(ALTERNATE_ACCESS_LABEL, "") for p in pods}
+		victim = away_from_endpoint(env, pods, nodes)
+		check("pod-away-from-endpoint", victim is not None, endpoint=env.endpoint, endpointAddress=env.hosts.get(env.endpoint),
+			workers={p["pod"]: p["worker"] for p in pods})
+		worker = victim["worker"]
+		before = nodes[worker]
+		label = labels[victim["pod"]]
+		emit("L3-NODE-BEFORE", node=worker, uid=before["uid"], labels=before["labels"], pod=victim["pod"])
+		check("worker-label", bool(label), node=worker, labels=before["labels"])
+		check("host-port", victim["hostPort"] > 0, pod=victim["pod"], hostPort=victim["hostPort"])
+		remaining = [p for p in pods if p is not victim]
+		with env.driver("l3-label-lost", remaining[0]["clearAlt"]) as drv:
+			l5.await_routing(drv, "label-before", [p["node"] for p in pods], ROUTING_WAIT_MS)
+			since = drv.mark()
+			cordon_others(env, worker, cordoned)
+			env.ctl.ok("delete-node", worker)
+			env.ctl.ok("reregister", worker, "--timeout", str(NODE_TIMEOUT_S), bound_ms=NODE_TIMEOUT_S * 1000 + CTL_TIMEOUT_MS)
+			registered = env.nodes()[worker]
+			emit("L3-NODE-RECREATED", node=worker, uid=[before["uid"], registered["uid"]], labels=registered["labels"])
+			check("new-node-uid", registered["uid"] and registered["uid"] != before["uid"], node=worker,
+				uid=[before["uid"], registered["uid"]])
+			check("label-gone", ALTERNATE_ACCESS_LABEL not in registered["labels"], node=worker, labels=registered["labels"])
+			failed = env.ctl.ok("wait-init-failed", victim["pod"], "--timeout", str(INIT_FAILURE_TIMEOUT_S),
+				bound_ms=INIT_FAILURE_TIMEOUT_S * 1000 + CTL_TIMEOUT_MS).first("L3-POD-INIT")
+			emit("L3-LABEL-MISSING", node=worker, label=ALTERNATE_ACCESS_LABEL, pod=failed["pod"], init=failed["init"],
+				state=failed["state"], reason=failed["reason"], exitCode=failed["exitCode"] or failed["lastExitCode"],
+				restarts=failed["restarts"], ready=failed["ready"], labelInLog=failed["labelInLog"])
+			check("init-container-failed", failed["worker"] == worker and failed["ready"] != "True", pod=failed["pod"],
+				worker=failed["worker"], expected=worker, ready=failed["ready"], phase=failed["phase"])
+			check("failure-names-label", failed["labelInLog"] == "true", pod=failed["pod"], init=failed["init"],
+				label=ALTERNATE_ACCESS_LABEL)
+			l5.await_routing(drv, "label-missing", [p["node"] for p in remaining], ROUTING_WAIT_MS)
+			l5.serve(drv, "label-missing")
+			never_empty(drv, "label-missing", since)
+			still = env.ctl.ok("init-state", victim["pod"]).first("L3-POD-INIT")
+			check("still-not-ready", still["ready"] != "True", pod=still["pod"], ready=still["ready"], state=still["state"],
+				reason=still["reason"], restarts=still["restarts"])
+			env.ctl.ok("label-node", worker, ALTERNATE_ACCESS_LABEL, label)
+			ready = env.ctl.ok("wait-ready", victim["pod"], "--old-uid", victim["uid"], "--timeout", str(POD_TIMEOUT_S),
+				bound_ms=POD_TIMEOUT_S * 1000 + CTL_TIMEOUT_MS).first("L3-POD-READY")
+			check("replacement-on-node", ready["worker"] == worker, pod=victim["pod"], worker=ready["worker"], expected=worker)
+			env.wait_completed()
+			_, after = env.cluster(size)
+			advertised("label-restored", after, "clearAlt", {p["pod"]: "%s:%d" % (labels[p["pod"]], p["hostPort"])
+				for p in after})
+			snapshot = l5.await_routing(drv, "label-restored", [p["node"] for p in after], ROUTING_WAIT_MS)
+			assert_nodes_at(env, "label-restored", snapshot, {p["node"]: (labels[p["pod"]], p["hostPort"]) for p in after})
+			never_empty(drv, "label-lost", since)
+			l5.serve(drv, "label-restored")
+	finally:
+		if label:
+			env.outcome.guard(env.ctl.ok, "label-node", worker, ALTERNATE_ACCESS_LABEL, label)
+		if cordoned:
+			env.outcome.guard(env.ctl.ok, "uncordon", *cordoned)
+		if label:
+			env.outcome.guard(env.wait_completed)
+		if size:
+			env.outcome.guard(env.restore, size)
+
+
 def tls_expected(env, cluster, pods):
 	"""The TLS address each pod advertises: the endpoint hostname under configuredIP,
 	loadBalancerTLSAlternateAccessAddress under networkLoadBalancer, with the pod's TLS Service NodePort."""
@@ -814,6 +890,11 @@ def nlb_only(shape):
 		"needs alternateAccess networkLoadBalancer (nlb or nlb-per-pod)")
 
 
+def per_node_only(shape):
+	return (None if shape["access"] == CONFIGURED_IP and not shape["multiPodPerHost"] else
+		"needs configuredIP with one pod per labelled worker (per-node)")
+
+
 def tls_only(shape):
 	return None if shape["tls"] else "needs a cluster that serves TLS (tls or nlb-tls)"
 
@@ -829,9 +910,7 @@ class Row:
 
 ROWS = [
 	Row("every-pod-advertises-shared-endpoint-with-own-node-port", row_shared_endpoint, applies=shared_endpoint),
-	Row("each-pod-at-its-worker-hostname-and-host-port", row_per_node, applies=lambda shape: None
-		if shape["access"] == CONFIGURED_IP and not shape["multiPodPerHost"] else
-		"needs configuredIP with one pod per labelled worker (per-node)"),
+	Row("each-pod-at-its-worker-hostname-and-host-port", row_per_node, applies=per_node_only),
 	Row("load-balancer-address-without-node-label-or-host-port", row_load_balancer_per_host, applies=lambda shape: None
 		if shape["access"] == NETWORK_LOAD_BALANCER and not shape["multiPodPerHost"] else
 		"needs networkLoadBalancer with one pod per host (nlb-per-pod)"),
@@ -842,6 +921,7 @@ ROWS = [
 	Row("pod-on-recreated-node-advertises-cluster-address", row_recreated_node, applies=lambda shape: nlb_only(shape) or
 		(None if not shape["multiPodPerHost"] else
 		"needs a pod on a worker the endpoint hostname does not resolve to; every pod runs on one kind node (nlb-per-pod)")),
+	Row("per-node-pod-on-node-recreated-without-label-cannot-start", row_per_node_label_lost, applies=per_node_only),
 	Row("shared-certificate-names-tls-name-not-endpoint", row_tls_certificate, contract=0, applies=tls_only),
 	Row("tls-name-holds-every-node-endpoint-name-not-created", row_tls_name, contract=TLS_CONTRACT, applies=tls_only),
 ]

@@ -32,12 +32,8 @@ def read_yaml(path: Path):
         raise CollectError(f"{path}: invalid YAML: {exc}") from exc
 
 
-def load_fixtures(directory: Path) -> tuple[str, dict[tuple[str, str], bool]]:
-    """Return the fixture set VERSION and every case, mapped to whether the fixture blocks it."""
-    version_path = directory / "VERSION"
-    if not version_path.is_file():
-        raise CollectError(f"fixtures directory has no VERSION: {directory}")
-
+def load_fixtures(directory: Path) -> dict[tuple[str, str], bool]:
+    """Return every fixture case, mapped to whether the fixture blocks it."""
     cases: dict[tuple[str, str], bool] = {}
     paths = sorted(path for root in FIXTURE_ROOTS for path in (directory / root).rglob("*.yaml"))
     for path in paths:
@@ -55,7 +51,7 @@ def load_fixtures(directory: Path) -> tuple[str, dict[tuple[str, str], bool]]:
 
     if not cases:
         raise CollectError(f"no fixture cases under {directory}")
-    return version_path.read_text(encoding="utf-8").strip(), cases
+    return cases
 
 
 def load_declarations(directory: Path, cases: dict) -> dict[str, dict[tuple[str, str], str]]:
@@ -83,7 +79,7 @@ def load_declarations(directory: Path, cases: dict) -> dict[str, dict[tuple[str,
     return declared
 
 
-def load_reports(directory: Path, version: str) -> list[dict]:
+def load_reports(directory: Path) -> list[dict]:
     paths = sorted(directory.rglob("conformance-report.json"))
     if not paths:
         raise CollectError(f"no conformance-report.json under {directory}")
@@ -95,7 +91,6 @@ def load_reports(directory: Path, version: str) -> list[dict]:
             report = {
                 "runtime": str(data["runtime"]),
                 "client": str(data["clientVersion"]),
-                "version": str(data["fixtureSetVersion"]),
                 "rows": [(row["file"], row["case"], row["result"], str(row.get("reason", ""))) for row in data["rows"]],
             }
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -103,8 +98,6 @@ def load_reports(directory: Path, version: str) -> list[dict]:
         for file_name, case_name, result, _ in report["rows"]:
             if result not in RESULTS:
                 raise CollectError(f"{path}: invalid result {result} for {file_name}:{case_name}")
-        if report["version"] != version:
-            raise CollectError(f"{path}: fixtureSetVersion {report['version']} does not match fixtures VERSION {version}")
         reports.append(report)
 
     runtimes = [report["runtime"] for report in reports]
@@ -121,14 +114,14 @@ def gate_kind(actual: str, declared: str) -> str:
     return ""
 
 
-def findings_for(report: dict, declared: dict, cases: dict, version: str) -> list[list[str]]:
+def findings_for(report: dict, declared: dict, cases: dict) -> list[list[str]]:
     """Rows that trip the gate: runtime, kind, file, case, declared, actual, reason."""
     found = []
     seen = set()
     for file_name, case_name, actual, reason in report["rows"]:
         seen.add((file_name, case_name))
         if (file_name, case_name) not in cases:
-            found.append(["unknown-case", file_name, case_name, "-", actual, f"not a case in fixture set {version}"])
+            found.append(["unknown-case", file_name, case_name, "-", actual, "not a case in the fixture set"])
             continue
         expected = declared.get((file_name, case_name), "blocked" if cases[(file_name, case_name)] else "pass")
         kind = gate_kind(actual, expected)
@@ -150,16 +143,16 @@ def table(headers: list[str], rows: list[list[str]]) -> list[str]:
 
 def collect(reports_dir: Path, fixtures_dir: Path, declarations_dir: Path | None) -> tuple[str, bool]:
     """Return the markdown summary and whether the gate failed."""
-    version, cases = load_fixtures(fixtures_dir)
+    cases = load_fixtures(fixtures_dir)
     declarations = load_declarations(declarations_dir, cases) if declarations_dir else {}
-    reports = load_reports(reports_dir, version)
+    reports = load_reports(reports_dir)
 
     findings, counts, unsupported = [], [], []
     for report in reports:
-        found = findings_for(report, declarations.get(report["runtime"], {}), cases, version)
+        found = findings_for(report, declarations.get(report["runtime"], {}), cases)
         findings.extend(found)
         totals = [str(sum(1 for row in report["rows"] if row[2] == result)) for result in RESULTS]
-        counts.append([report["runtime"], report["client"], report["version"], *totals, "fail" if found else "ok"])
+        counts.append([report["runtime"], report["client"], *totals, "fail" if found else "ok"])
         unsupported.extend(
             [report["runtime"], file_name, case_name, reason]
             for file_name, case_name, result, reason in report["rows"]
@@ -167,7 +160,7 @@ def collect(reports_dir: Path, fixtures_dir: Path, declarations_dir: Path | None
         )
 
     lines = ["## Conformance", ""]
-    lines += table(["Runtime", "Client", "Fixture set", "Pass", "Fail", "Unsupported", "Blocked", "Gate"], counts)
+    lines += table(["Runtime", "Client", "Pass", "Fail", "Unsupported", "Blocked", "Gate"], counts)
     if findings:
         lines += ["### Gate failures", ""]
         lines += table(["Runtime", "Kind", "File", "Case", "Declared", "Actual", "Reason"], findings)

@@ -4,17 +4,12 @@
 	"title": "Conformance report written by one runtime",
 	"type": "object",
 	"additionalProperties": false,
-	"required": [
-		"runtime",
-		"clientVersion",
-		"fixtureSetVersion",
-		"counts",
-		"rows"
-	],
+	"required": ["runtime", "clientVersion", "counts", "rows"],
 	"properties": {
 		"runtime": { "type": "string", "minLength": 1 },
 		"clientVersion": { "type": "string", "minLength": 1 },
 		"fixtureSetVersion": {
+			"description": "Ignored. Clients pin the fixtures by commit; kept so reports that still send it validate.",
 			"type": "string",
 			"pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
 		},

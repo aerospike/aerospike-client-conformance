@@ -21,7 +21,7 @@ The report shape is `schema/report.schema.json` in this repository, which owns i
 
 A case that is not in the declaration file is declared `pass`, except a case the fixture marks `state: blocked`, which is declared `blocked`. That matches the runner.
 
-Every report's `fixtureSetVersion` must equal `VERSION` in `fixtures-directory`. A declaration for a fixture file or case that is not in the fixture set is an error, as it is in the Java runner.
+A report's `fixtureSetVersion`, if present, is ignored; `fixtures-directory` is the fixture set the reports are checked against. A declaration for a fixture file or case that is not in the fixture set is an error, as it is in the Java runner.
 
 Other differences, such as a declared failure that now passes, do not fail this action. The runtime test is what forces the declaration to be updated.
 

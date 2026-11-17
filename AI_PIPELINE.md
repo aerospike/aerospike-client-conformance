@@ -9,8 +9,7 @@ matching. There is no library code here. The only executable code is the Python 
 
 ## Build
 
-There is no build and no published artifact. Client CI checks the repository out at a pinned
-`v<VERSION>` tag or commit and reads the fixtures from `schema/`, `discovery/` and `tls/`.
+There is no build and no published artifact. Client CI checks the repository out at a pinned commit SHA and reads the fixtures from `schema/`, `discovery/` and `tls/`.
 
 ## Test
 
@@ -40,7 +39,7 @@ shellcheck, actionlint, checkov, trufflehog, dotenv-linter, git-diff-check. Loca
 
 ## Architecture & key directories
 
-- `VERSION`: fixture set version for the whole repo (currently `0.1.0`).
+- `VERSION`: frozen and no longer enforced; kept only because clients still read it, and will be removed.
 - `schema/fixture.schema.json`: JSON Schema 2020-12 for every fixture file (`kind`: `translate`,
   `merge`, `tls`).
 - `schema/report.schema.json`: the report each client runtime writes. Not exercised by the
@@ -51,9 +50,7 @@ shellcheck, actionlint, checkov, trufflehog, dotenv-linter, git-diff-check. Loca
 - `tls/certs/<shape>.pem`: one self-signed cert per shape, certificate only.
 - `tls/generate-certs.sh`: regenerates all of `tls/certs/` from the shapes (needs `yq`, `openssl`).
 - `scripts/validate-fixtures.py`, `scripts/requirements.txt`: the CI check and its pinned deps.
-- `.github/workflows/`: `validate-fixtures.yml`, `trunk.yml`, `release.yml` (on a `v*` tag,
-  checks the tag matches `VERSION` and validates the fixtures), `pr-hygiene.yml`. `cicd-standard.yaml`/`cicd-composable.yaml` are
-  disabled template leftovers.
+- `.github/workflows/`: `validate-fixtures.yml`, `trunk.yml`, `pr-hygiene.yml`. `cicd-standard.yaml`/`cicd-composable.yaml` are disabled template leftovers.
 
 ## Conventions
 
@@ -67,10 +64,8 @@ shellcheck, actionlint, checkov, trufflehog, dotenv-linter, git-diff-check. Loca
 - Expected errors are a category plus required message facts, never an exception type.
 - Config keys use the public configuration surface; new provisional keys go in the README
   Unnamed config keys table.
-- Versioning (bump `VERSION`): patch = wording only; minor = new rows, files or optional keys;
-  major = changed expectation, removed or renamed row, or incompatible schema change.
-- The file's repo-relative path is its identity in client reports and declarations, so renaming
-  or moving a fixture file is a major change.
+- The fixture set is not versioned and `VERSION` is not bumped; clients pin by commit SHA.
+- The file's repo-relative path is its identity in client reports and declarations, so renaming or moving a fixture file breaks every client declaration that names it.
 - Flow-style YAML (`{ ... }` / `[ ... ]`) is the house style for compact inputs and expectations.
 - PR titles: conventional commits (`type(scope): description`), with a `[JIRA-123]` ticket for
   `feat`, `fix`, `docs`, `ci`, `refactor`.
