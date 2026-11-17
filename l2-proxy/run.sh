@@ -9,8 +9,9 @@
 # in an Amazon Linux 2023 container, then runs rows.py for the profile, which starts the manifest's
 # L5_DRIVER in a container on the client network only, applies the faults through l2ctl and decides
 # every row. When the manifest sets L2_RUN, it then runs once per profile in that container with the
-# topology's values file as its environment. Every container, network and image the run creates is
-# removed on exit, including on failure, and the run fails if any is left.
+# topology's values file as its environment, while node-server serves the nodes the test asks for.
+# Every container, network and image the run creates is removed on exit, including on failure, and
+# the run fails if any is left.
 #
 # Container names, network names and ports derive from --prefix and --port-base, so runs with
 # different values do not collide; the run checks that its names, ports and subnet are free first.
@@ -25,15 +26,16 @@
 #
 # Usage: l2-proxy/run.sh --client-repo <https url or local path> --commit <commit> --manifest <path>
 #                        [--profile default,...|all] [--rows ROW,...] [--edition ce|ee]
-#                        [--server-image <image>] [--unresolved-hostname] [--no-fault]
+#                        [--server-image <image>] [--unresolved-hostname] [--verbatim-access-address] [--no-fault]
 #                        [--prefix <prefix>] [--port-base <port>] [--cache <dir>] [--results <dir>] [--plan]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ALL_PROFILES="default reachable pass-through-names pass-through-ports port-map-range port-range low-mtu idle-reset"
+ALL_PROFILES="default reachable pass-through-names pass-through-ports port-map-range port-range low-mtu idle-reset unresolved-access cn-only"
 SHARED_WORKFLOWS_COMMIT=318e453bea7f3c068ead24057dab07312a7fe62e
 ACTION_PATH=.github/actions/setup-discovery-topology
+DNS_ACTION_PATH=.github/actions/setup-dns-server
 TOXIPROXY_IMAGE=ghcr.io/shopify/toxiproxy:2.12.0
 CURL_IMAGE=curlimages/curl:8.11.1
 BUILD_IMAGE=public.ecr.aws/amazonlinux/amazonlinux:2023
@@ -41,6 +43,9 @@ ENDPOINT_HOSTNAME=as-endpoint.test
 REACHABLE_HOSTNAME=as-reachable.test
 PASS_THROUGH_HOSTNAME=as-pass-through.test
 PASS_THROUGH_DOMAIN=pass-through.test
+UNRESOLVED_HOSTNAME=as-unresolved.test
+TLS_NAME=aerospike-tls
+TLS_PORT=4333
 NODES=3
 RANGE_FIRST=11
 RANGE_LAST=26
@@ -67,6 +72,7 @@ ROWS=""
 EDITION=ce
 SERVER_IMAGE=""
 UNRESOLVED=0
+VERBATIM=0
 NO_FAULT=0
 PORT_BASE="${L2_PORT_BASE:-4900}"
 PREFIX="${L2_PREFIX:-}"
@@ -83,6 +89,7 @@ while [ $# -gt 0 ]; do
 		--edition) EDITION="${2:-}"; shift ;;
 		--server-image) SERVER_IMAGE="${2:-}"; shift ;;
 		--unresolved-hostname) UNRESOLVED=1 ;;
+		--verbatim-access-address) VERBATIM=1 ;;
 		--no-fault) NO_FAULT=1 ;;
 		--prefix) PREFIX="${2:-}"; shift ;;
 		--port-base) PORT_BASE="${2:-}"; shift ;;
@@ -98,13 +105,20 @@ done
 	die "--port-base must be a port from 1024 to $((65535 - PORT_SPAN))"
 PREFIX="${PREFIX:-l2-proxy-$PORT_BASE}"
 [[ "$PREFIX" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "--prefix must be lower-case letters, digits and dashes, at most 31"
-[ "$PROFILES" != all ] || PROFILES="${ALL_PROFILES// /,}"
+if [ "$PROFILES" = all ]; then
+	PROFILES="${ALL_PROFILES// /,}"
+	# cn-only needs server TLS, which only Enterprise has.
+	[ "$EDITION" = ee ] || PROFILES="${PROFILES/,cn-only/}"
+fi
 IFS=, read -r -a PROFILE_LIST <<<"$PROFILES"
 for profile in "${PROFILE_LIST[@]}"; do
 	[[ " $ALL_PROFILES " == *" $profile "* ]] || die "unknown profile $profile (profiles: $ALL_PROFILES, or all)"
 done
 [ "$UNRESOLVED" = 0 ] || [[ ",$PROFILES," == *",pass-through-ports,"* ]] ||
 	die "--unresolved-hostname applies to the pass-through-ports profile only"
+[ "$VERBATIM" = 0 ] || [[ ",$PROFILES," == *",unresolved-access,"* ]] ||
+	die "--verbatim-access-address applies to the unresolved-access profile only"
+[ "$EDITION" = ee ] || [[ ",$PROFILES," != *",cn-only,"* ]] || die "the cn-only profile needs --edition ee"
 case "$EDITION" in
 	ce) SERVER_IMAGE="${SERVER_IMAGE:-aerospike/aerospike-server:latest}" ;;
 	ee) SERVER_IMAGE="${SERVER_IMAGE:-aerospike/aerospike-server-enterprise:latest}" ;;
@@ -120,6 +134,7 @@ esac
 CONTROL_PORT=$PORT_BASE
 LISTEN_PORT_BASE=$((PORT_BASE + 1))
 EXTRA_PORT_BASE=$((PORT_BASE + 10))
+TLS_PORT_BASE=$((PORT_BASE + 50))
 RANGE_PORT_BASE=$((PORT_BASE + 100))
 SUBNET="10.213.$((PORT_BASE / 100 % 256))"
 NODE_NETWORK="$PREFIX-nodes"
@@ -128,6 +143,20 @@ PROXY="$PREFIX-toxiproxy"
 CTL_CONTAINER="$PREFIX-ctl"
 BUILD_CONTAINER="$PREFIX-build"
 CLIENT_IMAGE="localhost/$PREFIX-client:latest"
+CONTROL_MOUNT=/l2-control
+TLS_MOUNT=/l2-tls
+NODE_SERVER_PID=""
+
+alternate_hostname() {
+	case "$1" in
+		pass-through-ports) echo "$PASS_THROUGH_HOSTNAME" ;;
+		unresolved-access) echo "$UNRESOLVED_HOSTNAME" ;;
+	esac
+}
+
+cert_shape() {
+	[ "$1" = cn-only ] && echo cn-only || echo san-only
+}
 
 describe_profile() {
 	local profile=$1
@@ -136,15 +165,19 @@ describe_profile() {
 	echo "                 $CLIENT_NETWORK (internal$([ "$profile" = low-mtu ] && echo ", MTU $CLIENT_NETWORK_MTU"))"
 	echo "  nodes          $PREFIX-node-1..$NODES, $SERVER_IMAGE ($EDITION)$([ "$profile" = port-map-range ] && echo ", on $SUBNET.$RANGE_FIRST upwards")"
 	echo "  toxiproxy      $PROXY on both networks, API port $CONTROL_PORT, endpoint $ENDPOINT_HOSTNAME ports $LISTEN_PORT_BASE-$((LISTEN_PORT_BASE + NODES - 1))$([ "$profile" = port-range ] && echo ", net.ipv4.ip_local_port_range $PROXY_PORT_RANGE")"
+	[ "$EDITION" != ee ] || echo "  tls            tls-name $TLS_NAME on port $TLS_PORT, $(cert_shape "$profile") certificate; TLS listeners $TLS_PORT_BASE-$((TLS_PORT_BASE + NODES - 1)); the rows use the clear listeners"
 	case "$profile" in
 		reachable) echo "  advertises     node $NODES: access-address $REACHABLE_HOSTNAME and its listener port; the others: private address, alternate $REACHABLE_HOSTNAME and their listener port" ;;
 		pass-through-names) echo "  advertises     node N: alternate node-N.$PASS_THROUGH_DOMAIN and its listener port" ;;
 		pass-through-ports) echo "  advertises     every node: alternate $PASS_THROUGH_HOSTNAME and its listener port; $([ "$UNRESOLVED" = 1 ] && echo "the name does not resolve in the servers" || echo "the name resolves to Toxiproxy in the servers")" ;;
+		unresolved-access) echo "  advertises     private address only; a node started with an alternate port advertises $UNRESOLVED_HOSTNAME, which resolves nowhere; the server $([ "$VERBATIM" = 1 ] && echo "advertises it verbatim" || echo "refuses it at startup")" ;;
 		port-map-range) echo "  listeners      $SUBNET.$RANGE_FIRST-$RANGE_LAST on $RANGE_PORT_BASE plus the last octet" ;;
 		low-mtu) echo "  namespace      max-record-size 8M" ;;
 		*) echo "  advertises     private address only" ;;
 	esac
+	echo "  dns            $PREFIX-dns on $CLIENT_NETWORK: $ENDPOINT_HOSTNAME A at Toxiproxy, _aerospike._tcp.$ENDPOINT_HOSTNAME SRV per clear listener"
 	echo "  control        $CTL_CONTAINER (curl on $NODE_NETWORK); new-node listeners from port $EXTRA_PORT_BASE"
+	echo "  node requests  node-server during L2_RUN, at $CONTROL_MOUNT in the client container$(alternate_hostname "$profile" | sed 's/^./; alternate-port advertises &/')"
 	echo "  driver         $PREFIX-driver-<pid> from $CLIENT_IMAGE on $CLIENT_NETWORK only"
 	python3 "$SCRIPT_DIR/rows.py" --plan --profile "$profile" | sed 's/^L2-PLAN-ROW profile=[^ ]* /  row            /'
 }
@@ -166,6 +199,7 @@ for cmd in docker git jq python3 curl tar; do
 done
 docker info >/dev/null 2>&1 || die "the container runtime is not reachable through docker"
 if [ "$EDITION" = ee ]; then
+	command -v openssl >/dev/null 2>&1 || die "openssl not found; --edition ee generates the TLS certificates with it"
 	[ -n "${FEATURES_CONF_PATH:-}" ] || die "--edition ee needs FEATURES_CONF_PATH"
 	[ -r "$FEATURES_CONF_PATH" ] || die "FEATURES_CONF_PATH is not readable"
 fi
@@ -216,6 +250,27 @@ secret_scan() {
 	[ $hits -eq 0 ]
 }
 
+start_node_server() {
+	mkdir -p "$STATE/control"
+	"$SCRIPT_DIR/node-server" "$STATE/control" "$CONTROL_MOUNT" "$RES" >"$RES/node-server.log" 2>&1 </dev/null &
+	NODE_SERVER_PID=$!
+	for _ in $(seq 300); do
+		[ ! -e "$STATE/control/ready" ] || return 0
+		kill -0 "$NODE_SERVER_PID" 2>/dev/null || break
+		sleep 0.1
+	done
+	cat "$RES/node-server.log" >&2
+	return 1
+}
+
+# Stopping the node server removes every node it started.
+stop_node_server() {
+	[ -n "$NODE_SERVER_PID" ] || return 0
+	kill "$NODE_SERVER_PID" 2>/dev/null
+	wait "$NODE_SERVER_PID" 2>/dev/null
+	NODE_SERVER_PID=""
+}
+
 remove_topology() {
 	local c n
 	for c in $(docker ps -aq --filter "name=^$PREFIX-" 2>/dev/null); do
@@ -231,6 +286,7 @@ cleanup() {
 	trap - EXIT
 	trap '' INT TERM
 	set +e
+	stop_node_server
 	remove_topology
 	docker image rm -f "$CLIENT_IMAGE" >/dev/null 2>&1
 	if [ -d "$WORK/client" ] && ! rm -rf "$WORK/client" 2>/dev/null; then
@@ -254,13 +310,16 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for f in entrypoint.sh proxy_map.sh; do
+mkdir -p "$WORK/dns-action"
+for f in "$ACTION_PATH/entrypoint.sh:action" "$ACTION_PATH/proxy_map.sh:action" "$DNS_ACTION_PATH/entrypoint.sh:dns-action"; do
+	path="${f%:*}"
+	out="$WORK/${f##*:}/$(basename "$path")"
 	if [ -n "${SHARED_WORKFLOWS_DIR:-}" ]; then
-		git -C "$SHARED_WORKFLOWS_DIR" show "$SHARED_WORKFLOWS_COMMIT:$ACTION_PATH/$f" >"$WORK/action/$f" ||
-			die "$f not found at $SHARED_WORKFLOWS_COMMIT in $SHARED_WORKFLOWS_DIR"
+		git -C "$SHARED_WORKFLOWS_DIR" show "$SHARED_WORKFLOWS_COMMIT:$path" >"$out" ||
+			die "$path not found at $SHARED_WORKFLOWS_COMMIT in $SHARED_WORKFLOWS_DIR"
 	else
-		curl -sfL "https://raw.githubusercontent.com/aerospike/shared-workflows/$SHARED_WORKFLOWS_COMMIT/$ACTION_PATH/$f" \
-			-o "$WORK/action/$f" || die "cannot download $ACTION_PATH/$f at $SHARED_WORKFLOWS_COMMIT"
+		curl -sfL "https://raw.githubusercontent.com/aerospike/shared-workflows/$SHARED_WORKFLOWS_COMMIT/$path" \
+			-o "$out" || die "cannot download $path at $SHARED_WORKFLOWS_COMMIT"
 	fi
 done
 # setup-discovery-topology calls Toxiproxy's API with curl at its node network address.
@@ -324,8 +383,20 @@ docker commit "$BUILD_CONTAINER" "$CLIENT_IMAGE" >/dev/null || die "cannot save 
 docker rm -f "$BUILD_CONTAINER" >/dev/null
 
 render_base_conf() {
-	local profile=$1 conf=$2 feature_key="" max_record="" mesh_seeds="" i
-	[ "$EDITION" != ee ] || feature_key="feature-key-file /etc/aerospike/features.conf"
+	local profile=$1 conf=$2 feature_key="" max_record="" mesh_seeds="" tls="" tls_service="" i
+	if [ "$EDITION" = ee ]; then
+		feature_key="feature-key-file /etc/aerospike/features.conf"
+		tls="    tls $TLS_NAME {
+        cert-file /etc/aerospike/tls/server.crt
+        key-file /etc/aerospike/tls/server.key
+        ca-file /etc/aerospike/tls/ca.crt
+    }
+"
+		tls_service="        tls-port $TLS_PORT
+        tls-authenticate-client false
+        tls-name $TLS_NAME
+"
+	fi
 	[ "$profile" != low-mtu ] || max_record="max-record-size 8M"
 	for i in $(seq 1 "$NODES"); do
 		mesh_seeds+="        mesh-seed-address-port $PREFIX-node-$i 3002"$'\n'
@@ -343,10 +414,10 @@ logging {
 }
 
 network {
-    service {
+$tls    service {
         address any
         port 3000
-    }
+$tls_service    }
     heartbeat {
         mode mesh
         address any
@@ -389,6 +460,7 @@ write_topology() {
 		echo "L2_CLIENT_HOSTS=${CLIENT_HOSTS:-}"
 		echo "L2_PROXY_CLIENT_ADDRESS=${PROXY_CLIENT_ADDRESS:-}"
 		echo "L2_ACCESS_HOSTNAME=${ACCESS_HOSTNAME:-}"
+		echo "L2_ALTERNATE_HOSTNAME=${ALTERNATE_HOSTNAME:-}"
 		echo "L2_EXTRA_PORT_BASE=$EXTRA_PORT_BASE"
 		echo "L2_SUBNET=$SUBNET"
 		echo "L2_OUTSIDE_OCTET=$OUTSIDE_OCTET"
@@ -404,7 +476,10 @@ write_values() {
 		echo "DISCOVERY_ENDPOINT_HOSTNAME=$(output endpoint-hostname)"
 		echo "DISCOVERY_ENDPOINT_PORT_BASE=$(output listen-port-base)"
 		echo "DISCOVERY_ENDPOINT_PORTS=$(output endpoint-ports)"
-		echo "DISCOVERY_TLS_ENDPOINT_PORTS="
+		echo "DISCOVERY_TLS_ENDPOINT_PORTS=$(output tls-endpoint-ports)"
+		echo "DISCOVERY_TLS_CERT_SHAPE=${CERT_SHAPE:-}"
+		echo "DISCOVERY_TLS_NAME=$([ "$EDITION" = ee ] && echo "$TLS_NAME")"
+		echo "DISCOVERY_TLS_CA_FILE=$([ "$EDITION" = ee ] && echo "$TLS_MOUNT/ca.crt")"
 		echo "DISCOVERY_PROXY_MAP=$(output proxy-name-port-map)"
 		echo "TOXIPROXY_URL=$(output toxiproxy-url)"
 		echo "TOXIPROXY_HOST=$(output toxiproxy-container-name)"
@@ -417,7 +492,33 @@ write_values() {
 		echo "DISCOVERY_CLIENT_NETWORK_MTU=${MTU:-}"
 		echo "DISCOVERY_PROXY_PORT_RANGE=${PORT_RANGE:-}"
 		echo "DISCOVERY_IDLE_RESET=${IDLE_RESET:-}"
+		echo "DISCOVERY_CONTROL_DIR=$CONTROL_MOUNT"
+		echo "DISCOVERY_DNS_SERVER=${DNS_SERVER:-}"
+		echo "DISCOVERY_UNRESOLVED_HOSTNAME=$([ "$PROFILE" = unresolved-access ] && echo "$UNRESOLVED_HOSTNAME")"
+		echo "DISCOVERY_VERBATIM_ACCESS_ADDRESS=$([ "$PROFILE" = unresolved-access ] && echo "$VERBATIM")"
 	} >"$state/values.env"
+}
+
+# A DNS server on the client network for the endpoint: an A record at Toxiproxy's client address and one
+# _aerospike._tcp SRV record per clear listener, as aerospike/shared-workflows setup-dns-server serves them.
+start_dns_server() {
+	local zone port ports
+	zone="\$ORIGIN $ENDPOINT_HOSTNAME.
+@ 3600 IN SOA ns.$ENDPOINT_HOSTNAME. admin.$ENDPOINT_HOSTNAME. 1 60 60 60 1
+@ 1 IN A $PROXY_CLIENT_ADDRESS"
+	IFS=, read -r -a ports <<<"$(output endpoint-ports)"
+	for port in "${ports[@]}"; do
+		zone+=$'\n'"_aerospike._tcp 1 IN SRV 10 10 $port $ENDPOINT_HOSTNAME."
+	done
+	NETWORK_NAME="$CLIENT_NETWORK" \
+		CONTAINER_NAME="$PREFIX-dns" \
+		ZONE_NAME="$ENDPOINT_HOSTNAME" \
+		ZONE_CONTENT="$zone" \
+		GITHUB_OUTPUT="$STATE/dns.out" \
+		bash "$WORK/dns-action/entrypoint.sh" >"$RES/dns.log" 2>&1 || { tail -30 "$RES/dns.log" >&2; return 1; }
+	DNS_SERVER="$(sed -n 's/^server-address=//p' "$STATE/dns.out")"
+	[ -n "$DNS_SERVER" ] || { echo "no DNS server address" >&2; return 1; }
+	echo "DNS server $PREFIX-dns at $DNS_SERVER on $CLIENT_NETWORK"
 }
 
 # Build one profile's topology into $STATE. Fails the profile on any error.
@@ -435,6 +536,8 @@ build_topology() {
 	NODE_HOSTS=""
 	CLIENT_HOSTS=""
 	ACCESS_HOSTNAME=""
+	ALTERNATE_HOSTNAME=""
+	DNS_SERVER=""
 	case "$profile" in
 		port-map-range) network_args=(--subnet "$SUBNET.0/24" --ip-range "$SUBNET.128/25") ;;
 		low-mtu)
@@ -447,6 +550,7 @@ build_topology() {
 			[ "$NO_FAULT" = 1 ] || sysctls="net.ipv4.ip_local_port_range=$PORT_RANGE"
 			;;
 		idle-reset) IDLE_RESET=1 ;;
+		unresolved-access) ALTERNATE_HOSTNAME="$(alternate_hostname "$profile")" ;;
 	esac
 	docker network create "${network_args[@]+"${network_args[@]}"}" "$NODE_NETWORK" >/dev/null
 	docker network create "${client_args[@]}" "$CLIENT_NETWORK" >/dev/null
@@ -454,9 +558,19 @@ build_topology() {
 
 	mkdir -p "$STATE/conf"
 	render_base_conf "$profile" "$STATE/conf/aerospike.conf"
+	CERT_SHAPE=""
 	if [ "$EDITION" = ee ]; then
 		cp "$FEATURES_CONF_PATH" "$STATE/features.conf"
 		chmod 644 "$STATE/features.conf"
+		CERT_SHAPE="$(cert_shape "$profile")"
+		# san-only carries the tls-name only as a SAN and a CN that is not it, so only SAN matching passes.
+		if [ "$CERT_SHAPE" = cn-only ]; then
+			sh "$SCRIPT_DIR/../tls/generate-certs.sh" --server "$STATE/tls" "$TLS_NAME" - >/dev/null
+		else
+			sh "$SCRIPT_DIR/../tls/generate-certs.sh" --server "$STATE/tls" "not-the-$TLS_NAME" "DNS:$TLS_NAME" >/dev/null
+		fi
+		mkdir -p "$STATE/tls-ca"
+		cp "$STATE/tls/ca.crt" "$STATE/tls-ca/ca.crt"
 	fi
 	CONTAINER_NAMES=""
 	for i in $(seq 1 "$NODES"); do
@@ -493,7 +607,7 @@ build_topology() {
 		LISTEN_PORT_BASE="$LISTEN_PORT_BASE" \
 		TOXIPROXY_IMAGE="$TOXIPROXY_IMAGE" \
 		TOXIPROXY_CONTROL_PORT="$CONTROL_PORT" \
-		TLS_LISTEN_PORT_BASE="" \
+		TLS_LISTEN_PORT_BASE="$([ "$EDITION" = ee ] && echo "$TLS_PORT_BASE")" \
 		CLIENT_NETWORK_MTU="" \
 		PROXY_SYSCTLS="$sysctls" \
 		GITHUB_OUTPUT="$STATE/topology.out" \
@@ -502,6 +616,7 @@ build_topology() {
 	proxy_server_address="$(container_address "$PROXY" "$NODE_NETWORK")"
 	[ -n "$PROXY_CLIENT_ADDRESS" ] && [ -n "$proxy_server_address" ] || { echo "no Toxiproxy address" >&2; return 1; }
 	IFS=, read -r -a proxies <<<"$(output proxy-name-port-map)"
+	start_dns_server
 
 	case "$profile" in
 		reachable | pass-through-names | pass-through-ports)
@@ -515,6 +630,7 @@ build_topology() {
 				pass-through-ports)
 					PASS_THROUGH_BRANCH=B
 					ACCESS_HOSTNAME=$PASS_THROUGH_HOSTNAME
+					ALTERNATE_HOSTNAME="$(alternate_hostname "$profile")"
 					hostnames=("$PASS_THROUGH_HOSTNAME")
 					;;
 			esac
@@ -533,6 +649,7 @@ build_topology() {
 			for entry in "${proxies[@]}"; do
 				container="${entry%:*}"
 				port="${entry##*:}"
+				[[ "$container" != *-tls ]] || continue
 				index=$((index + 1))
 				"$L2_CTL" stop-node "$container" >/dev/null
 				case "$profile" in
@@ -549,6 +666,7 @@ build_topology() {
 			done
 			if ! "$L2_CTL" wait-cluster "$NODES" --timeout 120; then
 				for entry in "${proxies[@]}"; do
+					[[ "${entry%:*}" != *-tls ]] || continue
 					[ "$(docker inspect -f '{{.State.Running}}' "${entry%:*}" 2>/dev/null)" = true ] ||
 						echo "Node ${entry%:*} exited: $(docker logs "${entry%:*}" 2>&1 | grep -m1 -E 'CRITICAL|Invalid access address')"
 				done
@@ -644,12 +762,20 @@ for PROFILE in "${PROFILE_LIST[@]}"; do
 			run_hosts+=(--add-host "$entry")
 		done
 		set +e
-		# shellcheck disable=SC2016 # expanded in the client container
-		docker run --rm --name "$PREFIX-driver-run" --network "$CLIENT_NETWORK" "${run_hosts[@]+"${run_hosts[@]}"}" \
-			"${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"}" \
-			--env-file "$STATE/values.env" -e L2_PROFILE="$PROFILE" -v "$WORK/client:/client" -w /client "$CLIENT_IMAGE" \
-			bash -c 'set -a; . "./$0"; set +a; bash -c "$L2_RUN"' "$MANIFEST" </dev/null >"$RES/l2-run.log" 2>&1
-		run_rc=$?
+		tls_mount=()
+		[ "$EDITION" != ee ] || tls_mount=(-v "$STATE/tls-ca:$TLS_MOUNT:ro")
+		if start_node_server; then
+			# shellcheck disable=SC2016 # expanded in the client container
+			docker run --rm --name "$PREFIX-driver-run" --network "$CLIENT_NETWORK" "${run_hosts[@]+"${run_hosts[@]}"}" \
+				"${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"}" -v "$STATE/control:$CONTROL_MOUNT" "${tls_mount[@]+"${tls_mount[@]}"}" \
+				--env-file "$STATE/values.env" -e L2_PROFILE="$PROFILE" -v "$WORK/client:/client" -w /client "$CLIENT_IMAGE" \
+				bash -c 'set -a; . "./$0"; set +a; bash -c "$L2_RUN"' "$MANIFEST" </dev/null >"$RES/l2-run.log" 2>&1
+			run_rc=$?
+		else
+			echo "The node server did not start (node-server.log)" >"$RES/l2-run.log"
+			run_rc=1
+		fi
+		stop_node_server
 		set -e
 		if [ "$run_rc" -eq 0 ]; then
 			echo "L2_RUN $PROFILE PASS" | tee -a "$RESULTS/rows.txt"

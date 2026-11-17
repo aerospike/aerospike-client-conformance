@@ -18,7 +18,8 @@ on:
       profile:
         description: >-
           Comma-separated profiles, or all: default, reachable, pass-through-names,
-          pass-through-ports, port-map-range, port-range, low-mtu, idle-reset
+          pass-through-ports, port-map-range, port-range, low-mtu, idle-reset, unresolved-access,
+          and cn-only on edition ee
         type: string
         required: false
         default: all
@@ -44,6 +45,25 @@ on:
         type: boolean
         required: false
         default: false
+      verbatim-access-address:
+        description: >-
+          On unresolved-access, which profile must then include, the server-image advertises access
+          addresses verbatim instead of resolving them at startup
+        type: boolean
+        required: false
+        default: false
+      registry:
+        description: >-
+          Registry to log in to through JFrog OIDC before pulling server-image, such as
+          aerospike.jfrog.io; empty pulls without logging in
+        type: string
+        required: false
+        default: ""
+      jfrog-platform-url:
+        description: JFrog platform URL for the OIDC exchange, when registry is set
+        type: string
+        required: false
+        default: https://aerospike.jfrog.io
       conformance-ref:
         description: Ref of aerospike/aerospike-client-conformance to run l2-proxy from
         type: string
@@ -53,15 +73,24 @@ on:
       FEATURES_CONF:
         description: Enterprise feature-key file content, for edition ee
         required: false
+      JFROG_OIDC_PROVIDER:
+        description: JFrog OIDC provider name, when registry is set
+        required: false
+      JFROG_OIDC_AUDIENCE:
+        description: JFrog OIDC audience, when registry is set
+        required: false
 
 permissions:
   contents: read
 
 jobs:
   l2:
-    name: L2 proxy (${{ inputs.profile }})
+    name: L2 proxy (${{ inputs.edition }}, ${{ inputs.profile }})
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
@@ -75,6 +104,35 @@ jobs:
           ref: ${{ inputs.conformance-ref }}
           path: conformance
           persist-credentials: false
+
+      - name: Require JFrog OIDC
+        if: ${{ inputs.registry != '' }}
+        env:
+          OIDC_PROVIDER: ${{ secrets.JFROG_OIDC_PROVIDER }}
+          OIDC_AUDIENCE: ${{ secrets.JFROG_OIDC_AUDIENCE }}
+        run: |
+          if [[ -z "${OIDC_PROVIDER}" || -z "${OIDC_AUDIENCE}" ]]; then
+            echo "::error::registry needs the JFROG_OIDC_PROVIDER and JFROG_OIDC_AUDIENCE secrets"
+            exit 1
+          fi
+
+      - name: Set up JFrog CLI
+        id: jfrog
+        if: ${{ inputs.registry != '' }}
+        uses: step-security/setup-jfrog-cli@a6b41f8338bea0983ddff6bd4ede7d2dcd81e1fa # v4.8.1
+        env:
+          JF_URL: ${{ inputs.jfrog-platform-url }}
+        with:
+          oidc-provider-name: ${{ secrets.JFROG_OIDC_PROVIDER }}
+          oidc-audience: ${{ secrets.JFROG_OIDC_AUDIENCE }}
+
+      - name: Log in to the registry
+        if: ${{ inputs.registry != '' }}
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ steps.jfrog.outputs.oidc-user }}
+          password: ${{ steps.jfrog.outputs.oidc-token }}
 
       - name: Write the feature key
         if: ${{ inputs.edition == 'ee' }}
@@ -99,6 +157,7 @@ jobs:
           EDITION: ${{ inputs.edition }}
           SERVER_IMAGE: ${{ inputs.server-image }}
           UNRESOLVED_HOSTNAME: ${{ inputs.unresolved-hostname }}
+          VERBATIM_ACCESS_ADDRESS: ${{ inputs.verbatim-access-address }}
         run: |
           set -euo pipefail
           args=(
@@ -112,6 +171,7 @@ jobs:
           [[ -z "${ROWS}" ]] || args+=(--rows "${ROWS}")
           [[ -z "${SERVER_IMAGE}" ]] || args+=(--server-image "${SERVER_IMAGE}")
           [[ "${UNRESOLVED_HOSTNAME}" != "true" ]] || args+=(--unresolved-hostname)
+          [[ "${VERBATIM_ACCESS_ADDRESS}" != "true" ]] || args+=(--verbatim-access-address)
           if [[ "${EDITION}" == "ee" ]]; then
             export FEATURES_CONF_PATH="${RUNNER_TEMP}/features.conf"
           fi
@@ -125,6 +185,6 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: l2-proxy-results-${{ inputs.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: l2-proxy-results-${{ inputs.edition }}-${{ inputs.profile }}${{ inputs.unresolved-hostname && '-unresolved-hostname' || '' }}${{ inputs.verbatim-access-address && '-verbatim' || '' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/l2-proxy-results
           if-no-files-found: warn
