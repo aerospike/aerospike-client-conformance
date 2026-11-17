@@ -204,4 +204,29 @@ jobs:
       FEATURES_CONF: ${{ secrets.FEATURES_CONF }}
 ```
 
-`edition` defaults to `ee`; `rows`, `server-image` and `conformance-ref` are optional. `unresolved-hostname: true` passes `--unresolved-hostname`, so `shared-name-unresolved-in-servers-advertised-verbatim` runs instead of skipping; `profile` must then include `pass-through-ports` and `server-image` must advertise access addresses verbatim. The results artifact is `l2-proxy-results-<profile>-<run id>-<attempt>`, so a caller can call the workflow once per profile in one run.
+`edition` defaults to `ee`; `rows`, `server-image` and `conformance-ref` are optional. `unresolved-hostname: true` passes `--unresolved-hostname`, so `shared-name-unresolved-in-servers-advertised-verbatim` runs instead of skipping; `profile` must then include `pass-through-ports` and `server-image` must advertise access addresses verbatim. `verbatim-access-address: true` passes `--verbatim-access-address`; `profile` must then include `unresolved-access`.
+
+A `server-image` from a private registry needs `registry`, such as `aerospike.jfrog.io`, and the `JFROG_OIDC_PROVIDER` and `JFROG_OIDC_AUDIENCE` secrets: the job exchanges a GitHub OIDC token for JFrog credentials, as aerospike/shared-workflows `setup-aerospike-server` does, and logs in to `registry` before the run pulls the image. `jfrog-platform-url` defaults to `https://aerospike.jfrog.io`. The job asks for `id-token: write`, so the caller must grant it:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  l2-unresolved-access:
+    uses: aerospike/aerospike-client-conformance/.github/workflows/l2-proxy.yaml@<sha>
+    with:
+      client-repository: aerospike/aerospike-client-java
+      commit: ${{ github.sha }}
+      manifest: test/discovery/l5-aws.manifest
+      profile: unresolved-access
+      edition: ce
+      server-image: aerospike.jfrog.io/database-docker-dev-local/aerospike-server:<tag>
+      verbatim-access-address: true
+      registry: aerospike.jfrog.io
+    secrets:
+      JFROG_OIDC_PROVIDER: ${{ secrets.JFROG_OIDC_PROVIDER }}
+      JFROG_OIDC_AUDIENCE: ${{ secrets.JFROG_OIDC_AUDIENCE }}
+```
+
+The results artifact is `l2-proxy-results-<edition>-<profile>[-unresolved-hostname][-verbatim]-<run id>-<attempt>`, so a caller can call the workflow once per profile and server in one run.
