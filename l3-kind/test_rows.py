@@ -477,7 +477,18 @@ class ScaleUpTest(RowsTest):
 
 	def test_usable_before_start_fails(self):
 		s = scenario(self.phases, ctl=scale_up_ctl(), watch=dict(self.watch, usableAt=1000050))
-		self.assertFailsCheck(self.row, s, "usable-after-start", measurementError="true", usableMs=-50, startAt=1000100)
+		self.assertFailsCheck(self.row, s, "usable-after-start", measurementError="true", usableMs=-50, startAt=1000100,
+			startPollMs=14)
+
+	def test_usable_within_answer_poll_before_start_passes(self):
+		out = self.assertPasses(self.row, scenario(self.phases, ctl=scale_up_ctl(), watch=dict(self.watch, usableAt=1000090)))
+		self.assertIn("check=usable-after-start measurementError=false usableMs=-10 startAt=1000100 startPollMs=14 ", out)
+
+	def test_usable_before_bump_start_uses_bump_poll(self):
+		ctl = scale_up_ctl()
+		ctl["join-watch"]["lines"] = [ctl["join-watch"]["lines"][0].replace("bumpEpochMs=1000000", "bumpEpochMs=1000250")]
+		s = scenario(self.phases, ctl=ctl, watch=dict(self.watch, usableAt=1000235))
+		self.assertFailsCheck(self.row, s, "usable-after-start", usableMs=-15, startAt=1000250, startPollMs=12)
 
 	def test_coarse_poll_fails(self):
 		ctl = scale_up_ctl()
