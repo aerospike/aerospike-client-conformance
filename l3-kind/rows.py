@@ -62,7 +62,6 @@ INIT_FAILURE_TIMEOUT_S = 300
 MIN_PODS = 2
 
 USABLE_BOUND_MS = l5.USABLE_TEND_INTERVALS * TEND_INTERVAL_MS
-POLL_BOUND_MS = 20
 LISTENER_WAIT_MS = 300000
 QUIET_WINDOW_MS = l5.QUIET_TEND_INTERVALS * TEND_INTERVAL_MS
 MIGRATION_WAIT_MS = 300000
@@ -474,14 +473,16 @@ def row_scale_up(env):
 			check("watch-usable", usable_ms is not None, node=node, **times)
 			check("answered-node", joined["node"] == node, node=node, answeredBy=joined["node"], address=joined["address"])
 			polls = [joined["bumpPollMs"], joined["answerPollMs"]]
-			check("poll-interval", all(p.isdigit() and int(p) <= POLL_BOUND_MS for p in polls),
-				bumpPollMs=joined["bumpPollMs"], answerPollMs=joined["answerPollMs"], boundMs=POLL_BOUND_MS)
+			check("poll-interval", all(p.isdigit() for p in polls), bumpPollMs=joined["bumpPollMs"],
+				answerPollMs=joined["answerPollMs"])
 			# The start is when a poll first saw the bump or the answer, up to one poll interval after it happened.
 			start_poll = int(joined["answerPollMs"] if answer_at >= bump_at else joined["bumpPollMs"])
 			check("usable-after-start", usable_ms >= -start_poll, measurementError=usable_ms < -start_poll, usableMs=usable_ms,
 				startAt=start_at, startPollMs=start_poll, **times, clockErrorMs=round(error))
-			check("usable-ms", usable_ms <= USABLE_BOUND_MS, node=node, usableMs=usable_ms, startAt=start_at, **times,
-				readyToAnswerMs=answer_at - ready_at, boundMs=USABLE_BOUND_MS)
+			inconclusive = usable_ms <= USABLE_BOUND_MS < usable_ms + start_poll
+			check("usable-ms", usable_ms + start_poll <= USABLE_BOUND_MS, node=node, usableMs=usable_ms, startAt=start_at,
+				**times, readyToAnswerMs=answer_at - ready_at, boundMs=USABLE_BOUND_MS, startPollMs=start_poll,
+				inconclusive=inconclusive)
 			env.wait_completed()
 			_, after, _ = shared_expected(env, "scale-up-after")
 			added = [p for p in after if p["pod"] == new_pod]
