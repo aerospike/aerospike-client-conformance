@@ -9,8 +9,9 @@
 # in an Amazon Linux 2023 container, then runs rows.py for the profile, which starts the manifest's
 # L5_DRIVER in a container on the client network only, applies the faults through l2ctl and decides
 # every row. When the manifest sets L2_RUN, it then runs once per profile in that container with the
-# topology's values file as its environment. Every container, network and image the run creates is
-# removed on exit, including on failure, and the run fails if any is left.
+# topology's values file as its environment, while node-server serves the nodes the test asks for.
+# Every container, network and image the run creates is removed on exit, including on failure, and
+# the run fails if any is left.
 #
 # Container names, network names and ports derive from --prefix and --port-base, so runs with
 # different values do not collide; the run checks that its names, ports and subnet are free first.
@@ -128,6 +129,8 @@ PROXY="$PREFIX-toxiproxy"
 CTL_CONTAINER="$PREFIX-ctl"
 BUILD_CONTAINER="$PREFIX-build"
 CLIENT_IMAGE="localhost/$PREFIX-client:latest"
+CONTROL_MOUNT=/l2-control
+NODE_SERVER_PID=""
 
 describe_profile() {
 	local profile=$1
@@ -145,6 +148,7 @@ describe_profile() {
 		*) echo "  advertises     private address only" ;;
 	esac
 	echo "  control        $CTL_CONTAINER (curl on $NODE_NETWORK); new-node listeners from port $EXTRA_PORT_BASE"
+	echo "  node requests  node-server during L2_RUN, at $CONTROL_MOUNT in the client container$([ "$profile" = pass-through-ports ] && echo "; alternate-port advertises $PASS_THROUGH_HOSTNAME")"
 	echo "  driver         $PREFIX-driver-<pid> from $CLIENT_IMAGE on $CLIENT_NETWORK only"
 	python3 "$SCRIPT_DIR/rows.py" --plan --profile "$profile" | sed 's/^L2-PLAN-ROW profile=[^ ]* /  row            /'
 }
@@ -216,6 +220,27 @@ secret_scan() {
 	[ $hits -eq 0 ]
 }
 
+start_node_server() {
+	mkdir -p "$STATE/control"
+	"$SCRIPT_DIR/node-server" "$STATE/control" "$CONTROL_MOUNT" "$RES" >"$RES/node-server.log" 2>&1 </dev/null &
+	NODE_SERVER_PID=$!
+	for _ in $(seq 300); do
+		[ ! -e "$STATE/control/ready" ] || return 0
+		kill -0 "$NODE_SERVER_PID" 2>/dev/null || break
+		sleep 0.1
+	done
+	cat "$RES/node-server.log" >&2
+	return 1
+}
+
+# Stopping the node server removes every node it started.
+stop_node_server() {
+	[ -n "$NODE_SERVER_PID" ] || return 0
+	kill "$NODE_SERVER_PID" 2>/dev/null
+	wait "$NODE_SERVER_PID" 2>/dev/null
+	NODE_SERVER_PID=""
+}
+
 remove_topology() {
 	local c n
 	for c in $(docker ps -aq --filter "name=^$PREFIX-" 2>/dev/null); do
@@ -231,6 +256,7 @@ cleanup() {
 	trap - EXIT
 	trap '' INT TERM
 	set +e
+	stop_node_server
 	remove_topology
 	docker image rm -f "$CLIENT_IMAGE" >/dev/null 2>&1
 	if [ -d "$WORK/client" ] && ! rm -rf "$WORK/client" 2>/dev/null; then
@@ -389,6 +415,7 @@ write_topology() {
 		echo "L2_CLIENT_HOSTS=${CLIENT_HOSTS:-}"
 		echo "L2_PROXY_CLIENT_ADDRESS=${PROXY_CLIENT_ADDRESS:-}"
 		echo "L2_ACCESS_HOSTNAME=${ACCESS_HOSTNAME:-}"
+		echo "L2_ALTERNATE_HOSTNAME=${ALTERNATE_HOSTNAME:-}"
 		echo "L2_EXTRA_PORT_BASE=$EXTRA_PORT_BASE"
 		echo "L2_SUBNET=$SUBNET"
 		echo "L2_OUTSIDE_OCTET=$OUTSIDE_OCTET"
@@ -417,6 +444,7 @@ write_values() {
 		echo "DISCOVERY_CLIENT_NETWORK_MTU=${MTU:-}"
 		echo "DISCOVERY_PROXY_PORT_RANGE=${PORT_RANGE:-}"
 		echo "DISCOVERY_IDLE_RESET=${IDLE_RESET:-}"
+		echo "DISCOVERY_CONTROL_DIR=$CONTROL_MOUNT"
 	} >"$state/values.env"
 }
 
@@ -435,6 +463,7 @@ build_topology() {
 	NODE_HOSTS=""
 	CLIENT_HOSTS=""
 	ACCESS_HOSTNAME=""
+	ALTERNATE_HOSTNAME=""
 	case "$profile" in
 		port-map-range) network_args=(--subnet "$SUBNET.0/24" --ip-range "$SUBNET.128/25") ;;
 		low-mtu)
@@ -515,6 +544,7 @@ build_topology() {
 				pass-through-ports)
 					PASS_THROUGH_BRANCH=B
 					ACCESS_HOSTNAME=$PASS_THROUGH_HOSTNAME
+					ALTERNATE_HOSTNAME=$PASS_THROUGH_HOSTNAME
 					hostnames=("$PASS_THROUGH_HOSTNAME")
 					;;
 			esac
@@ -644,12 +674,18 @@ for PROFILE in "${PROFILE_LIST[@]}"; do
 			run_hosts+=(--add-host "$entry")
 		done
 		set +e
-		# shellcheck disable=SC2016 # expanded in the client container
-		docker run --rm --name "$PREFIX-driver-run" --network "$CLIENT_NETWORK" "${run_hosts[@]+"${run_hosts[@]}"}" \
-			"${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"}" \
-			--env-file "$STATE/values.env" -e L2_PROFILE="$PROFILE" -v "$WORK/client:/client" -w /client "$CLIENT_IMAGE" \
-			bash -c 'set -a; . "./$0"; set +a; bash -c "$L2_RUN"' "$MANIFEST" </dev/null >"$RES/l2-run.log" 2>&1
-		run_rc=$?
+		if start_node_server; then
+			# shellcheck disable=SC2016 # expanded in the client container
+			docker run --rm --name "$PREFIX-driver-run" --network "$CLIENT_NETWORK" "${run_hosts[@]+"${run_hosts[@]}"}" \
+				"${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"}" -v "$STATE/control:$CONTROL_MOUNT" \
+				--env-file "$STATE/values.env" -e L2_PROFILE="$PROFILE" -v "$WORK/client:/client" -w /client "$CLIENT_IMAGE" \
+				bash -c 'set -a; . "./$0"; set +a; bash -c "$L2_RUN"' "$MANIFEST" </dev/null >"$RES/l2-run.log" 2>&1
+			run_rc=$?
+		else
+			echo "The node server did not start (node-server.log)" >"$RES/l2-run.log"
+			run_rc=1
+		fi
+		stop_node_server
 		set -e
 		if [ "$run_rc" -eq 0 ]; then
 			echo "L2_RUN $PROFILE PASS" | tee -a "$RESULTS/rows.txt"

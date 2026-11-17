@@ -124,6 +124,7 @@ Rows that assert on client internals stay in the client: the timeout fault on ea
 | `DISCOVERY_CLIENT_NETWORK_MTU`, `DISCOVERY_PROXY_PORT_RANGE` | `low-mtu` and `port-range`                                                                              |
 | `DISCOVERY_IDLE_RESET`                                       | `1` on `idle-reset`                                                                                     |
 | `DISCOVERY_TLS_ENDPOINT_PORTS`                               | Empty                                                                                                   |
+| `DISCOVERY_CONTROL_DIR`                                      | `/l2-control`, where the test writes node requests (below)                                              |
 
 `L2_PROFILE` names the profile. The test controls the faults through Toxiproxy's API, the same calls `l2ctl` makes:
 
@@ -137,6 +138,24 @@ curl -sf -X POST "$TOXIPROXY_URL/proxies/<listener>" -H 'Content-Type: applicati
 ```
 
 A test removes every toxic it adds and enables every listener it disables before it ends.
+
+### Node requests
+
+While `L2_RUN` runs, `node-server` runs on the host and serves node requests in the file format of [`discovery-node-server`](../.github/actions/discovery-node-server/README.md#requests), so a test that starts nodes there works unchanged. Its directory is mounted at `DISCOVERY_CONTROL_DIR`. The test writes one line to `<id>.tmp`, renames it to `<id>.request`, and reads `key=value` lines from `<id>.ack`; an `error` key is a failure.
+
+| Request                                        | Ack on success                                                         |
+| ---------------------------------------------- | ---------------------------------------------------------------------- |
+| `start [alternate-port=<port>] [address=<ip>]` | `container=<name>` and `address=<ip>`                                  |
+| `stop <name>`                                  | `removed=<name>`                                                       |
+| `status <name>`                                | `running`, `exit-code`, `log`, `lookup-in`, `lookup-exit` and `lookup` |
+
+- `start` runs a node with the cluster's config and mesh seeds through `l2ctl start-node`, named after the topology's nodes: `<prefix>-node-4`, then the next free number. It has no listener; the test adds one through Toxiproxy's API, upstream `<name>:3000`.
+- `alternate-port=<port>` advertises the profile's alternate hostname with that port: `as-pass-through.test` on `pass-through-ports`, which resolves in the servers unless the run has `--unresolved-hostname`. Other profiles have no alternate hostname and answer with an error.
+- `address=<ip>` gives the node that address; only `port-map-range` has a fixed subnet.
+- `stop <name>` removes a node this server started and refuses any other.
+- `status <name>` reports on a node of the topology: `running=true` or `false`, its `exit-code`, and `log`, the node's log at a path the test can read. On a profile with an alternate hostname it also looks that name up with `getent hosts`, in the node while it runs and otherwise in a new container from the server image on the node network: `lookup-in=container` or `image`, `lookup-exit` (`2` means not found) and `lookup`, its output on one line.
+
+The server stops when `L2_RUN` ends, and removes every node it started, so the profile's cleanup finds none.
 
 ## Running it locally
 
@@ -154,7 +173,7 @@ l2-proxy/run.sh --client-repo /path/to/aerospike-client-java --commit origin/plu
 - `--plan` prints each profile's topology and rows and creates nothing.
 - On a Podman machine the paths the containers mount (the work directory, results and cache) must be under a directory the machine shares, such as `/Users` or `/private`; `run.sh` resolves them to their real paths.
 
-Results go to `l2-proxy/results/<prefix>-<time>/` unless `--results` says otherwise: `client.txt`, `build.log`, `rows.txt` with one line per row, and per profile `build-topology.log`, `topology.log`, `values.env`, `status-before.txt`, `status-after.txt`, `rows.log`, each node's and Toxiproxy's log, and `l2-run.log` when the manifest sets `L2_RUN`. `cleanup.txt` lists anything with the prefix left after the run; the run fails if it is not empty. A profile whose topology could not be built is reported as `NOT RUN`.
+Results go to `l2-proxy/results/<prefix>-<time>/` unless `--results` says otherwise: `client.txt`, `build.log`, `rows.txt` with one line per row, and per profile `build-topology.log`, `topology.log`, `values.env`, `status-before.txt`, `status-after.txt`, `rows.log`, each node's and Toxiproxy's log, and `l2-run.log` and `node-server.log` when the manifest sets `L2_RUN`, with the log of every node the node server removed. `cleanup.txt` lists anything with the prefix left after the run; the run fails if it is not empty. A profile whose topology could not be built is reported as `NOT RUN`.
 
 ## From a workflow
 
