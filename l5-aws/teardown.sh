@@ -28,10 +28,11 @@ done
 export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION" AWS_PAGER=""
 
 remaining_resources() {
-	local arn id state
+	local arns arn id state
+	arns="$(aws resourcegroupstaggingapi get-resources --tag-filters "Key=$RUN_TAG,Values=$STACK" \
+		--query 'ResourceTagMappingList[].ResourceARN' --output text)" || return 1
 	# The tagging API lists deleted instances and volumes for a while; EC2 is authoritative for those.
-	for arn in $(aws resourcegroupstaggingapi get-resources --tag-filters "Key=$RUN_TAG,Values=$STACK" \
-		--query 'ResourceTagMappingList[].ResourceARN' --output text); do
+	for arn in $arns; do
 		[ "$arn" != "None" ] || continue
 		id="${arn##*/}"
 		case "$arn" in
@@ -91,7 +92,10 @@ delete_stack() {
 }
 
 rc=0
-status="$(aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo GONE)"
+if ! status="$(aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text 2>&1)"; then
+	[[ "$status" == *"does not exist"* ]] || die "cannot read the status of stack $STACK: $status"
+	status=GONE
+fi
 echo "Stack $STACK: $status"
 if [ "$status" != "GONE" ] && [ "$status" != "DELETE_COMPLETE" ]; then
 	L5_STACK="$STACK" L5_ENV=/dev/null "$SCRIPT_DIR/l5ctl" cleanup || rc=1
@@ -118,16 +122,23 @@ if [ "$status" != "GONE" ] && [ "$status" != "DELETE_COMPLETE" ]; then
 fi
 
 left=""
+listed=1
 ignored="$(mktemp)"
 for i in $(seq 1 20); do
-	left="$(remaining_resources 2>"$ignored")"
+	left="$(remaining_resources 2>"$ignored")" || {
+		listed=0
+		break
+	}
 	[ -n "$left" ] || break
 	[ "$i" -lt 20 ] && sleep 30
 done
 sort -u "$ignored"
 rm -f "$ignored"
 echo "aws resourcegroupstaggingapi get-resources --tag-filters Key=$RUN_TAG,Values=$STACK"
-if [ -n "$left" ]; then
+if [ "$listed" = 0 ]; then
+	echo "ERROR: cannot list the resources tagged $RUN_TAG=$STACK, so none were checked" >&2
+	rc=1
+elif [ -n "$left" ]; then
 	echo "ERROR: resources tagged $RUN_TAG=$STACK remain:" >&2
 	echo "$left" >&2
 	rc=1

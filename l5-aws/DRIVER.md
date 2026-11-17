@@ -4,9 +4,19 @@ Each client runs L5 through a driver: one executable in the client's repository 
 
 This document is for the engineer writing a client's driver, and is what the harness may rely on. Operating the harness is in [README.md](README.md).
 
-Contract version: **1**.
+Contract version: **5**.
 
-Status: the harness side is [`rows.py`](rows.py), which `run.sh` runs for each row when the manifest sets `L5_DRIVER`. A manifest without `L5_DRIVER` still runs its rows through `L5_RUN`, as described in the README.
+Changed from 4 to 5: a `--port-map` key may be an advertised `HOST:PORT` as well as a node name, and the `large` command writes and reads records of a given size. Version 5 includes the TLS flags of version 4.
+
+Changed from 3 to 4: the optional `--tls-name` and `--tls-ca-file` flags connect over TLS. A driver that reports version 3 or earlier has no TLS support; a harness still runs every row that needs no TLS with it, and skips the TLS rows.
+
+Changed from 2 to 3: each failed attempt of the load writes a `failure` with the `t` its attempt started, so the harness can tell an attempt sent before a routing change from one sent after it.
+
+Changed from 1 to 2: `watch` probes every address `HOST` resolves to, and `servingAt` is the start of the first of 3 consecutive rounds in which every address connected, where in 1 it was the start of the first attempt that connected to the first address. The `watch` reply adds `addresses`.
+
+Status: the harness side is [`rows.py`](rows.py), which `run.sh` runs for each row when the manifest sets `L5_DRIVER`. A manifest without `L5_DRIVER` still runs its rows through `L5_RUN`, as described in the README. The L2 harness, [`l2-proxy/rows.py`](../l2-proxy/rows.py), runs the same driver against a local proxy topology, and the L3 harness, [`l3-kind/rows.py`](../l3-kind/rows.py), against kind and the Aerospike Kubernetes Operator.
+
+A harness reads the version from `ready` and skips, with the reason, every row that needs a later version than the driver reports; a version 1 to 3 driver still runs every other row. `rows.py` here reads versions 1 to 5, `l2-proxy/rows.py` reads 1, 2, 3 and 5, and `l3-kind/rows.py` reads 1 to 5.
 
 ## Packaging
 
@@ -18,13 +28,14 @@ The client's manifest (see the README) sets:
 | `L5_BUILD`  | Once, after setup, to build the client and its driver                                                                                               |
 | `L5_DRIVER` | The driver command. The harness appends the flags below and runs it with `bash -c` from the repository root, as many times per row as the row needs |
 
-The runner is Amazon Linux 2023 on x86_64. The driver gets the harness environment (README), of which it needs only `AEROSPIKE_ADMIN_PASSWORD`.
+The runner is Amazon Linux 2023 on x86_64. The driver gets the harness environment (README), of which it needs only `AEROSPIKE_ADMIN_PASSWORD`. L2 runs the same commands in an Amazon Linux 2023 container, as described in [its README](../l2-proxy/README.md).
 
 ## Invocation
 
 ```text
 $L5_DRIVER --seed HOST:PORT --shape pass-through|port-map [--port-map NODE=HOST:PORT,...] [--on-miss strict|pass-through]
            [--user USER] --tend-interval MS --timeout MS --namespace NS --set SET [--workers N] [--keys N]
+           [--tls-name NAME --tls-ca-file PATH]
 ```
 
 | Flag                   | Meaning                                                                                                |
@@ -32,7 +43,7 @@ $L5_DRIVER --seed HOST:PORT --shape pass-through|port-map [--port-map NODE=HOST:
 | `--seed`               | The only seed host                                                                                     |
 | `--shape pass-through` | Use the services-alternate peer list, with the pass-through translator                                 |
 | `--shape port-map`     | Use the standard peer list, with the port-map translator built from `--port-map`                       |
-| `--port-map`           | Node name to `host:port`, comma separated. Only with `--shape port-map`                                |
+| `--port-map`           | Node name or advertised `HOST:PORT` to `host:port`, comma separated. Only with `--shape port-map`      |
 | `--on-miss`            | Translator miss mode. Default `strict`                                                                 |
 | `--user`               | User name; the password is `AEROSPIKE_ADMIN_PASSWORD`. Without it, no authentication                   |
 | `--tend-interval`      | Client tend interval in milliseconds                                                                   |
@@ -40,6 +51,12 @@ $L5_DRIVER --seed HOST:PORT --shape pass-through|port-map [--port-map NODE=HOST:
 | `--namespace`, `--set` | Where the load and `serve` write                                                                       |
 | `--workers`            | Concurrent load workers. Default 4                                                                     |
 | `--keys`               | Keys the load cycles over. Default 1000                                                                |
+| `--tls-name`           | Version 4. Connect to every node over TLS, validating its certificate against this name                |
+| `--tls-ca-file`        | Version 4. PEM file of the CA that signed the server certificates. Only with `--tls-name`              |
+
+A `--port-map` key that contains `:` is an advertised `HOST:PORT` (version 5), matched against the endpoint as the node advertises it on the standard list; any other key is a node name. Pass every key to the client's port-map translator as given.
+
+With `--tls-name`, the seed and every node are TLS endpoints: `--shape pass-through` uses the TLS services-alternate list, and the client validates each node's certificate against `--tls-name`, never against the host it dials. When the certificate does not match, the client is not created (exit status 3). Without `--tls-name`, connect in the clear.
 
 Map each flag to the client's own configuration of the same meaning. In Java, `pass-through` is `useServicesAlternate = true` with `PassThroughAddressTranslator.INSTANCE`, and `port-map` is `useServicesAlternate = false` with `new PortMapAddressTranslator(map)` and `translationOnMiss`.
 
@@ -50,7 +67,7 @@ Set the client's own command retries to zero. The driver retries, so the timing 
 Start the load once the client is created. Each of the `--workers` workers runs one command at a time, forever, until `quit`:
 
 - Worker `w` (from 0), iteration `i` (from 0) uses key `load-<k>` with `k = (w + i * workers) % keys`. An even `i` puts bin `v` with the integer `i`; an odd `i` gets the record.
-- An attempt fails on any error the client returns or raises. Count it in `failed`, keep its message as `lastError`, sleep one tend interval, and issue the same command again. Repeat until it succeeds.
+- An attempt fails on any error the client returns or raises. Count it in `failed`, keep its message as `lastError`, write a `failure` (Output), sleep one tend interval, and issue the same command again. Repeat until it succeeds.
 - A success counts in `succeeded`. Its latency is the time from its first attempt to its success. `maxLatencyMs` is the largest latency of the commands whose first attempt started at or after the last `reset`.
 
 On a worker runtime without threads, run the workers as concurrent tasks; each still has one command in flight.
@@ -69,7 +86,7 @@ Once, when the first load command has succeeded.
 {
 	"type": "ready",
 	"t": 812,
-	"contract": 1,
+	"contract": 5,
 	"epochMs": 1762189200123,
 	"client": "java",
 	"clientVersion": "9.2.0",
@@ -122,6 +139,21 @@ Every 100 ms, and immediately whenever the routing changes: a node is added or r
 
 Leave out a field the client cannot provide; never send a placeholder. The harness asserts on `unowned` only when it is present, and otherwise on `serve` and command latency.
 
+### `failure`
+
+Once for each failed attempt of the load, when it fails.
+
+```json
+{
+	"type": "failure",
+	"t": 19370,
+	"startedAt": 19110,
+	"message": "Node 2A0 10.80.1.25 30287: Timeout"
+}
+```
+
+`startedAt` is the `t` at the start of that attempt, not of the command's first attempt. `message` is the error message, as kept in `lastError`. An attempt that fails before `ready` counts in `failed` but writes no `failure`, since `ready` is the first line and `t` never goes back.
+
 ### `log`
 
 Each message the client logs at warning level or above.
@@ -130,7 +162,7 @@ Each message the client logs at warning level or above.
 { "type": "log", "t": 2210, "level": "WARN", "message": "..." }
 ```
 
-### `served`, `reset`, `watch`, `error`
+### `served`, `reset`, `watch`, `large`, `error`
 
 The replies to the commands below.
 
@@ -167,7 +199,7 @@ Restart `maxLatencyMs` and `longestUnownedMs` from now, and reply `{"type":"rese
 
 Measure how soon the client uses a node once its listener serves:
 
-1. Every 10 ms, resolve `HOST`, open a TCP connection to the first address it resolves to, at `PORT`, with a 50 ms connect timeout, and close it. An attempt does not try the other addresses: a new listener serves on one endpoint address before the others, so a probe that walks every address sets `servingAt` early and fails the bound for a client that is not slow. `servingAt` is the `t` at the start of the first attempt that connects; `lastClosedAt` is the `t` at the start of the last attempt that did not.
+1. Every 10 ms, resolve `HOST` and open a TCP connection to every address it resolves to, at `PORT`, each with a 50 ms connect timeout, concurrently, and close them. A round whose connects have not all finished before the next 10 ms tick delays that tick; rounds never overlap. `servingAt` is the `t` at the start of the first of 3 consecutive rounds in which every address connected; `lastClosedAt` is the `t` at the start of the last round in which any address did not connect. Every address is required because the client may connect to any of them, so the measurement starts only when none refuses.
 2. From `servingAt`, every 10 ms, check whether `NODE` is usable (Definitions). `usableAt` is the `t` of the first check where it is.
 3. Reply when `NODE` is usable, or 60000 ms after `servingAt`:
 
@@ -179,15 +211,45 @@ Measure how soon the client uses a node once its listener serves:
 	"node": "4A0",
 	"servingAt": 90150,
 	"lastClosedAt": 90140,
+	"addresses": [
+		{ "address": "10.80.1.25", "firstConnectedAt": 90100 },
+		{ "address": "10.80.2.31", "firstConnectedAt": 90130 },
+		{ "address": "10.80.3.17", "firstConnectedAt": 90150 }
+	],
 	"usableAt": 90400,
 	"usableMs": 250,
 	"ownershipChecked": true
 }
 ```
 
+`addresses` has one object per address `HOST` resolved to, in resolution order: `address`, the IP address, and `firstConnectedAt`, the `t` at the start of the first round in which it connected, or `null` if none did.
+
 `usableAt` and `usableMs` are `null` if the node did not become usable. `ownershipChecked` is false when the client does not expose its partition map. Probe and check in the driver, with no harness round trip; this is the one measurement whose bound, twice the tend interval, is too tight to rebuild from snapshots.
 
 One `watch` at a time; a second gets an `error` reply.
+
+### `large STEP BYTES KEYS`
+
+Version 5. Write and read `KEYS` keys, `STEP-0` to `STEP-<KEYS-1>`, each with bin `v` a string of exactly `BYTES` characters that starts with the key's name, one put then one get per key, one attempt each. Then reply:
+
+```json
+{
+	"type": "large",
+	"t": 7310,
+	"step": "mtu",
+	"bytes": 1048576,
+	"keys": 8,
+	"written": 8,
+	"read": 8,
+	"mismatched": 0,
+	"failures": 0,
+	"firstFailure": null,
+	"maxMs": 41,
+	"elapsedMs": 610
+}
+```
+
+`read` and `mismatched` count as for `serve`. `maxMs` is the longest single put or get.
 
 ### `quit`
 
@@ -231,3 +293,65 @@ printf 'serve smoke\nwatch 127.0.0.1:3000 <node>\nquit\n' | (sleep 5; cat) | \
 ```
 
 Expect `ready`; snapshots about every 100 ms with one node, active and reachable; `served` with 4096 written and read and no failures; `watch` with a `usableMs` near 0; and exit status 0. Leave `--user` out against a server without security.
+
+## Proposed, not in effect: contract version 6
+
+This section is a proposal. It is not part of the contract: a driver reports at most version 5, no harness reads a field or sends a command below, and versions 1 to 5 keep their meaning. Each item names the rows that need it; the L2 and L3 rows it lists do not exist yet, except where an existing row gains a check.
+
+A harness that adopts version 6 adds each check below as a row of its own, or as a check that runs only for a version 6 driver, so a version 5 driver is never failed for what it cannot report. A row that needs version 6 is skipped against a version 5 driver with the reason `the driver speaks contract 5; this row needs 6`, as rows that need version 4 or 5 are skipped today. A check that version 6 adds to an existing row is reported as an `L2-CHECK` or `L3-CHECK` line with `outcome=skip` and the same reason, and the row's other checks decide it.
+
+### `route STEP`
+
+The node the client sends each partition's commands to, from its own partition map, without sending a command. For each partition of `--namespace`, in partition order, the name of the node the client would send a write to, and the node it would send a read to with its replica policy set to the master. `null` when the client would send it nowhere. Reply:
+
+```json
+{
+	"type": "route",
+	"t": 6120,
+	"step": "after",
+	"partitions": 4096,
+	"write": ["1A0", "2A0", "..."],
+	"read": ["1A0", "2A0", "..."]
+}
+```
+
+A client that does not expose its partition map replies with `write` and `read` as `null`, and the rows that need them skip.
+
+Needed by a row in every L2 profile and every L3 profile, `writes-and-reads-go-to-each-partition-master`: after routing every node, `route` before and after `serve`, compared with the master each node reports through asinfo (`replicas`); every partition routes to the server's master, and the two replies agree, so the partition map did not change under the comparison. The L2 rows and the L3 rows that route a cluster they did not change already assert this from the server side, through the namespace statistics (no command proxied to another node). What `route` adds is the client's own choice, attributed per partition, which the server cannot report while it migrates partitions: the L3 rows that change the cluster (`scale-up-new-node-usable-within-two-tend-intervals`, `scale-down-removed-node-leaves-without-retry-storm`, `node-ports-stable-across-reschedule-and-recreate`, `rescheduled-pod-keeps-address-and-node-port`, `pod-on-recreated-node-advertises-cluster-address`) would compare `route` with the masters once migrations end, retrying within two tend intervals.
+
+### `kind` on `error`, `failure` and `log`
+
+Rows today accept any exit status 3 or any failed attempt, because the message text is the client's. Version 6 adds `kind`, one of a fixed set, alongside `message`:
+
+| Line      | `kind`                                                                                                                                                                         |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `error`   | `tls-name-mismatch`, `alternate-address-missing`, `peers-unreachable`, `seed-unreachable`, `authentication`, `other`                                                           |
+| `failure` | `timeout`, `connection`, `node-unavailable`, `other`                                                                                                                           |
+| `log`     | `translation-miss`, `translation-collision`, `other`; with `translation-*`, `nodes`: the node names the message names, and `address`: the advertised or translated `host:port` |
+
+| Rows                                                                                                                                             | Check                                                                               |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| L3 `tls-name-holds-every-node-endpoint-name-not-created`                                                                                         | The endpoint name as tls-name exits 3 with `tls-name-mismatch`, not any exit 3      |
+| L2 `empty-alternate-list-client-not-created`, `seed-without-alternate-client-not-created`                                                        | `alternate-address-missing`                                                         |
+| L2 `pass-through-miss-without-route-client-not-created`                                                                                          | `peers-unreachable`                                                                 |
+| L2 `silent-drop-attempts-time-out-within-bound-and-recover`                                                                                      | Every failed attempt is a `timeout`                                                 |
+| L2 `source-port-exhaustion-fails-within-bound-and-recovers`, `reset-peer-attempts-fail-within-bound-and-recover`                                 | Every failed attempt is a `connection` failure, not a `timeout`                     |
+| L2 `strict-miss-never-holds-the-unmapped-node`, `strict-never-holds-node-outside-range`, `pass-through-miss-holds-reachable-node-at-its-address` | A `translation-miss` naming the unmapped node in every window of two tend intervals |
+| L2 `port-map-colliding-nodes-never-held`, `colliding-alternate-nodes-never-held`, and `colliding-newcomer-never-held` once it runs               | A `translation-collision` naming both nodes and the shared `host:port`              |
+| L2 rows that route every node                                                                                                                    | No `translation-miss` or `translation-collision` line                               |
+
+### `tlsName` and `replicas` in `snapshot`
+
+- Each object in `nodes` adds `tlsName`: the name the client validates that node's certificate against, `null` in the clear. Needed by L3 `tls-name-holds-every-node-endpoint-name-not-created`: every node held under the cluster's tls-name.
+- With `owners`, `replicas`: for each node, the partitions of `--namespace` that name it in the client's map at any replica position. Needed by L3 `scale-down-removed-node-leaves-without-retry-storm`: the removed node leaves `replicas` as well as `owners`.
+
+### `nodes` and `blob` in `large`
+
+`large STEP BYTES KEYS [blob]`: with `blob`, bin `v` is `BYTES` bytes, the key's name followed by bytes of any value, instead of a string. The reply adds `nodes`, the name of the node each put was sent to, in key order. Needed by L2 `large-records-over-low-mtu-within-timeout`: a blob of 64 KiB and one of 1 MiB to every node.
+
+### Flags
+
+| Flag                       | Meaning                                                                                                | Needed by                                                                                                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `--on-miss client-default` | Leave the translator miss mode at the client's own default                                             | An L2 row on `reachable`: with no miss mode set, the unmapped reachable node is held at its advertised address (`pass-through`) |
+| `--seed-dns NAME`          | Seed from the addresses `NAME` resolves to through the client's DNS seed provider, instead of `--seed` | An L2 row seeding through a DNS name the topology serves, which l2-proxy would add                                              |

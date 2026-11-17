@@ -53,8 +53,9 @@ for raw in spec.get("raw", []):
 if "exit_before_ready" in spec:
 	out({"type": "error", "t": 0, "message": "client not created"})
 	sys.exit(spec["exit_before_ready"])
+contract = dict({"contract": 2}, **spec.get("ready_fields", {}))["contract"]
 if spec.get("ready", True):
-	out(dict({"type": "ready", "t": 0, "contract": 1, "epochMs": 0, "client": "fake", "clientVersion": "0",
+	out(dict({"type": "ready", "t": 0, "contract": 2, "epochMs": 0, "client": "fake", "clientVersion": "0",
 		"shape": shape}, **spec.get("ready_fields", {})))
 t = 0
 counters = {"succeeded": 0, "failed": 0, "clientErrors": 0, "clientTimeouts": 0}
@@ -73,7 +74,15 @@ while True:
 		if t - entered_t >= later["after_ms"]:
 			ph = dict(ph, **later)
 	counters["succeeded"] += ph.get("succeed", 10)
-	counters["failed"] += ph.get("fail", 0) + (ph.get("fail_first", 0) if first else 0)
+	failures = ph.get("fail", 0) + (ph.get("fail_first", 0) if first else 0)
+	counters["failed"] += failures
+	if contract >= 3:
+		for _ in range(failures):
+			failure = {"type": "failure", "t": t, "startedAt": entered_t + ph["started_ms"] if "started_ms" in ph else t - 500,
+				"message": ph.get("error", "timeout")}
+			for key in ph.get("failure_omit", []):
+				failure.pop(key, None)
+			out(failure)
 	counters["clientErrors"] += ph.get("errors", 0)
 	snapshot = {"type": "snapshot", "t": t, "reason": "change" if first else "heartbeat", "nodes": ph["nodes"],
 		"unowned": 0, "owners": {n["name"]: 1 for n in ph["nodes"]}, "longestUnownedMs": 0, "maxLatencyMs": 5,
@@ -106,8 +115,14 @@ while True:
 		else:
 			out({"type": "error", "t": t, "message": "unknown command: " + " ".join(words)})
 	if watch and name in spec.get("watch_phases", ["listener"]):
-		out(dict({"type": "watch", "t": t, "address": watch[0], "node": watch[1], "servingAt": t - 60,
-			"lastClosedAt": t - 70, "usableAt": t - 10, "usableMs": 50, "ownershipChecked": True}, **spec.get("watch", {})))
+		reply = {"type": "watch", "t": t, "address": watch[0], "node": watch[1], "servingAt": t - 60,
+			"lastClosedAt": t - 70, "addresses": [{"address": "127.0.0.1", "firstConnectedAt": t - 80},
+				{"address": "127.0.0.2", "firstConnectedAt": t - 60}],
+			"usableAt": t - 10, "usableMs": 50, "ownershipChecked": True}
+		reply.update(spec.get("watch", {}))
+		for key in spec.get("watch_omit", []):
+			reply.pop(key, None)
+		out(reply)
 		watch = None
 '''
 
@@ -416,8 +431,8 @@ class ContractTest(RowsTest):
 
 	def test_wrong_contract(self):
 		s = w1()
-		s["driver"]["ready_fields"] = {"contract": 2}
-		self.assertContract(*self.run_row("W-1", s), "ready with contract 2")
+		s["driver"]["ready_fields"] = {"contract": 6}
+		self.assertContract(*self.run_row("W-1", s), "ready with contract 6, harness speaks 1, 2, 3, 4 or 5")
 
 	def test_no_ready(self):
 		s = w1()
@@ -543,6 +558,34 @@ class W3Test(RowsTest):
 		self.assertIn("L5-CHECK check=routing step=served", out)
 		self.assertRestored()
 
+	def test_passes_with_addresses(self):
+		s = w3(self.port)
+		s["driver"]["watch"] = {"addresses": [{"address": "127.0.0.1", "firstConnectedAt": 5000},
+			{"address": "127.0.0.2", "firstConnectedAt": None}]}
+		code, out = self.run_row("W-3", s)
+		self.assertPasses(code, out)
+		usable = [line for line in out.splitlines() if line.startswith("L5-NODE-USABLE ")]
+		self.assertEqual(1, len(usable), out)
+		self.assertIn(" contract=2 addresses=127.0.0.1@5000,127.0.0.2@null ", usable[0])
+
+	def test_passes_contract_1(self):
+		s = w3(self.port)
+		s["driver"]["ready_fields"] = {"contract": 1}
+		s["driver"]["watch_omit"] = ["addresses"]
+		code, out = self.run_row("W-3", s)
+		self.assertPasses(code, out)
+		self.assertIn("L5-CHECK check=usable-ms", out)
+		usable = [line for line in out.splitlines() if line.startswith("L5-NODE-USABLE ")]
+		self.assertEqual(1, len(usable), out)
+		self.assertIn(" contract=1 addresses=- ", usable[0])
+		self.assertRestored()
+
+	def test_watch_without_addresses(self):
+		s = w3(self.port)
+		s["driver"]["watch_omit"] = ["addresses"]
+		self.assertContract(*self.run_row("W-3", s), "watch without addresses")
+		self.assertRestored()
+
 	def test_pending(self):
 		s = w3(self.port)
 		s["ctl"]["pending"] = {"lines": []}
@@ -653,6 +696,7 @@ class W5Test(RowsTest):
 		self.assertIn("L5-CHECK check=moved-off-zone address=10.0.0.1 ", out)
 		self.assertIn("L5-CHECK check=stays-off-zone address=10.0.0.1 t=null afterRunningMs=null nodes=null untilT=", out)
 		self.assertIn("L5-CHECK check=no-failures-after-move ", out)
+		self.assertIn(" basis=completion firstRiseAfterRunningMs=null ", out)
 		self.assertIn("L5-OUTAGE-DNS when=during name=127.0.0.1 address=10.0.0.1 resolvesToCut=false", out)
 
 	def test_passes_without_partition_map(self):
@@ -748,6 +792,77 @@ class W5Test(RowsTest):
 		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 60000, "fail": 1})
 		self.assertFailsCheck(*self.run_row("W-5", s), "no-failures-after-move")
 
+	def test_no_failures_after_move_before_outage_end(self):
+		s = w5()
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 200000, "fail": 1})
+		self.assertFailsCheck(*self.run_row("W-5", s), "no-failures-after-move")
+		failed = [line for line in self.output.splitlines() if line.startswith("L5-CHECK check=no-failures-after-move ")][0]
+		self.assertIn(" untilT=", failed)
+
+	def test_passes_when_failures_after_outage_end(self):
+		s = w5()
+		s["ctl"]["experiment"] = [{"lines": ["L5-FIS experiment={1} status=running"]}] * 30 + [
+			{"lines": ["L5-FIS experiment={1} status=completed"], "phase": "after"}]
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 310000, "fail": 1})
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		self.assertIn("L5-CHECK check=no-failures-after-move ", out)
+		self.assertIn(" firstRiseAfterRunningMs=null ", out)
+
+	def test_passes_contract_3_when_failures_started_before_move(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 3}
+		s["driver"]["phases"]["outage"]["later"] += [{"after_ms": 11000, "fail": 2, "started_ms": 9500},
+			{"after_ms": 13000, "fail": 0}]
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		self.assertIn("basis=start startedBeforeMove=4 startedAfterMove=0 firstStartAfterRunningMs=null message=null ",
+			out)
+
+	def test_no_failures_after_move_contract_3(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 3}
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 60000, "fail": 1, "error": "node-2A0-timeout"})
+		self.assertFailsCheck(*self.run_row("W-5", s), "no-failures-after-move", basis="start",
+			startedBeforeMove=0, message="node-2A0-timeout")
+		failed = [line for line in self.output.splitlines() if line.startswith("L5-CHECK check=no-failures-after-move ")][0]
+		fields = dict(word.split("=", 1) for word in failed.split()[1:])
+		self.assertGreater(int(fields["firstStartAfterRunningMs"]), 50000)
+		self.assertNotEqual("0", fields["startedAfterMove"])
+
+	def test_passes_contract_3_when_failures_start_after_outage_end(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 3}
+		s["ctl"]["experiment"] = [{"lines": ["L5-FIS experiment={1} status=running"]}] * 30 + [
+			{"lines": ["L5-FIS experiment={1} status=completed"], "phase": "after"}]
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 310000, "fail": 1})
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		self.assertIn(" basis=start startedBeforeMove=0 startedAfterMove=0 firstStartAfterRunningMs=null ", out)
+
+	def test_passes_contract_5_when_failures_started_before_move(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 5}
+		s["driver"]["phases"]["outage"]["later"] += [{"after_ms": 11000, "fail": 2, "started_ms": 9500},
+			{"after_ms": 13000, "fail": 0}]
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		self.assertIn("basis=start startedBeforeMove=4 startedAfterMove=0 firstStartAfterRunningMs=null message=null ",
+			out)
+
+	def test_no_failures_after_move_contract_5(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 5}
+		s["driver"]["phases"]["outage"]["later"].append({"after_ms": 60000, "fail": 1, "error": "node-2A0-timeout"})
+		self.assertFailsCheck(*self.run_row("W-5", s), "no-failures-after-move", basis="start",
+			startedBeforeMove=0, message="node-2A0-timeout")
+
+	def test_failure_without_started_at(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 3}
+		s["driver"]["phases"]["outage"]["failure_omit"] = ["startedAt"]
+		self.assertContract(*self.run_row("W-5", s), "failure without startedAt")
+
 	def test_experiment_wait(self):
 		s = w5()
 		s["ctl"]["experiment --wait"] = {"exit": 2, "stderr": "ERROR: FIS experiment E5 failed"}
@@ -762,6 +877,50 @@ class W5Test(RowsTest):
 		s = w5()
 		s["driver"]["served"] = {"read": 0, "mismatched": 4096}
 		self.assertFailsCheck(*self.run_row("W-5", s), "serve", step="after")
+
+
+class LaterContractTest(RowsTest):
+	def assertPassesWith(self, contract, row, scenario):
+		scenario["driver"]["ready_fields"] = {"contract": contract}
+		code, out = self.run_row(row, scenario)
+		self.assertPasses(code, out)
+		self.assertIn("L5-DRIVER-READY ", out)
+		self.assertIn(" contract=%d" % contract, out)
+		return out
+
+	def test_w1_contract_4(self):
+		out = self.assertPassesWith(4, "W-1", w1())
+		self.assertEqual(2, out.count("L5-CHECK check=serve "))
+
+	def test_w1_contract_5(self):
+		out = self.assertPassesWith(5, "W-1", w1())
+		self.assertEqual(2, out.count("L5-CHECK check=serve "))
+
+	def test_w2_contract_4(self):
+		out = self.assertPassesWith(4, "W-2", w2())
+		self.assertIn("L5-RECOVERY step=rollout", out)
+
+	def test_w2_contract_5(self):
+		out = self.assertPassesWith(5, "W-2", w2())
+		self.assertIn("L5-RECOVERY step=rollout", out)
+
+	def test_w3_contract_4(self):
+		out = self.assertPassesWith(4, "W-3", w3(free_port()))
+		self.assertIn(" contract=4 addresses=", out)
+		self.assertIn("L5-CHECK check=routing step=served", out)
+
+	def test_w3_contract_5(self):
+		out = self.assertPassesWith(5, "W-3", w3(free_port()))
+		self.assertIn(" contract=5 addresses=", out)
+		self.assertIn("L5-CHECK check=routing step=served", out)
+
+	def test_w5_contract_4(self):
+		out = self.assertPassesWith(4, "W-5", w5())
+		self.assertIn(" basis=start startedBeforeMove=", out)
+
+	def test_w5_contract_5(self):
+		out = self.assertPassesWith(5, "W-5", w5())
+		self.assertIn(" basis=start startedBeforeMove=", out)
 
 
 if __name__ == "__main__":

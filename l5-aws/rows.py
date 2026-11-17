@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 #
-# One L5 row (W-1, W-2, W-3 or W-5) through a client's driver (DRIVER.md, contract version 1). run.sh
-# runs it on the runner from the client checkout with the row environment of the README. It starts
-# the driver with bash -c from the current directory, sends it commands, reads its JSON lines and
-# makes every pass/fail call; it drives the cluster through $L5_CTL. Every interval it asserts on is
+# One L5 row (W-1, W-2, W-3 or W-5) through a client's driver (DRIVER.md, contract version 1 to 5).
+# run.sh runs it on the runner from the client checkout with the row environment of the README. It
+# starts the driver with bash -c from the current directory, sends it commands, reads its JSON lines
+# and makes every pass/fail call; it drives the cluster through $L5_CTL. Every interval it asserts on is
 # a difference of driver t values or a field the driver measured. Each check prints an L5-CHECK line
 # with its measurement, bound and outcome. The row leaves the cluster at the size it found it.
 #
@@ -23,7 +23,9 @@ import sys
 import threading
 import time
 
-CONTRACT = 1
+CONTRACTS = (1, 2, 3, 4, 5)
+# Tag of every line the shared driver code prints; l2-proxy/rows.py sets L2.
+TAG = "L5"
 NAMESPACE = "test"
 USER = "admin"
 CLUSTER_SIZE = 3
@@ -81,8 +83,10 @@ MESSAGE_FIELDS = {
 	"reset": (),
 	"watch": ("address", "node", "servingAt", "lastClosedAt", "usableAt", "usableMs", "ownershipChecked"),
 	"error": ("message",),
+	"failure": ("startedAt", "message"),
 }
 NODE_FIELDS = ("name", "host", "port", "address", "active", "reachable")
+WATCH_ADDRESS_FIELDS = ("address", "firstConnectedAt")
 UNOWNED_FIELDS = ("owners", "longestUnownedMs")
 SNAPSHOT_NUMBERS = ("succeeded", "failed", "maxLatencyMs", "unowned", "longestUnownedMs", "clientErrors",
 	"clientTimeouts")
@@ -125,7 +129,7 @@ def emit(tag, **fields):
 
 def check(name, ok, quiet=False, **fields):
 	if not ok or not quiet:
-		emit("L5-CHECK", check=name, **fields, outcome="pass" if ok else "fail")
+		emit(TAG + "-CHECK", check=name, **fields, outcome="pass" if ok else "fail")
 	if not ok:
 		raise RowFailure(name + ": " + " ".join("%s=%s" % (k, fmt(v)) for k, v in fields.items()))
 
@@ -134,15 +138,17 @@ def is_number(value):
 	return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def contract_problem(msg):
+def contract_problem(msg, contract=None, contracts=CONTRACTS, fields=MESSAGE_FIELDS):
 	if not isinstance(msg, dict):
 		return "not a JSON object"
 	kind = msg.get("type")
-	if kind not in MESSAGE_FIELDS:
+	if kind not in fields:
 		return "unknown type %r" % (kind,)
+	if kind == "failure" and (contract not in contracts or contract < 3):
+		return "failure from a driver without contract 3"
 	if not is_number(msg.get("t")):
 		return "%s without a numeric t" % kind
-	missing = [f for f in MESSAGE_FIELDS[kind] if f not in msg]
+	missing = [f for f in fields[kind] if f not in msg]
 	if kind == "snapshot":
 		if not isinstance(msg.get("nodes"), list):
 			return "snapshot nodes is not a list"
@@ -157,10 +163,23 @@ def contract_problem(msg):
 		bad = [f for f in SNAPSHOT_NUMBERS if f in msg and not is_number(msg[f])]
 		if bad:
 			return "snapshot %s not a number" % ",".join(bad)
+	if kind == "watch" and contract == 2:
+		if "addresses" not in msg:
+			missing.append("addresses")
+		elif not isinstance(msg["addresses"], list):
+			return "watch addresses is not a list"
+		else:
+			for entry in msg["addresses"]:
+				if not isinstance(entry, dict):
+					return "watch address is not an object"
+				missing += ["addresses[].%s" % f for f in WATCH_ADDRESS_FIELDS if f not in entry]
 	if missing:
 		return "%s without %s" % (kind, ",".join(missing))
-	if kind == "ready" and msg["contract"] != CONTRACT:
-		return "ready with contract %r, harness speaks %d" % (msg["contract"], CONTRACT)
+	if kind == "failure" and not is_number(msg["startedAt"]):
+		return "failure startedAt not a number"
+	if kind == "ready" and msg["contract"] not in contracts:
+		return "ready with contract %r, harness speaks %s or %s" % (msg["contract"],
+			", ".join(map(str, contracts[:-1])), contracts[-1])
 	return None
 
 
@@ -245,8 +264,9 @@ def kill_group(proc):
 class Driver:
 	"""A running driver: its messages in order, and the commands sent to it."""
 
-	def __init__(self, command, flags, shape, outcome):
+	def __init__(self, command, flags, shape, outcome, problem=contract_problem):
 		self.shape = shape
+		self.problem = problem
 		self.outcome = outcome
 		self.command = command + " " + " ".join(shlex.quote(f) for f in flags)
 		self.messages = []
@@ -256,7 +276,8 @@ class Driver:
 		self.status = None
 		self.quit_sent = False
 		self.ready = None
-		say("L5-DRIVER-START command=" + self.command)
+		self.contract = None
+		say(TAG + "-DRIVER-START command=" + self.command)
 		self.proc = subprocess.Popen(["bash", "-c", self.command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
 			stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, start_new_session=True)
 		self.threads = [threading.Thread(target=self._read, daemon=True),
@@ -290,7 +311,7 @@ class Driver:
 			raw = raw.rstrip("\n")
 			try:
 				msg = json.loads(raw)
-				problem = contract_problem(msg)
+				problem = self.problem(msg, self.contract)
 			except ValueError:
 				msg, problem = None, "non-JSON line on stdout: " + raw[:300]
 			with self.cond:
@@ -298,6 +319,8 @@ class Driver:
 					problem = "t went back from %s to %s" % (self.messages[-1]["t"], msg["t"])
 				if problem is None and msg["type"] == "ready" and msg["shape"] != self.shape:
 					problem = "ready for shape %r, started with %r" % (msg["shape"], self.shape)
+				if problem is None and msg["type"] == "ready":
+					self.contract = msg["contract"]
 				if problem is None:
 					msg["_index"] = len(self.messages)
 					self.messages.append(msg)
@@ -307,10 +330,10 @@ class Driver:
 			if problem is None and msg["type"] == "log":
 				emit("CLIENT-LOG", t=msg["t"], level=msg["level"], message=msg["message"])
 			elif problem is None and msg["type"] == "snapshot" and msg["reason"] == "change":
-				emit("L5-SNAPSHOT", t=msg["t"], nodes=describe(msg["nodes"]), unowned=msg.get("unowned"),
+				emit(TAG + "-SNAPSHOT", t=msg["t"], nodes=describe(msg["nodes"]), unowned=msg.get("unowned"),
 					failed=msg["failed"], succeeded=msg["succeeded"])
 			elif problem is None and msg["type"] == "error":
-				emit("L5-DRIVER-ERROR", t=msg["t"], message=msg["message"])
+				emit(TAG + "-DRIVER-ERROR", t=msg["t"], message=msg["message"])
 		status = self.proc.wait()
 		with self.cond:
 			self.exited = True
@@ -378,12 +401,12 @@ class Driver:
 		if ready is None:
 			raise ContractError("no ready within %d ms of the driver's first t" % READY_WAIT_MS)
 		self.ready = ready
-		emit("L5-DRIVER-READY", t=ready["t"], client=ready["client"], clientVersion=ready["clientVersion"],
+		emit(TAG + "-DRIVER-READY", t=ready["t"], client=ready["client"], clientVersion=ready["clientVersion"],
 			shape=ready["shape"], contract=ready["contract"])
 
 	def send(self, command):
 		self._raise_if_broken()
-		emit("L5-DRIVER-COMMAND", t=self.mark()[1], command=command)
+		emit(TAG + "-DRIVER-COMMAND", t=self.mark()[1], command=command)
 		try:
 			self.proc.stdin.write(command + "\n")
 			self.proc.stdin.flush()
@@ -416,7 +439,7 @@ class Driver:
 			try:
 				self.proc.wait(QUIT_WAIT_MS / 1000)
 			except subprocess.TimeoutExpired:
-				emit("L5-DRIVER-KILLED", reason="no exit within %d ms of quit" % QUIT_WAIT_MS)
+				emit(TAG + "-DRIVER-KILLED", reason="no exit within %d ms of quit" % QUIT_WAIT_MS)
 				kill_group(self.proc)
 				self.proc.wait()
 		kill_group(self.proc)
@@ -428,7 +451,7 @@ class Driver:
 			except OSError:
 				pass
 		status = self.proc.returncode
-		emit("L5-DRIVER-EXIT", status=status, afterQuit=not before_quit)
+		emit(TAG + "-DRIVER-EXIT", status=status, afterQuit=not before_quit)
 		if self.violation is not None:
 			raise ContractError("driver broke the contract: " + self.violation)
 		if before_quit and self.ready is None and status == 3:
@@ -444,7 +467,7 @@ class Outcome:
 	def record(self, error):
 		status = 3 if isinstance(error, ContractError) else 1
 		self.status = max(self.status, status)
-		emit("L5-FAILED", kind="contract" if status == 3 else "assertion", reason=str(error))
+		emit(TAG + "-FAILED", kind="contract" if status == 3 else "assertion", reason=str(error))
 
 	def guard(self, step, *args):
 		try:
@@ -555,6 +578,12 @@ def tcp_connects(host, port, timeout_ms):
 			return True
 	except OSError:
 		return False
+
+
+def probed(contract, reply):
+	if contract == 1:
+		return "-"
+	return ",".join("%s@%s" % (a["address"], fmt(a["firstConnectedAt"])) for a in reply["addresses"]) or "-"
 
 
 def await_routing(drv, step, expected, bound_ms):
@@ -761,9 +790,10 @@ def row_w3(env):
 			reply, waited = drv.reply("watch", LISTENER_WAIT_MS, (watch_mark[0], sync_t))
 			check("watch-reply", reply is not None, address=address, node=node, waitedMs=waited,
 				boundMs=LISTENER_WAIT_MS)
-			emit("L5-NODE-USABLE", pod=pod, node=node, advertised=address, servingAt=reply["servingAt"],
-				lastClosedAt=reply["lastClosedAt"], usableAt=reply["usableAt"], usableMs=reply["usableMs"],
-				ownershipChecked=reply["ownershipChecked"], tendInterval=TEND_INTERVAL_MS)
+			emit("L5-NODE-USABLE", pod=pod, node=node, advertised=address, contract=drv.contract,
+				addresses=probed(drv.contract, reply), servingAt=reply["servingAt"], lastClosedAt=reply["lastClosedAt"],
+				usableAt=reply["usableAt"], usableMs=reply["usableMs"], ownershipChecked=reply["ownershipChecked"],
+				tendInterval=TEND_INTERVAL_MS)
 			check("watch-usable", reply["usableAt"] is not None and reply["usableMs"] is not None, node=node,
 				servingAt=reply["servingAt"], usableAt=reply["usableAt"])
 			budget_ms = USABLE_TEND_INTERVALS * TEND_INTERVAL_MS
@@ -841,9 +871,16 @@ def row_w5(env):
 			failed_at_running = drv.between(0, reset["_index"])[-1]["failed"]
 			seen = {"status": "running", "next": running_t + STATUS_POLL_MS, "halfway": False, "unowned": False,
 				"longestUnownedMs": 0, "maxLatencyMs": 0, "stretch": None, "resolved": None, "moved": None, "back": None,
-				"rise": None}
+				"rise": None, "startedBeforeMove": 0, "startedAfterMove": 0, "firstStartAfterMove": None}
 
 			def during(msg):
+				if msg["type"] == "failure" and seen["moved"] is not None:
+					if msg["startedAt"] < seen["moved"]["t"]:
+						seen["startedBeforeMove"] += 1
+					elif msg["startedAt"] < until_t:
+						seen["startedAfterMove"] += 1
+						if seen["firstStartAfterMove"] is None:
+							seen["firstStartAfterMove"] = msg
 				if msg["type"] != "snapshot":
 					return None
 				if "unowned" in msg:
@@ -868,7 +905,7 @@ def row_w5(env):
 				else:
 					if on_zone and seen["back"] is None and msg["t"] < until_t:
 						seen["back"] = {"t": msg["t"], "nodes": describe(on_zone)}
-					if msg["failed"] > seen["moved"]["failed"] and seen["rise"] is None:
+					if msg["failed"] > seen["moved"]["failed"] and seen["rise"] is None and msg["t"] < until_t:
 						seen["rise"] = msg
 				if not seen["halfway"] and msg["t"] - running_t >= OUTAGE_DURATION_MS // 2:
 					seen["halfway"] = True
@@ -903,9 +940,17 @@ def row_w5(env):
 			back = seen["back"] or {}
 			check("stays-off-zone", not back, address=address, t=back.get("t"),
 				afterRunningMs=back["t"] - running_t if back else None, nodes=back.get("nodes"), untilT=until_t)
-			rise = seen["rise"]
-			check("no-failures-after-move", rise is None, failedAtMove=moved["failed"], failedAtEnd=last["failed"],
-				firstRiseAfterRunningMs=rise and rise["t"] - running_t, lastError=last["lastError"])
+			if drv.contract >= 3:
+				first = seen["firstStartAfterMove"]
+				check("no-failures-after-move", first is None, failedAtMove=moved["failed"], failedAtEnd=last["failed"],
+					basis="start", startedBeforeMove=seen["startedBeforeMove"], startedAfterMove=seen["startedAfterMove"],
+					firstStartAfterRunningMs=first and first["startedAt"] - running_t, message=first and first["message"],
+					lastError=last["lastError"], untilT=until_t)
+			else:
+				rise = seen["rise"]
+				check("no-failures-after-move", rise is None, failedAtMove=moved["failed"], failedAtEnd=last["failed"],
+					basis="completion", firstRiseAfterRunningMs=rise and rise["t"] - running_t, lastError=last["lastError"],
+					untilT=until_t)
 
 			env.ctl.ok(EXPERIMENT_WAIT_MS, "experiment", experiment, "--wait", name="experiment-wait")
 			state["ended"] = True

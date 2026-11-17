@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # One L5 run on AWS for one client, from the operator's machine. Creates stack.yaml as a uniquely
-# named stack, installs AKO 4.6.0 and the AerospikeCluster from the runner with l5ctl, adds one NLB
+# named stack, installs AKO and the AerospikeCluster from the runner with l5ctl, adds one NLB
 # listener per pod NodePort and checks where the endpoint name resolves. On the runner, over EC2
 # Instance Connect, it checks out the client, runs the manifest's setup and build commands and runs
 # each row once: through rows.py with the manifest's driver (L5_DRIVER, DRIVER.md) when it sets one,
@@ -11,6 +11,10 @@
 #
 # --control resolvable makes the endpoint name resolvable in the producer VPC too, for W-1 on a
 # released server. --control unresolvable runs no rows and passes only if the server fails to start.
+# --ako-version latest (the default) installs the newest released AKO chart from --ako-helm-repo.
+# --alternate-access configured-ip (the default) labels every Aerospike node with the endpoint name for
+# AKO's configuredIP; nlb sets networkLoadBalancer at the endpoint name with no node label, and with
+# --one-pod-per-host also multiPodPerHost false.
 # --plan validates the arguments and prints what would be created, with no AWS call.
 # --stack reuses a stack left by --keep instead of creating one; it is deleted at the end unless
 # --keep is given again.
@@ -23,6 +27,8 @@
 #
 # Usage: l5-aws/run.sh --client-repo <https url> --commit <sha> --manifest <path in the client repo>
 #                      --server-image <image> [--rows W-1,W-3,W-2,W-5] [--registry-auth <file>]
+#                      [--ako-version <chart version>|latest] [--ako-helm-repo <url>]
+#                      [--alternate-access configured-ip|nlb] [--one-pod-per-host]
 #                      [--control resolvable|unresolvable] [--stack <kept stack>] [--keep] [--plan]
 
 set -euo pipefail
@@ -50,6 +56,10 @@ MANIFEST=""
 SERVER_IMAGE=""
 ROWS="W-1,W-3,W-2,W-5"
 REGISTRY_AUTH=""
+AKO_VERSION=latest
+AKO_HELM_REPO=https://aerospike.github.io/aerospike-kubernetes-operator
+ALTERNATE_ACCESS=configured-ip
+ONE_POD_PER_HOST=0
 CONTROL=""
 KEEP=0
 EXISTING_STACK=""
@@ -62,6 +72,10 @@ while [ $# -gt 0 ]; do
 		--server-image) SERVER_IMAGE="${2:-}"; shift ;;
 		--rows) ROWS="${2:-}"; shift ;;
 		--registry-auth) REGISTRY_AUTH="${2:-}"; shift ;;
+		--ako-version) AKO_VERSION="${2:-}"; shift ;;
+		--ako-helm-repo) AKO_HELM_REPO="${2:-}"; shift ;;
+		--alternate-access) ALTERNATE_ACCESS="${2:-}"; shift ;;
+		--one-pod-per-host) ONE_POD_PER_HOST=1 ;;
 		--control) CONTROL="${2:-}"; shift ;;
 		--stack) EXISTING_STACK="${2:-}"; shift ;;
 		--keep) KEEP=1 ;;
@@ -71,6 +85,15 @@ while [ $# -gt 0 ]; do
 	shift
 done
 [[ "$SERVER_IMAGE" =~ ^[A-Za-z0-9._:/@-]+$ ]] || die "--server-image is required"
+[[ "$AKO_VERSION" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?)$ ]] ||
+	die "--ako-version must be latest or a chart version like 4.6.0"
+[[ "$AKO_HELM_REPO" =~ ^https://[A-Za-z0-9./_-]+$ ]] || die "--ako-helm-repo must be an https URL"
+case "$ALTERNATE_ACCESS" in
+	configured-ip) NODE_LABEL=true ;;
+	nlb) NODE_LABEL=false ;;
+	*) die "--alternate-access must be configured-ip or nlb" ;;
+esac
+[ "$ONE_POD_PER_HOST" = "0" ] || [ "$ALTERNATE_ACCESS" = "nlb" ] || die "--one-pod-per-host needs --alternate-access nlb"
 case "$CONTROL" in
 	"" | resolvable | unresolvable) ;;
 	*) die "--control must be resolvable or unresolvable" ;;
@@ -114,11 +137,17 @@ STACK="${EXISTING_STACK:-l5-aws-$(date -u +%Y%m%d-%H%M%S)}"
 if [ "$PLAN" = "1" ]; then
 	echo "Plan, no AWS call made:"
 	echo "  stack          $STACK in $AWS_REGION, profile $AWS_PROFILE, template $SCRIPT_DIR/stack.yaml"
-	echo "  creates        producer VPC (EKS $(sed -n '/^  KubernetesVersion:/,/Default:/s/^ *Default: *//p' "$SCRIPT_DIR/stack.yaml" | tr -d '"'), one system and three Spot node groups, internal NLB, endpoint service),"
+	echo "  creates        producer VPC (EKS $(sed -n '/^  KubernetesVersion:/,/Default:/s/^ *Default: *//p' "$SCRIPT_DIR/stack.yaml" | tr -d '"'), one system and three Aerospike node groups (Spot in zone A, on-demand in B and C), internal NLB, endpoint service),"
 	echo "                 consumer VPC (interface endpoint, private hosted zone, runner with an Elastic IP), IAM roles for EKS, nodes, FIS and the runner"
 	echo "  boundary       $AWS_PERMISSIONS_BOUNDARY"
 	echo "  producer zone  $PRODUCER_RECORD"
 	echo "  server image   $SERVER_IMAGE${REGISTRY_AUTH:+ (pull secret from $REGISTRY_AUTH)}"
+	echo "  AKO            $AKO_VERSION from $AKO_HELM_REPO$([ "$AKO_VERSION" = "latest" ] && echo " (newest released chart)")"
+	if [ "$ALTERNATE_ACCESS" = "nlb" ]; then
+		echo "  access         nlb: networkLoadBalancer at the endpoint name, multiPodPerHost $([ "$ONE_POD_PER_HOST" = "1" ] && echo false || echo true), no node label"
+	else
+		echo "  access         configured-ip: configuredIP, multiPodPerHost true, endpoint name as node label"
+	fi
 	if [ "$CONTROL" = "unresolvable" ]; then
 		echo "  rows           none; passes only if the server fails to start"
 	elif [ ${#ROW_LIST[@]} -eq 0 ]; then
@@ -141,14 +170,32 @@ if [ ${#ROW_LIST[@]} -gt 0 ] && [[ "${CLIENT_REPO%.git}" =~ ^https://github\.com
 	curl -sfI -m 20 "https://raw.githubusercontent.com/${BASH_REMATCH[1]}/$COMMIT/$MANIFEST" >/dev/null ||
 		die "$MANIFEST not found at $COMMIT in $CLIENT_REPO; use --rows none for the environment only"
 fi
+# Read the chosen chart's CRD now, since a chart without networkLoadBalancer fails only at install.
+if [ "$ALTERNATE_ACCESS" = "nlb" ]; then
+	ako_chart="$(curl -sf -m 30 "${AKO_HELM_REPO%/}/index.yaml" | awk '
+		/^  [^ -]/ { chart = ($0 == "  aerospike-kubernetes-operator:") }
+		chart && /^    - https?:\/\/.*\.tgz$/ { url = $2 }
+		chart && /^    version: / { print $2, url }')" || die "cannot read $AKO_HELM_REPO/index.yaml"
+	if [ "$AKO_VERSION" = "latest" ]; then
+		ako_chart="$(grep -v '^[^ ]*-' <<<"$ako_chart" | sort -V | tail -1)"
+	else
+		ako_chart="$(awk -v v="$AKO_VERSION" '$1 == v' <<<"$ako_chart")"
+	fi
+	[ -n "$ako_chart" ] || die "AKO chart $AKO_VERSION not found in $AKO_HELM_REPO"
+	curl -sf -m 60 "${ako_chart#* }" | tar -xzOf - \
+		aerospike-kubernetes-operator/crds/customresourcedefinition_aerospikeclusters.asdb.aerospike.com.yaml |
+		grep -- '- networkLoadBalancer$' >/dev/null ||
+		die "AKO ${ako_chart%% *} does not offer alternateAccess networkLoadBalancer; --alternate-access nlb needs an --ako-version that does (4.8.0-dev1 today)"
+	echo "AKO ${ako_chart%% *} offers networkLoadBalancer"
+fi
 
 OPERATOR="${CALLER##*/}"
 live="$(aws cloudformation list-stacks --stack-status-filter CREATE_IN_PROGRESS CREATE_COMPLETE ROLLBACK_IN_PROGRESS \
 	UPDATE_IN_PROGRESS UPDATE_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_COMPLETE UPDATE_ROLLBACK_IN_PROGRESS \
 	UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_ROLLBACK_COMPLETE \
 	--query "StackSummaries[?starts_with(StackName,'l5-aws-')].[StackName,StackId,StackStatus,CreationTime]" --output text)" ||
-	die "cannot list stacks in $AWS_REGION, so the check for another live L5 run could not run"
-blocking=""
+	die "cannot list stacks in $AWS_REGION"
+others=""
 while read -r live_name live_id live_status live_created; do
 	[ -n "$live_name" ] && [ "$live_name" != "$EXISTING_STACK" ] || continue
 	owner="$(aws cloudformation describe-stacks --stack-name "$live_id" \
@@ -160,13 +207,32 @@ while read -r live_name live_id live_status live_created; do
 	[ -n "$owner" ] && [ "$owner" != "None" ] || owner=unknown
 	live_created="${live_created%%.*}"
 	live_created="${live_created%+00:00}Z"
-	if [ "$owner" = "$OPERATOR" ]; then
-		echo "Your stack $live_name is also live ($live_status, created $live_created)"
-	else
-		blocking+=$'\n'"  $live_name  $live_status  created $live_created  by $owner"
-	fi
+	others+=$'\n'"  $live_name  $live_status  created $live_created  by $owner"
 done <<<"$live"
-[ -z "$blocking" ] || die "another L5 run is live in $AWS_REGION:$blocking"$'\n'"Wait for it to finish or ask its owner; a kept stack is deleted with teardown.sh <stack name>."
+
+short=""
+check_capacity() {
+	local label=$1 type=$2 service=$3 code=$4 count=$5 key=$6 needed limit in_use
+	needed="$(grep -c "^    Type: AWS::EC2::$type\$" "$SCRIPT_DIR/stack.yaml")" || needed=0
+	limit="$(aws service-quotas get-service-quota --service-code "$service" --quota-code "$code" \
+		--query Quota.Value --output text 2>/dev/null)" ||
+		limit="$(aws service-quotas get-aws-default-service-quota --service-code "$service" --quota-code "$code" \
+			--query Quota.Value --output text 2>/dev/null)" ||
+		die "cannot read the $label quota ($service $code) in $AWS_REGION, so the capacity check could not run"
+	limit="${limit%%.*}"
+	in_use="$(aws ec2 "$count" --query "length($key)" --output text)" ||
+		die "cannot count $label in $AWS_REGION, so the capacity check could not run"
+	[[ "$limit" =~ ^[0-9]+$ && "$in_use" =~ ^[0-9]+$ ]] ||
+		die "unexpected $label quota '$limit' or count '$in_use', so the capacity check could not run"
+	[ $((in_use + needed)) -le "$limit" ] || short+=$'\n'"  $label $in_use of $limit in use, this run needs $needed"
+}
+if [ -z "$EXISTING_STACK" ]; then
+	check_capacity VPCs VPC vpc L-F678F1CE describe-vpcs Vpcs
+	check_capacity "internet gateways" InternetGateway vpc L-A4707A72 describe-internet-gateways InternetGateways
+	check_capacity "Elastic IPs" EIP ec2 L-0263D0A3 describe-addresses Addresses
+	[ -z "$short" ] || die "not enough capacity in $AWS_REGION for another L5 run:$short"$'\n'"Live L5 stacks:${others:- none}"$'\n'"Wait for one to finish, ask its owner, raise the quota, or run in another AWS_REGION."
+fi
+[ -z "$others" ] || echo "Live L5 stacks in $AWS_REGION:$others"
 
 RESULTS="$SCRIPT_DIR/results/$STACK"
 WORK="$(mktemp -d)"
@@ -177,6 +243,8 @@ echo "Caller:  $CALLER"
 echo "Region:  $AWS_REGION"
 echo "Stack:   $STACK"
 echo "Server:  $SERVER_IMAGE"
+echo "AKO:     $AKO_VERSION from $AKO_HELM_REPO"
+echo "Access:  $ALTERNATE_ACCESS$([ "$ONE_POD_PER_HOST" = "1" ] && echo ", one pod per host")"
 echo "Control: ${CONTROL:-none}"
 echo "SSH from $OPERATOR_IP/32"
 
@@ -204,7 +272,11 @@ cleanup() {
 			echo "  AWS_PROFILE=$AWS_PROFILE AWS_REGION=$AWS_REGION $SCRIPT_DIR/teardown.sh $STACK"
 		else
 			"$SCRIPT_DIR/teardown.sh" "$STACK" 2>&1 | tee "$RESULTS/cleanup.txt"
-			[ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
+			if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+				rc=1
+				echo "Teardown failed; the stack may still exist. Once the credentials work, run it again with:"
+				echo "  AWS_PROFILE=$AWS_PROFILE AWS_REGION=$AWS_REGION $SCRIPT_DIR/teardown.sh $STACK"
+			fi
 		fi
 	fi
 	secret_scan || rc=1
@@ -227,7 +299,8 @@ else
 		--capabilities CAPABILITY_IAM --tags "Key=$RUN_TAG,Value=$STACK" "Key=$OPERATOR_TAG,Value=$OPERATOR" \
 		--parameters "ParameterKey=OperatorCidr,ParameterValue=$OPERATOR_IP/32" \
 		"ParameterKey=PermissionsBoundaryArn,ParameterValue=$AWS_PERMISSIONS_BOUNDARY" \
-		"ParameterKey=ProducerRecord,ParameterValue=$PRODUCER_RECORD" >/dev/null
+		"ParameterKey=ProducerRecord,ParameterValue=$PRODUCER_RECORD" \
+		"ParameterKey=NodeLabel,ParameterValue=$NODE_LABEL" >/dev/null
 	echo "Waiting for stack create (EKS takes 15 to 20 minutes)"
 	if ! aws cloudformation wait stack-create-complete --stack-name "$STACK"; then
 		# shellcheck disable=SC2016 # backticks are JMESPath literals
@@ -246,12 +319,15 @@ RUNNER_IP="$(output RunnerPublicIp)"
 ENDPOINT_NAME="$(output EndpointName)"
 [ "$(output ProducerRecord)" = "$PRODUCER_RECORD" ] ||
 	die "stack $STACK has ProducerRecord=$(output ProducerRecord), this run needs $PRODUCER_RECORD"
+[ "$(output NodeLabel)" = "$NODE_LABEL" ] ||
+	die "stack $STACK has NodeLabel=$(output NodeLabel), --alternate-access $ALTERNATE_ACCESS needs $NODE_LABEL"
 {
 	echo "L5_STACK=$STACK"
 	echo "AWS_REGION=$AWS_REGION"
 	echo "L5_CLUSTER=$(output ClusterName)"
 	echo "L5_ENDPOINT_NAME=$ENDPOINT_NAME"
 	echo "L5_PRODUCER_RECORD=$(output ProducerRecord)"
+	echo "L5_ALTERNATE_ACCESS=$ALTERNATE_ACCESS"
 	echo "L5_NLB_ARN=$(output NlbArn)"
 	echo "L5_PRODUCER_VPC=$(output ProducerVpcId)"
 	echo "L5_NODEGROUPS=$(output AerospikeNodegroups)"
@@ -323,7 +399,9 @@ helm version
 aws --version
 EOF
 
-install_args=(--server-image "$SERVER_IMAGE" --features-conf l5/features.conf)
+install_args=(--server-image "$SERVER_IMAGE" --features-conf l5/features.conf --ako-version "$AKO_VERSION"
+	--ako-helm-repo "$AKO_HELM_REPO" --alternate-access "$ALTERNATE_ACCESS")
+[ "$ONE_POD_PER_HOST" = "0" ] || install_args+=(--one-pod-per-host)
 [ -z "$REGISTRY_AUTH" ] || install_args+=(--registry-auth l5/registry-auth.json)
 [ "$CONTROL" != "unresolvable" ] || install_args+=(--expect-start-failure)
 echo "Installing AKO and the AerospikeCluster"
@@ -402,9 +480,21 @@ grep -E '^(Commit|Rows): ' "$RESULTS/build.log"
 # Each row starts on a Completed cluster with a healthy listener per NodePort. rows.py with the
 # manifest's L5_DRIVER, or else its L5_RUN, runs from the client checkout with the manifest and the
 # environment loaded.
+credentials_fail() {
+	local err
+	err="$(aws sts get-caller-identity --query Account --output text 2>&1 >/dev/null | sed '/^$/d' | paste -sd' ' -)" &&
+		return 1
+	echo "AWS credentials of profile $AWS_PROFILE stopped working ($err); run aws sso login, then rerun the row with --stack $STACK"
+}
+
 failed=0
 for row in "${ROW_LIST[@]}"; do
 	echo "Row $row"
+	if reason="$(credentials_fail)"; then
+		echo "ROW $row NOT RUN: $reason" | tee -a "$RESULTS/rows.txt"
+		failed=1
+		continue
+	fi
 	row_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	remote_script "$MANIFEST" "$row" "${CONTROL:-none}"
 	set +e
@@ -442,15 +532,21 @@ EOF
 	REMOTE_COMMAND=(l5/l5ctl status)
 	remote >"$RESULTS/$row-status.txt" 2>&1 || true
 	REMOTE_COMMAND=(l5/l5ctl interruptions "$row_start")
-	remote >"$RESULTS/$row-interruptions.txt" 2>&1 || echo "L5-INTERRUPTED unknown: interruptions check failed" >>"$RESULTS/$row-interruptions.txt"
-	interrupted="$(grep -c '^L5-INTERRUPTED' "$RESULTS/$row-interruptions.txt" || true)"
+	if remote >"$RESULTS/$row-interruptions.txt" 2>&1; then
+		interrupted="$(grep -c '^L5-INTERRUPTED' "$RESULTS/$row-interruptions.txt" || true)"
+	else
+		interrupted=unknown
+	fi
 	if [ "$row_rc" -eq 0 ]; then
 		echo "ROW $row PASS (unplanned Spot interruptions: $interrupted)" | tee -a "$RESULTS/rows.txt"
 	else
-		reason="$(grep -m1 '^L5-FAILED' "$RESULTS/$row.log" | cut -c1-200 || true)"
+		reason="$(credentials_fail)" || reason="$(grep -m1 '^L5-FAILED' "$RESULTS/$row.log" | cut -c1-200 || true)"
 		line="ROW $row FAIL exit=$row_rc (see $row.log)${reason:+: $reason}"
-		[ "$interrupted" -eq 0 ] ||
+		if [ "$interrupted" = unknown ]; then
+			line+="; the Spot interruption check failed (see $row-interruptions.txt)"
+		elif [ "$interrupted" -gt 0 ]; then
 			line+="; $interrupted unplanned Spot interruption(s) during the row, rerun it (see $row-interruptions.txt)"
+		fi
 		echo "$line" | tee -a "$RESULTS/rows.txt"
 		failed=1
 	fi
