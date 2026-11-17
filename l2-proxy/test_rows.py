@@ -491,8 +491,15 @@ class EmptyAlternateTest(RowsTest):
 	row = "empty-alternate-list-client-not-created"
 
 	def test_passes(self):
-		self.assertPasses(self.row, scenario(not_created={"l2-empty-alternate": "no alternate address"}))
+		self.assertPasses(self.row, scenario(not_created={"l2-empty-alternate": "use_services_alternate: no alternate address"}))
 		self.assertEqual("pass-through", self.driver_args()[0][self.driver_args()[0].index("--shape") + 1])
+
+	def test_flag_named_in_client_spelling(self):
+		self.assertPasses(self.row, scenario(not_created={"l2-empty-alternate": "useServicesAlternate: node A1 has none"}))
+
+	def test_error_does_not_name_flag(self):
+		s = scenario(not_created={"l2-empty-alternate": "no alternate address"})
+		self.assertFailsCheck(self.row, s, "error-names-flag", flag="use_services_alternate")
 
 	def test_client_created(self):
 		self.assertFailsCheck(self.row, scenario(), "client-not-created")
@@ -520,6 +527,13 @@ class ListenerClosedTest(RowsTest):
 		self.assertIn("command=serve outage", out)
 		self.assertIn("L2-CHECK check=others-serve-during-outage read=4096", out)
 		self.assertIn('ownedByOthers=2 others=["A1","C1"]', out)
+
+	def test_other_node_dropped_during_outage_fails(self):
+		phases = self.phases()
+		phases["fault"] = {"nodes": three(A1={"active": False}, B1={"reachable": False})}
+		self.assertFailsCheck(self.row, scenario(phases), "others-held-during-outage", held='["C1"]',
+			expected='["A1","C1"]')
+		self.assertIn("listener c-2 on", self.ctl_log())
 
 	def test_others_not_served_during_outage_fails(self):
 		s = scenario(self.phases(), served={"read": 1, "written": 1, "failures": 4095})
@@ -644,10 +658,14 @@ class ReachableTest(RowsTest):
 		self.assertFailsCheck("alternate-list-holds-only-nodes-with-alternate", s, "never-held", node="C1")
 
 	def test_seed_without_alternate_passes(self):
-		s = self.with_nodes(scenario(not_created={"l2-seed-without-alternate": "no alternate address"}))
+		s = self.with_nodes(scenario(not_created={"l2-seed-without-alternate": "use_services_alternate: no alternate address"}))
 		self.assertPasses("seed-without-alternate-client-not-created", s)
 		flags = self.driver_args()[0]
 		self.assertEqual("as-endpoint.test:4903", flags[flags.index("--seed") + 1])
+
+	def test_seed_without_alternate_error_does_not_name_flag(self):
+		s = self.with_nodes(scenario(not_created={"l2-seed-without-alternate": "no alternate address"}))
+		self.assertFailsCheck("seed-without-alternate-client-not-created", s, "error-names-flag")
 
 	def test_seed_without_alternate_created_fails(self):
 		self.assertFailsCheck("seed-without-alternate-client-not-created", self.with_nodes(scenario()), "client-not-created")

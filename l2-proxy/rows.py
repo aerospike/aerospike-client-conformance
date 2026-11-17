@@ -68,6 +68,7 @@ LARGE_WAIT_MS = 120000
 HEAVY_WORKERS = 64
 LIGHT_WORKERS = 2
 EXHAUSTED_QUIET_WAIT_MS = 180000
+ALTERNATE_FLAG = "use_services_alternate"
 PORTS_FREE_WAIT_MS = 90000
 PORTS_POLL_S = 5
 MIGRATION_WAIT_MS = 300000
@@ -345,8 +346,9 @@ def collision_never_held(env, set_name, step, colliding, **flags):
 	emit("L2-CHECK", check="others-held-and-served", step=step, outcome="skip", reason=COLLISION_UNDECIDED)
 
 
-def expect_not_created(env, step, named=(), **flags):
-	"""The driver exits 3 before ready: the client could not be created, and its error names each of named."""
+def expect_not_created(env, step, named=(), flag=None, **flags):
+	"""The driver exits 3 before ready: the client could not be created, and its error names each of named and
+	the client flag, ignoring case and underscores."""
 	drv = env.start("l2-" + step, **flags)
 	try:
 		try:
@@ -361,6 +363,10 @@ def expect_not_created(env, step, named=(), **flags):
 		errors = [m["message"] for m in drv.between(0, len(drv.messages), "error")]
 		unnamed = [name for name in named if not any(name in message for message in errors)]
 		check("error-names", not unnamed, step=step, unnamed=unnamed, errors=errors)
+		if flag is not None:
+			key = flag.replace("_", "").lower()
+			check("error-names-flag", any(key in m.replace("_", "").lower() for m in errors), step=step, flag=flag,
+				errors=errors)
 	finally:
 		try:
 			drv.close()
@@ -467,7 +473,7 @@ def row_empty_alternate(env):
 	nodes = env.topology()
 	with_alt = [n["container"] + "=" + n["alt"] for n in nodes if n["alt"]]
 	check("alternate-empty", not with_alt, withAlternate=with_alt)
-	expect_not_created(env, "empty-alternate", shape="pass-through")
+	expect_not_created(env, "empty-alternate", flag=ALTERNATE_FLAG, shape="pass-through")
 
 
 def fault_row(env, step, victims, apply, remove, observe):
@@ -498,6 +504,7 @@ def row_listener_closed(env):
 	"""A node's listener closed: the client stops using the node, and once the listener is open again holds and
 	serves every node within bounded command latency."""
 	node = victim(env)
+	expected = sorted(n["node"] for n in env.topology() if n["node"] != node["node"])
 
 	def observe(drv, since):
 		def gone(m):
@@ -510,6 +517,8 @@ def row_listener_closed(env):
 			nodes=describe((snapshot or drv.latest())["nodes"]))
 		others = [n["name"] for n in snapshot["nodes"] if n["name"] != node["node"] and n["active"] is True and
 			n["reachable"] is True]
+		check("others-held-during-outage", sorted(others) == expected, step="outage", held=sorted(others),
+			expected=expected)
 		owned = sum(snapshot.get("owners", {}).get(name, 0) for name in others)
 		served, waited = drv.request("serve outage", "served", l5.SERVE_WAIT_MS, lambda m: m["step"] == "outage")
 		check("served-reply", served is not None, step="outage", waitedMs=waited, boundMs=l5.SERVE_WAIT_MS)
@@ -649,7 +658,8 @@ def row_alternate_with_alternate(env):
 def row_seed_without_alternate(env):
 	"""pass-through shape seeded at the node with no alternate address: the client is not created."""
 	_, reachable = reachable_split(env)
-	expect_not_created(env, "seed-without-alternate", shape="pass-through", seed_port=reachable["port"])
+	expect_not_created(env, "seed-without-alternate", flag=ALTERNATE_FLAG, shape="pass-through",
+		seed_port=reachable["port"])
 
 
 def pass_through_row(env, step):
