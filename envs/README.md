@@ -6,7 +6,7 @@ The provider, translator and TLS name matching integration tests need the same s
 | -------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | `dns`          | Two node cluster on two host addresses, a standalone node and a CoreDNS server for zone `dns.test`                     |
 | `aws-tags`     | Two node cluster on two host addresses advertising private addresses, and a stub EC2 endpoint returning both nodes     |
-| `port-map`     | Two node cluster advertising only container addresses, node B created but not started                                  |
+| `port-map`     | Two node cluster advertising only unroutable addresses, node B created but not started                                 |
 | `collision`    | A control cluster and a cluster whose two nodes advertise the same host and port                                       |
 | `yaml`         | A pass-through cluster and a port-map cluster, each with a client YAML config file                                     |
 | `pass-through` | Two node cluster, each node advertising its own published host port as alternate access address                        |
@@ -63,11 +63,11 @@ The values file has one `KEY=value` per line, no quoting, and can be sourced by 
 
 A node is five keys under a prefix such as `NODE_A` or `CONTROL_NODE_B`:
 
-| Key                                                | Value                                                                                                                                                                                                                               |
-| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<node>_NAME`                                      | Node ID, such as `A1`                                                                                                                                                                                                               |
-| `<node>_HOST`, `<node>_PORT`                       | Where the node is reachable from this host                                                                                                                                                                                          |
-| `<node>_ADVERTISED_HOST`, `<node>_ADVERTISED_PORT` | The access address the node advertises to clients: its alternate access address where it has one, otherwise its container address. Empty when the node has no alternate access address in an environment that sets one on its peers |
+| Key                                                | Value                                                                                                                                                                                                                            |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<node>_NAME`                                      | Node ID, such as `A1`                                                                                                                                                                                                            |
+| `<node>_HOST`, `<node>_PORT`                       | Where the node is reachable from this host                                                                                                                                                                                       |
+| `<node>_ADVERTISED_HOST`, `<node>_ADVERTISED_PORT` | The access address the node advertises to clients: its alternate access address where it has one, otherwise its access address. Empty when the node has no alternate access address in an environment that sets one on its peers |
 
 `CLIENT_CONFIG` is a client YAML config file for the environment where there is one.
 
@@ -105,9 +105,9 @@ The stub's control API, JSON over HTTP under `EC2_STUB_CONTROL`:
 
 ### port-map
 
-Each node advertises only its container address on port 3000, which the host cannot reach, and is published on its own host port. Node addresses are fixed, so a port map can name node B before it exists. Node B is created but not started.
+Each node advertises only an address in 192.0.2.0/24 (TEST-NET-1), which no host routes, on port 3000, and is published on its own host port. Node addresses are fixed, so a port map can name node B before it exists. Node B is created but not started.
 
-Values: `NODE_A_*`, `NODE_B_*` (`ADVERTISED_HOST:ADVERTISED_PORT` is the container address). Nodes: `a`, `b`.
+Values: `NODE_A_*`, `NODE_B_*` (`ADVERTISED_HOST:ADVERTISED_PORT` is that unroutable address). Nodes: `a`, `b`.
 
 Verbs: `start-node-b` starts node B and waits for the two node cluster. `node-b-state` prints `running` or `stopped`.
 
@@ -119,7 +119,7 @@ Values: `CONTROL_NODE_A_*`, `CONTROL_NODE_B_*`, `COLLISION_NODE_A_*`, `COLLISION
 
 ### yaml
 
-Two clusters, each with a client YAML config file that is the client's only configuration. In the pass-through cluster each node advertises `ENV_HOST` and its own published port; the YAML sets `use_services_alternate: true` and `translation.provider: pass-through`. In the port-map cluster each node advertises only its container address; the YAML sets `translation.provider: port-map` and `on_miss: strict`, mapping node A by its advertised `host:port` and node B by node name.
+Two clusters, each with a client YAML config file that is the client's only configuration. In the pass-through cluster each node advertises `ENV_HOST` and its own published port; the YAML sets `use_services_alternate: true` and `translation.provider: pass-through`. In the port-map cluster each node advertises only an address in 192.0.2.0/24 (TEST-NET-1), which no host routes, on port 3000; the YAML sets `translation.provider: port-map` and `on_miss: strict`, mapping node A by its advertised `host:port` and node B by node name.
 
 Values: `PASS_THROUGH_NODE_A_*`, `PASS_THROUGH_NODE_B_*`, `PASS_THROUGH_CLIENT_CONFIG`, `PORT_MAP_NODE_A_*`, `PORT_MAP_NODE_B_*`, `PORT_MAP_CLIENT_CONFIG`. Nodes: `pass-through-a`, `pass-through-b`, `port-map-a`, `port-map-b`.
 
