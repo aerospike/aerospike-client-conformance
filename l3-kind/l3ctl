@@ -38,6 +38,10 @@ Usage: l3ctl <command> [arguments]
   delete-pod POD                         Delete POD and wait until it is gone
   wait-ready POD [--old-uid UID] [--timeout S]
                                          Wait until POD exists with another UID and is Ready
+  init-state POD                         L3-POD-INIT: POD's UID, node, phase, Ready, and its init container
+                                         that last exited non-zero (else the first): state, reason, exit
+                                         code, restarts, and whether its log names the alternate access label
+  wait-init-failed POD [--timeout S]     Wait until an init container of POD has exited non-zero; L3-POD-INIT
   service NAME [PORT]                    L3-SERVICE: UID and NodePort of PORT (default the service port)
   service-create NAME POD NODEPORT       NodePort Service on NODEPORT for the service port of POD alone
   service-delete NAME                    Delete a Service and wait until it is gone
@@ -497,6 +501,53 @@ cmd_wait_ready() {
 	echo "L3-POD-READY pod=$pod uid=$uid oldUid=$old worker=$worker ip=$ip"
 }
 
+init_state() {
+	local pod=$1 state uid worker phase ready name restarts waiting terminated exit_code last_code failed="" log
+	state=$(k -n "$NS" get pod "$pod" --ignore-not-found -o \
+		'jsonpath={.metadata.uid}|{.spec.nodeName}|{.status.phase}|{.status.conditions[?(@.type=="Ready")].status}')
+	IFS='|' read -r uid worker phase ready <<<"$state"
+	[ -n "$uid" ] || die "no pod $pod"
+	while IFS='|' read -r name restarts waiting terminated exit_code last_code; do
+		[ -n "$name" ] || continue
+		[ -n "$failed" ] || failed="$name|$restarts|$waiting|$terminated|$exit_code|$last_code"
+		if [ "${exit_code:-0}" != 0 ] || [ "${last_code:-0}" != 0 ]; then
+			failed="$name|$restarts|$waiting|$terminated|$exit_code|$last_code"
+			break
+		fi
+	done < <(k -n "$NS" get pod "$pod" -o \
+		'jsonpath={range .status.initContainerStatuses[*]}{.name}|{.restartCount}|{.state.waiting.reason}|{.state.terminated.reason}|{.state.terminated.exitCode}|{.lastState.terminated.exitCode}{"\n"}{end}')
+	IFS='|' read -r name restarts waiting terminated exit_code last_code <<<"$failed"
+	log=""
+	if [ -n "$name" ]; then
+		log=$(k -n "$NS" logs "$pod" -c "$name" 2>/dev/null || true)$(k -n "$NS" logs "$pod" -c "$name" --previous 2>/dev/null || true)
+	fi
+	echo "L3-POD-INIT pod=$pod uid=$uid worker=$worker phase=$phase ready=${ready:-False} init=$name" \
+		"state=${waiting:+waiting}${terminated:+terminated} reason=$waiting$terminated exitCode=$exit_code" \
+		"lastExitCode=$last_code restarts=${restarts:-0} labelInLog=$([[ "$log" == *"$ALTERNATE_ACCESS_LABEL"* ]] && echo true || echo false)"
+}
+
+cmd_init_state() {
+	[ $# -eq 1 ] || usage
+	init_state "$1"
+}
+
+cmd_wait_init_failed() {
+	local pod=${1:-} deadline line=""
+	[ -n "$pod" ] || usage
+	shift
+	timeout_arg "$@"
+	deadline=$((SECONDS + TIMEOUT_S))
+	while :; do
+		line=$(init_state "$pod" 2>/dev/null) || line=""
+		if [[ "$line" =~ \ (exitCode|lastExitCode)=[1-9] ]]; then
+			break
+		fi
+		((SECONDS < deadline)) || die "no init container of $pod exited non-zero within ${TIMEOUT_S}s: ${line:-no pod}"
+		sleep 2
+	done
+	echo "$line"
+}
+
 cmd_service() {
 	local name=${1:-} port=${2:-}
 	[ -n "$name" ] || usage
@@ -730,6 +781,8 @@ case "$command" in
 	wait-completed) cmd_wait_completed "$@" ;;
 	delete-pod) cmd_delete_pod "$@" ;;
 	wait-ready) cmd_wait_ready "$@" ;;
+	init-state) cmd_init_state "$@" ;;
+	wait-init-failed) cmd_wait_init_failed "$@" ;;
 	service) cmd_service "$@" ;;
 	service-create) cmd_service_create "$@" ;;
 	service-delete) cmd_service_delete "$@" ;;

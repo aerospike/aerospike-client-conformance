@@ -684,6 +684,118 @@ class RecreatedNodeTest(RowsTest):
 			"runs on one kind node (nlb-per-pod)")
 
 
+PER_NODE_W2 = "node-2.as-endpoint.test"
+
+
+def label_lost_ctl(init=None):
+	failed = ("L3-POD-INIT pod={1} uid=p1b worker=w2 phase=Pending ready=False init=aerospike-init state=waiting "
+		"reason=Init:CrashLoopBackOff exitCode= lastExitCode=1 restarts=2 labelInLog=true")
+	init = init or {"lines": [failed]}
+	pods = [cluster_line(2, multi="false"), pod_line(0, "w1", "node-1.as-endpoint.test", 3000, 3000)]
+	without = [node_line("cp", "control-plane", "172.18.0.2"), node_line("w1", ip="172.18.0.3",
+		labels={LABEL: "node-1.as-endpoint.test"}), node_line("w2", ip="172.18.0.4", uid="u-w2-new")]
+	return {
+		"pods": {"by_phase": {"start": {"lines": pods + [pod_line(1, "w2", PER_NODE_W2, 3000, 3000)]},
+			"restored": {"lines": pods + [pod_line(1, "w2", PER_NODE_W2, 3000, 3000, uid="p1b")]}}},
+		"nodes": {"by_phase": {"start": PER_NODE_NODES, "empty": {"lines": without}, "missing": {"lines": without},
+			"restored": {"lines": without[:2] + [node_line("w2", ip="172.18.0.4", uid="u-w2-new",
+				labels={LABEL: PER_NODE_W2})]}}},
+		"cordon-others": {"lines": ["L3-CORDONED node=cp", "L3-CORDONED node=w1"]},
+		"delete-node": {"lines": ["L3-NODE-DELETED node={1} uid=u-w2 pods=aerocluster-0-1"]},
+		"reregister": {"lines": ["L3-KUBELET-RESTARTED node={1}", "L3-NODE-REGISTERED node={1} uid=u-w2-new afterS=20"],
+			"phase": "missing"},
+		"wait-init-failed": init,
+		"init-state": {"lines": init.get("lines", [])},
+		"label-node": {"lines": ["L3-LABELLED node={1} {2}={3}"], "phase": "restored"},
+		"wait-ready": {"lines": ["L3-POD-READY pod={1} uid=p1c oldUid=p1 worker=w2 ip=10.244.2.5"]},
+		"uncordon": {"lines": ["L3-UNCORDONED node=cp", "L3-UNCORDONED node=w1"]},
+	}
+
+
+class PerNodeLabelLostTest(RowsTest):
+	profile = "per-node"
+	row = "per-node-pod-on-node-recreated-without-label-cannot-start"
+	values = PerNodeTest.values
+	both = [node(0, "node-1.as-endpoint.test", 3000), node(1, "172.18.0.4", 3000)]
+	phases = {"start": {"nodes": both}, "missing": {"nodes": both[:1]}, "restored": {"nodes": both}}
+
+	def assertRestored(self):
+		self.assertEqual(["label-node w2 %s %s" % (LABEL, PER_NODE_W2), "uncordon cp w1", "wait-completed --timeout 600",
+			"pods"], self.ctl_log()[-4:])
+
+	def test_pass(self):
+		out = self.assertPasses(self.row, scenario(self.phases, ctl=label_lost_ctl()))
+		self.assertIn("L3-LABEL-MISSING node=w2 label=%s pod=aerocluster-0-1 init=aerospike-init state=waiting "
+			"reason=Init:CrashLoopBackOff exitCode=1 restarts=2 ready=False labelInLog=true" % LABEL, out)
+		self.assertIn("L3-CHECK check=label-gone node=w2", out)
+		self.assertIn("L3-CHECK check=advertised-clearAlt step=label-restored wrong=[]", out)
+		log = self.ctl_log()
+		order = ["cordon-others w2", "delete-node w2", "reregister w2 --timeout 300",
+			"wait-init-failed aerocluster-0-1 --timeout 300", "init-state aerocluster-0-1",
+			"label-node w2 %s %s" % (LABEL, PER_NODE_W2), "wait-ready aerocluster-0-1 --old-uid p1 --timeout 600"]
+		self.assertEqual(order + [order[5]], [c for c in log if c in order])
+		self.assertRestored()
+		args = self.driver_args()
+		self.assertEqual(1, len(args))
+		self.assertEqual("node-1.as-endpoint.test:3000", args[0][args[0].index("--seed") + 1])
+
+	def test_pod_starting_without_label_fails(self):
+		line = ("L3-POD-INIT pod={1} uid=p1b worker=w2 phase=Running ready=True init=aerospike-init state= reason= "
+			"exitCode= lastExitCode= restarts=0 labelInLog=false")
+		started = {"lines": [line], "exit": 1,
+			"stderr": "ERROR: no init container of aerocluster-0-1 exited non-zero within 300s"}
+		self.assertFailsCheck(self.row, scenario(self.phases, ctl=label_lost_ctl(started)), "wait-init-failed")
+		self.assertNotIn("L3-LABEL-MISSING", " ".join(self.ctl_log()))
+		self.assertRestored()
+
+	def test_pod_ready_without_label_fails(self):
+		ctl = label_lost_ctl()
+		ctl["init-state"] = {"lines": [ctl["wait-init-failed"]["lines"][0].replace("ready=False", "ready=True")]}
+		self.assertFailsCheck(self.row, scenario(self.phases, ctl=ctl), "still-not-ready", ready="True")
+		self.assertRestored()
+
+	def test_failure_not_naming_label_fails(self):
+		ctl = label_lost_ctl()
+		ctl["wait-init-failed"] = {"lines": [ctl["wait-init-failed"]["lines"][0].replace("labelInLog=true",
+			"labelInLog=false")]}
+		self.assertFailsCheck(self.row, scenario(self.phases, ctl=ctl), "failure-names-label")
+
+	def test_label_kept_fails(self):
+		ctl = label_lost_ctl()
+		ctl["nodes"]["by_phase"]["missing"] = ctl["nodes"]["by_phase"]["restored"]
+		self.assertFailsCheck(self.row, scenario(self.phases, ctl=ctl), "label-gone")
+		self.assertRestored()
+
+	def test_remaining_node_not_routed_fails(self):
+		phases = dict(self.phases, missing={"nodes": self.both[:1], "unowned": 2048})
+		self.assertFailsCheck(self.row, scenario(phases, ctl=label_lost_ctl()), "routing", step="label-missing")
+
+	def test_driver_left_without_nodes_fails(self):
+		ctl = label_lost_ctl()
+		ctl["reregister"] = dict(ctl["reregister"], phase="empty")
+		ctl["wait-init-failed"] = dict(ctl["wait-init-failed"], phase="missing")
+		phases = dict(self.phases, empty={"nodes": []})
+		self.assertFailsCheck(self.row, scenario(phases, ctl=ctl), "never-empty", step="label-missing")
+		self.assertRestored()
+
+	def test_recovery_without_routing_fails(self):
+		phases = dict(self.phases, restored={"nodes": self.both[:1]})
+		self.assertFailsCheck(self.row, scenario(phases, ctl=label_lost_ctl()), "routing", step="label-restored")
+		self.assertRestored()
+
+	def test_recovery_at_another_address_fails(self):
+		ctl = label_lost_ctl()
+		ctl["pods"]["by_phase"]["restored"]["lines"][-1] = pod_line(1, "w2", "172.18.0.4", 3000, 3000, uid="p1b")
+		self.assertFailsCheck(self.row, scenario(self.phases, ctl=ctl), "advertised-clearAlt", step="label-restored")
+		self.assertRestored()
+
+	def test_other_profiles_skip(self):
+		for profile in sorted(set(rows.PROFILES) - {"per-node"}):
+			with self.subTest(profile=profile):
+				self.profile = profile
+				self.assertSkips(self.row, scenario(), "needs configuredIP with one pod per labelled worker (per-node)")
+
+
 def tls_ctl(cluster=None, tls_host=ENDPOINT, sans="DNS:aerospike-tls", host=ENDPOINT, peers=None):
 	cluster = cluster or cluster_line(2, tls=TLS_NAME)
 	peers = peers or [peers_tls(i, 2, tls_host) for i in range(2)]
