@@ -467,8 +467,18 @@ class ScaleUpTest(RowsTest):
 	def test_usable_after_bound_fails(self):
 		s = scenario(self.phases, ctl=scale_up_ctl(), watch=dict(self.watch, usableAt=1000700))
 		self.assertFailsCheck(self.row, s, "usable-ms", usableMs=600, startAt=1000100, bumpAt=1000000, answerAt=1000100,
-			readyAt=999900, servingAt=999700, usableAt=1000700, readyToAnswerMs=200, boundMs=500)
+			readyAt=999900, servingAt=999700, usableAt=1000700, readyToAnswerMs=200, boundMs=500, startPollMs=14,
+			inconclusive="false")
 		self.assertIn("scale 2 --timeout 600", self.ctl_log())
+
+	def test_usable_within_start_poll_of_bound_fails(self):
+		s = scenario(self.phases, ctl=scale_up_ctl(), watch=dict(self.watch, usableAt=1000590))
+		self.assertFailsCheck(self.row, s, "usable-ms", usableMs=490, boundMs=500, startPollMs=14, inconclusive="true")
+
+	def test_usable_start_poll_before_bound_passes(self):
+		out = self.assertPasses(self.row, scenario(self.phases, ctl=scale_up_ctl(), watch=dict(self.watch, usableAt=1000586)))
+		self.assertIn("usableMs=486 ", out)
+		self.assertIn("boundMs=500 startPollMs=14 inconclusive=false outcome=pass", out)
 
 	def test_clock_starts_at_later_bump(self):
 		ctl = scale_up_ctl()
@@ -491,10 +501,13 @@ class ScaleUpTest(RowsTest):
 		s = scenario(self.phases, ctl=ctl, watch=dict(self.watch, usableAt=1000235))
 		self.assertFailsCheck(self.row, s, "usable-after-start", usableMs=-15, startAt=1000250, startPollMs=12)
 
-	def test_coarse_poll_fails(self):
+	def test_coarse_poll_far_below_bound_passes(self):
 		ctl = scale_up_ctl()
 		ctl["join-watch"]["lines"] = [ctl["join-watch"]["lines"][0].replace("answerPollMs=14", "answerPollMs=150")]
-		self.assertFailsCheck(self.row, scenario(self.phases, ctl=ctl, watch=self.watch), "poll-interval", answerPollMs=150)
+		out = self.assertPasses(self.row, scenario(self.phases, ctl=ctl, watch=self.watch))
+		self.assertIn("check=poll-interval bumpPollMs=12 answerPollMs=150 outcome=pass", out)
+		self.assertIn("usableMs=200 ", out)
+		self.assertIn("startPollMs=150 inconclusive=false outcome=pass", out)
 
 	def test_first_probe_answered_fails(self):
 		ctl = scale_up_ctl()
