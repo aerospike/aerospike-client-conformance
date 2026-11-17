@@ -7,32 +7,23 @@ check that keeps them consistent; each client keeps its own runner and its own d
 
 Expected values are never adjusted to match a runtime.
 
-## Versioning
+## Pinning
 
-`VERSION` is the fixture set version, one for the whole repository. Clients pin a `v<VERSION>` tag and
-upgrade with a deliberate change that also updates their declarations. Every report records the
-fixture set version it ran.
-
-- patch: wording only (`because`, `description`, README)
-- minor: new rows, new files or new optional keys
-- major: a changed expectation, a removed or renamed row, or an incompatible schema change
-
-The repository is public, so client CI checks it out at a pinned tag or commit with `actions/checkout`
-and passes that directory to its runner; nothing is published elsewhere. A `v<VERSION>` tag must match
-`VERSION` at that commit, and `release.yml` checks that and the fixtures when the tag is pushed.
+The fixture set is not versioned. Client CI checks this repository out with `actions/checkout` and calls its actions at a commit SHA with a `# main` comment, and passes the checkout to its runner; nothing is published elsewhere. A client moves the pin deliberately, in a change that also updates its declarations.
 
 ```yaml
 - uses: actions/checkout@<sha>
   with:
     repository: aerospike/aerospike-client-conformance
-    ref: v1.1.0
+    ref: <commit-sha> # main
     path: conformance
 ```
+
+`VERSION` is frozen and will be removed once no client reads it.
 
 ## Layout
 
 ```text
-VERSION
 schema/fixture.schema.json        every fixture file validates against this (JSON Schema 2020-12)
 schema/report.schema.json         the report each runtime writes
 discovery/translate/*.yaml        address translation (kind: translate, collision)
@@ -186,7 +177,7 @@ from its declaration, so a row changing in either direction forces a reviewed ch
 declaration. Declarations live in each client repository, next to its runner.
 
 Each runtime writes a report conforming to `schema/report.schema.json`: runtime, client
-version, fixture set version, counts per result, and per row the file, case, result and
+version, counts per result, and per row the file, case, result and
 reason. [`collect-conformance-report`](.github/actions/collect-conformance-report) checks reports
 against the fixture set and the declarations in CI, and
 [`report-skipped-layers`](.github/actions/report-skipped-layers) lists the test layers a run could

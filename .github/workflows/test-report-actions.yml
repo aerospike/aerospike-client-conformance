@@ -41,9 +41,9 @@ jobs:
           spec = importlib.util.spec_from_file_location("cr", ".github/actions/collect-conformance-report/collect_report.py")
           cr = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(cr)
-          version, cases = cr.load_fixtures(cr.Path("."))
+          cases = cr.load_fixtures(cr.Path("."))
           rows = [{"file": f, "case": c, "result": "blocked" if blocked else "pass"} for (f, c), blocked in cases.items()]
-          print(json.dumps({"runtime": "smoke", "clientVersion": "0", "fixtureSetVersion": version, "counts": {}, "rows": rows}))
+          print(json.dumps({"runtime": "smoke", "clientVersion": "0", "counts": {}, "rows": rows}))
           EOF
 
       - name: Collect the report

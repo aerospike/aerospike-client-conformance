@@ -17,7 +17,6 @@ spec = importlib.util.spec_from_file_location("collect_report", SCRIPT)
 cr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cr)
 
-VERSION = "1.0.0"
 FILE = "discovery/translate/port-map.yaml"
 CASE = "host-port-key-hit"
 TLS_FILE = "tls/name-matching.yaml"
@@ -34,7 +33,6 @@ class CollectReportTests(unittest.TestCase):
             directory.mkdir()
 
     def fixture_set(self, cases, blocked=(), kinds=None):
-        (self.fixtures / "VERSION").write_text(f"{VERSION}\n", encoding="utf-8")
         by_file: dict[str, list[str]] = {}
         for file_name, case_name in cases:
             by_file.setdefault(file_name, []).append(case_name)
@@ -49,8 +47,8 @@ class CollectReportTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    def report(self, rows, version=VERSION):
-        body = {"runtime": "java", "clientVersion": "9.1.0", "fixtureSetVersion": version, "counts": {}, "rows": rows}
+    def report(self, rows, **extra):
+        body = {"runtime": "java", "clientVersion": "9.1.0", "counts": {}, "rows": rows, **extra}
         (self.reports / "conformance-report.json").write_text(json.dumps(body), encoding="utf-8")
 
     def declare(self, text):
@@ -73,7 +71,7 @@ class CollectReportTests(unittest.TestCase):
         )
         markdown, failed = self.collect()
         self.assertFalse(failed)
-        self.assertIn("| java | 9.1.0 | 1.0.0 | 0 | 1 | 1 | 0 | ok |", markdown)
+        self.assertIn("| java | 9.1.0 | 0 | 1 | 1 | 0 | ok |", markdown)
         self.assertIn("no translator API", markdown)
 
     def test_a_collision_case_can_be_declared(self) -> None:
@@ -83,7 +81,7 @@ class CollectReportTests(unittest.TestCase):
         self.declare(f"{collision}:\n  three-peers-one-endpoint: {{ result: fail, reason: pairs only }}\n")
         markdown, failed = self.collect()
         self.assertFalse(failed)
-        self.assertIn("| java | 9.1.0 | 1.0.0 | 0 | 1 | 0 | 0 | ok |", markdown)
+        self.assertIn("| java | 9.1.0 | 0 | 1 | 0 | 0 | ok |", markdown)
 
     def test_each_gate_rule_fails(self) -> None:
         cases = [(FILE, "broken"), (FILE, "unsupported"), (FILE, "blocked"), (FILE, "missing")]
@@ -127,9 +125,32 @@ class CollectReportTests(unittest.TestCase):
         self.report([{"file": FILE, "case": CASE, "result": "skip"}])
         with self.assertRaisesRegex(cr.CollectError, "invalid result skip"):
             self.collect()
-        self.report([{"file": FILE, "case": CASE, "result": "pass"}], version="9.9.9")
-        with self.assertRaisesRegex(cr.CollectError, "does not match fixtures VERSION 1.0.0"):
-            self.collect()
+
+    def test_fixtures_directory_without_version_is_read(self) -> None:
+        self.fixture_set([(FILE, CASE)])
+        self.assertFalse((self.fixtures / "VERSION").exists())
+        self.report([{"file": FILE, "case": CASE, "result": "pass"}])
+        markdown, failed = self.collect()
+        self.assertFalse(failed)
+        self.assertIn("| java | 9.1.0 | 1 | 0 | 0 | 0 | ok |", markdown)
+
+    def test_report_with_or_without_fixture_set_version_is_accepted(self) -> None:
+        self.fixture_set([(FILE, CASE)])
+        (self.fixtures / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+        for extra in ({}, {"fixtureSetVersion": "1.0.0"}, {"fixtureSetVersion": "9.9.9"}):
+            with self.subTest(**extra):
+                self.report([{"file": FILE, "case": CASE, "result": "pass"}], **extra)
+                markdown, failed = self.collect()
+                self.assertFalse(failed)
+                self.assertNotIn("9.9.9", markdown)
+                self.assertIn("| java | 9.1.0 | 1 | 0 | 0 | 0 | ok |", markdown)
+
+    def test_unknown_case_finding_names_no_version(self) -> None:
+        self.fixture_set([(FILE, CASE)])
+        self.report([{"file": FILE, "case": CASE, "result": "pass"}, {"file": FILE, "case": "renamed", "result": "pass"}])
+        markdown, failed = self.collect()
+        self.assertTrue(failed)
+        self.assertIn("| java | unknown-case | discovery/translate/port-map.yaml | renamed | - | pass | not a case in the fixture set |", markdown)
 
     def test_files_that_are_not_fixtures_are_skipped(self) -> None:
         self.fixture_set([(FILE, CASE)])
@@ -137,11 +158,10 @@ class CollectReportTests(unittest.TestCase):
         (self.fixtures / ".trunk" / "trunk.yaml").write_text("version: 0.1\n", encoding="utf-8")
         (self.fixtures / "aws-real").mkdir()
         (self.fixtures / "aws-real" / "stack.yaml").write_text("Value: !Ref AmiId\n", encoding="utf-8")
-        self.assertEqual(list(cr.load_fixtures(self.fixtures)[1]), [(FILE, CASE)])
+        self.assertEqual(list(cr.load_fixtures(self.fixtures)), [(FILE, CASE)])
 
     def test_every_fixture_file_in_this_repository_is_read(self) -> None:
-        version, cases = cr.load_fixtures(REPOSITORY)
-        self.assertEqual(version, (REPOSITORY / "VERSION").read_text(encoding="utf-8").strip())
+        cases = cr.load_fixtures(REPOSITORY)
         expected = {
             path.relative_to(REPOSITORY).as_posix()
             for root in cr.FIXTURE_ROOTS
