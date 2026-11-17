@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+#
+# Serves the node requests a client's own tests write while L2_RUN runs, in the file format of
+# .github/actions/discovery-node-server (README.md there), on the topology l2ctl reads from
+# $L2_STATE/topology.env. A test writes <id>.request to the control directory and reads <id>.ack.
+# run.sh starts it in the background before L2_RUN and stops it after; on exit it removes every node
+# it started. Each node it removes leaves its log in the log directory.
+#
+# Usage: node-server <control dir> <control dir in the client container> <log dir>
+
+set -uo pipefail
+shopt -s nullglob
+
+[ $# -eq 3 ] || { echo "Usage: node-server <control dir> <control dir in the client container> <log dir>" >&2; exit 2; }
+dir=$1
+client_dir=$2
+log_dir=$3
+[ -n "${L2_CTL:-}" ] && [ -n "${L2_STATE:-}" ] && [ -f "$L2_STATE/topology.env" ] || {
+	echo "ERROR: L2_CTL and L2_STATE must name l2ctl and a topology state directory" >&2
+	exit 2
+}
+while IFS= read -r line; do
+	if [[ "$line" =~ ^[A-Z0-9_]+= ]]; then
+		printf -v "${line%%=*}" '%s' "${line#*=}"
+	fi
+done <"$L2_STATE/topology.env"
+alternate_host="${L2_ALTERNATE_HOSTNAME:-}"
+started=()
+host_args=()
+IFS=, read -r -a entries <<<"${L2_NODE_HOSTS:-}"
+for entry in "${entries[@]+"${entries[@]}"}"; do
+	host_args+=(--add-host "$entry")
+done
+
+ack() {
+	printf '%s\n' "$2" >"$dir/$1.tmp"
+	mv "$dir/$1.tmp" "$dir/$1.ack"
+	echo "Ack $1: $(tr '\n' ' ' <<<"$2")"
+}
+
+one_line() {
+	tr '\n' ' ' <<<"$1" | sed 's/ *$//'
+}
+
+is_started() {
+	local c
+	for c in "${started[@]+"${started[@]}"}"; do
+		[ "$c" != "$1" ] || return 0
+	done
+	return 1
+}
+
+remove() {
+	local c kept=()
+	docker logs "$1" >"$log_dir/$1.log" 2>&1 || true
+	"$L2_CTL" stop-node "$1" >/dev/null || return 1
+	for c in "${started[@]+"${started[@]}"}"; do
+		[ "$c" = "$1" ] || kept+=("$c")
+	done
+	started=("${kept[@]+"${kept[@]}"}")
+}
+
+start() {
+	local id=$1 option error="" options=() out container address
+	for option in $2; do
+		case "$option" in
+			alternate-port=*)
+				if [ -n "$alternate_host" ] && [[ "${option#*=}" =~ ^[0-9]+$ ]]; then
+					options+=(--alternate "$alternate_host:${option#*=}")
+				else
+					error="$option needs a port and a profile with an alternate hostname"
+				fi
+				;;
+			address=*) options+=(--address "${option#*=}") ;;
+			*) error="unknown start option $option" ;;
+		esac
+	done
+	if [ -n "$error" ]; then
+		ack "$id" "error=$error"
+		return
+	fi
+	if out="$("$L2_CTL" start-node "${options[@]+"${options[@]}"}" 2>&1)" &&
+		container="$(sed -n 's/^L2-STARTED container=\([^ ]*\) .*/\1/p' <<<"$out")" && [ -n "$container" ]; then
+		started+=("$container")
+		address="$(sed -n 's/^L2-STARTED .* address=\([0-9.]*\) .*/\1/p' <<<"$out")"
+		ack "$id" "$(printf 'container=%s\naddress=%s' "$container" "$address")"
+	else
+		ack "$id" "error=$(one_line "$out")"
+	fi
+}
+
+status() {
+	local id=$1 name=$2 state lookup="" lookup_rc="" where="" err=""
+	if [[ "$name" == "$L2_PREFIX-node-"* ]] &&
+		state="$(docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' "$name" 2>&1)"; then
+		docker logs "$name" >"$dir/$name.log" 2>&1 || true
+		if [ -n "$alternate_host" ]; then
+			lookup_rc=0
+			if [ "${state% *}" = true ]; then
+				where=container
+				lookup="$(docker exec "$name" getent hosts "$alternate_host" 2>&1)" || lookup_rc=$?
+			else
+				where=image
+				lookup="$(docker run --rm --name "$L2_PREFIX-lookup-$id" --network "$L2_NODE_NETWORK" \
+					"${host_args[@]+"${host_args[@]}"}" --entrypoint getent "$L2_SERVER_IMAGE" hosts "$alternate_host" 2>&1)" ||
+					lookup_rc=$?
+			fi
+		fi
+		ack "$id" "$(printf 'running=%s\nexit-code=%s\nlog=%s\nlookup-in=%s\nlookup-exit=%s\nlookup=%s' "${state% *}" \
+			"${state#* }" "$client_dir/$name.log" "$where" "$lookup_rc" "$(one_line "$lookup")")"
+	else
+		[[ "$name" == "$L2_PREFIX-node-"* ]] && err=" $(one_line "$state")"
+		ack "$id" "error=cannot inspect $name$err"
+	fi
+}
+
+stop_all() {
+	local c
+	for c in "${started[@]+"${started[@]}"}"; do
+		remove "$c" && echo "Removed $c on exit"
+	done
+}
+trap stop_all EXIT
+trap 'exit 0' TERM INT
+
+mkdir -p "$dir" "$log_dir"
+touch "$dir/ready"
+echo "Serving node requests in $dir ($client_dir in the client container); alternate hostname ${alternate_host:-none}"
+
+while true; do
+	for request in "$dir"/*.request; do
+		id="$(basename "$request" .request)"
+		action=""
+		arg=""
+		read -r action arg <"$request" || true
+		rm -f "$request"
+		if ! [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+			echo "Ignored request $id: the id must be letters, digits, dots, dashes and underscores"
+			continue
+		fi
+		echo "Request $id: $action $arg"
+		case "$action" in
+			start) start "$id" "$arg" ;;
+			stop)
+				if is_started "$arg" && remove "$arg"; then
+					ack "$id" "removed=$arg"
+				else
+					ack "$id" "error=cannot remove $arg: not a node this server started"
+				fi
+				;;
+			status) status "$id" "$arg" ;;
+			*) ack "$id" "error=unknown request: $action $arg" ;;
+		esac
+	done
+	sleep 0.1
+done

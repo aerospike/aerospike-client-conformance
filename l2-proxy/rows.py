@@ -39,7 +39,7 @@ MESSAGE_FIELDS = dict(l5.MESSAGE_FIELDS, large=("step", "bytes", "keys", "writte
 	"firstFailure", "maxMs", "elapsedMs"))
 
 PROFILES = ("default", "reachable", "pass-through-names", "pass-through-ports", "port-map-range", "port-range",
-	"low-mtu", "idle-reset")
+	"low-mtu", "idle-reset", "unresolved-access", "cn-only")
 NAMESPACE = l5.NAMESPACE
 PARTITIONS = l5.PARTITIONS
 CLUSTER_SIZE = 3
@@ -879,6 +879,37 @@ def row_unresolved_shared_name(env):
 	check("peers-verbatim", not listed, wrong=listed, hostname=host)
 
 
+def row_unresolved_access(env):
+	"""A node started with an alternate name that does not resolve where the servers run: a server that advertises
+	access addresses verbatim, as --verbatim-access-address says, joins and advertises the name as configured, and
+	one that resolves them at startup exits with a CRITICAL log line naming it while the cluster keeps its size."""
+	host = env.value("L2_ALTERNATE_HOSTNAME")
+	verbatim = env.values.get("DISCOVERY_VERBATIM_ACCESS_ADDRESS") == "1"
+	lookups = env.ctl.ok("lookup", host).tagged("L2-LOOKUP")
+	resolving = [line["container"] for line in lookups if line["resolves"] != "false"]
+	check("unresolved-in-servers", lookups and not resolving, hostname=host, resolvesIn=resolving)
+	address = env.address(int(env.value("L2_EXTRA_PORT_BASE")), host)
+	container = None
+	try:
+		container = env.ctl.ok("start-node", "--alternate", address).first("L2-STARTED")["container"]
+		bound_ms = NODE_WAIT_S * 1000 + CTL_TIMEOUT_MS
+		if verbatim:
+			env.ctl.ok("wait-advertised", container, "--timeout", str(NODE_WAIT_S), bound_ms=bound_ms)
+			started = [line for line in env.ctl.ok("nodes").tagged("L2-NODE") if line["container"] == container]
+			alt = started[0].fields.get("alt", "") if started else ""
+			check("advertised-verbatim", alt == address, container=container, alt=alt, expected=address)
+		else:
+			exited = env.ctl.ok("wait-exit", container, "--timeout", str(NODE_WAIT_S), "--naming", host,
+				bound_ms=bound_ms).first("L2-EXITED")
+			check("refused-at-startup", exited["exit"] != "0" and int(exited["critical"]) > 0, container=container,
+				exit=exited["exit"], criticalLines=exited["critical"], hostname=host)
+			env.wait_cluster()
+	finally:
+		if container:
+			env.outcome.guard(env.ctl.ok, "stop-node", container)
+			env.outcome.guard(env.wait_cluster)
+
+
 def parse_peers(value):
 	"""A peers reply, gen,port,[[node,tls-name,[address[:port],...]],...], as each node's addresses, each with its
 	port."""
@@ -1002,6 +1033,9 @@ ROWS = {
 		Row("large-records-over-low-mtu-within-timeout", row_large_record, contract=5)],
 	"idle-reset": [ROUTE, BY_NAME,
 		Row("reset-peer-attempts-fail-within-bound-and-recover", row_reset_peer, contract=3, fault=True)],
+	"unresolved-access": [ROUTE, BY_NAME,
+		Row("unresolved-alternate-name-advertised-verbatim-or-refused", row_unresolved_access, contract=0)],
+	"cn-only": [ROUTE, BY_NAME],
 }
 
 
