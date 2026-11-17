@@ -475,8 +475,10 @@ def row_scale_up(env):
 			polls = [joined["bumpPollMs"], joined["answerPollMs"]]
 			check("poll-interval", all(p.isdigit() and int(p) <= POLL_BOUND_MS for p in polls),
 				bumpPollMs=joined["bumpPollMs"], answerPollMs=joined["answerPollMs"], boundMs=POLL_BOUND_MS)
-			check("usable-after-start", usable_ms >= 0, measurementError=usable_ms < 0, usableMs=usable_ms, startAt=start_at,
-				**times, clockErrorMs=round(error))
+			# The start is when a poll first saw the bump or the answer, up to one poll interval after it happened.
+			start_poll = int(joined["answerPollMs"] if answer_at >= bump_at else joined["bumpPollMs"])
+			check("usable-after-start", usable_ms >= -start_poll, measurementError=usable_ms < -start_poll, usableMs=usable_ms,
+				startAt=start_at, startPollMs=start_poll, **times, clockErrorMs=round(error))
 			check("usable-ms", usable_ms <= USABLE_BOUND_MS, node=node, usableMs=usable_ms, startAt=start_at, **times,
 				readyToAnswerMs=answer_at - ready_at, boundMs=USABLE_BOUND_MS)
 			env.wait_completed()
