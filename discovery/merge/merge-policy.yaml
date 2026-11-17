@@ -135,8 +135,8 @@ rows:
         - [{ host: 10.0.1.1, port: 3000 }, { host: 10.0.1.2, port: 3000 }]
         - [{ host: 10.0.1.3, port: 3000 }]
 
-  - case: replace-empty-refresh-keeps-previous
-    because: An empty result after init under replace keeps the previous snapshot.
+  - case: replace-empty-refresh-publishes-empty
+    because: An empty refresh after init under replace publishes an empty seed list.
     config:
       discovery: { merge_policy: replace }
       seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
@@ -153,10 +153,10 @@ rows:
             { host: 10.0.1.1, port: 3000 },
           ]
         - [{ host: 10.0.1.2, port: 3000 }]
-        - [{ host: 10.0.1.2, port: 3000 }]
+        - []
 
   - case: replace-empty-at-init-keeps-static
-    because: An empty result at init under replace leaves the static seeds, and a later empty result keeps them.
+    because: An empty result at init under replace leaves the static seeds, and a later empty result publishes an empty list.
     config:
       discovery: { merge_policy: replace }
       seeds: [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
@@ -167,7 +167,7 @@ rows:
     expect:
       snapshots:
         - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
-        - [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.2, port: 3000 }]
+        - []
 
   - case: replace-duplicates-keep-first
     because: replace removes duplicates keeping the first occurrence, at init and on refresh.
