@@ -108,6 +108,12 @@ subnet() {
 	echo "10.213.$(((PORT / 10) % 256))"
 }
 
+# The /24 nodes of fixed_cluster advertise, TEST-NET-1: no host routes it, so a client reaches a node
+# only through its published port.
+unroutable() {
+	echo "192.0.2"
+}
+
 # put <key> <value>: add one line to the values file.
 put() {
 	echo "$1=$2" >> "$VALUES.tmp"
@@ -122,10 +128,11 @@ put_node() {
 	put "${1}_ADVERTISED_PORT" "${6:-}"
 }
 
-# write_conf <file> <cluster name> <node id> <mesh seed or ""> [<alternate address> <alternate port> [<tls name> <cert dir>]]
+# write_conf <file> <cluster name> <node id> <mesh seed or ""> [<alternate address> <alternate port> [<tls name> <cert dir>
+# [<access address>]]]
 write_conf() {
 	local file="$1" cluster="$2" node_id="$3" mesh_seed="$4" alt_address="${5:-}" alt_port="${6:-}"
-	local tls_name="${7:-}" cert_dir="${8:-}"
+	local tls_name="${7:-}" cert_dir="${8:-}" access_address="${9:-}"
 
 	{
 		echo "service {"
@@ -152,6 +159,7 @@ write_conf() {
 		echo "    service {"
 		echo "        address any"
 		echo "        port 3000"
+		[ -z "$access_address" ] || echo "        access-address $access_address"
 		if [ -n "$alt_address" ]; then
 			echo "        alternate-access-address $alt_address"
 			echo "        alternate-access-port $alt_port"
@@ -219,15 +227,16 @@ cluster() {
 }
 
 # fixed_cluster <suffix or ""> <node a> <port a> <node b> <port b> <run|create>: two node cluster on
-# a network with subnet(), node A at .11 and node B at .12, each advertising only that address on
-# port 3000, which the host cannot reach. Node B is started with run or only created with create.
+# a network with subnet(), node A at .11 and node B at .12, advertising only unroutable() .11 and
+# .12 on port 3000, which no host reaches. Node B is started with run or only created with create.
 fixed_cluster() {
-	local s="${1:+$1-}" cluster="${1:-$ENV_NAME}" ip net
+	local s="${1:+$1-}" cluster="${1:-$ENV_NAME}" ip net adv
 	ip="$(subnet)"
+	adv="$(unroutable)"
 
-	write_conf "${s}a.conf" "$cluster" "$2" "$ip.12"
-	write_conf "${s}b.conf" "$cluster" "$4" "$ip.11"
-	log "Starting ${1:-cluster}: $2 ($ip.11:3000) on $ENV_HOST:$3, $4 ($ip.12:3000) on $ENV_HOST:$5 ($AEROSPIKE_IMAGE)"
+	write_conf "${s}a.conf" "$cluster" "$2" "$ip.12" "" "" "" "" "$adv.11"
+	write_conf "${s}b.conf" "$cluster" "$4" "$ip.11" "" "" "" "" "$adv.12"
+	log "Starting ${1:-cluster}: $2 (advertising $adv.11:3000) on $ENV_HOST:$3, $4 (advertising $adv.12:3000) on $ENV_HOST:$5 ($AEROSPIKE_IMAGE)"
 	net="$(network "$1" "$ip")"
 	node run "${s}a" "$net" "$ENV_HOST:$3:3000" "${s}a.conf" "$ip.11"
 	node "$6" "${s}b" "$net" "$ENV_HOST:$5:3000" "${s}b.conf" "$ip.12"

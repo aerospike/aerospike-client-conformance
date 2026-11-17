@@ -442,6 +442,7 @@ def scale_up_ctl():
 			"readyToAnswerMs=200 readyTransition=2026-11-13T10:00:00Z"], "phase": "scaling"},
 		"wait-pod": {"lines": ["L3-POD-UP pod={1} node=0A2 nodePort=31002 ready=False"]},
 		"scale": {"lines": ["L3-COMPLETED size={1}"], "phase": "start"},
+		"stats": stats(3),
 	}
 
 
@@ -515,6 +516,14 @@ class ScaleUpTest(RowsTest):
 			"l3-scale-up:scaling": {"nodes": [node(1), node(2)]}}
 		s = scenario(phases, ctl=scale_up_ctl(), watch=self.watch)
 		self.assertFailsCheck(self.row, s, "routing")
+
+	def test_proxy_hop_after_scale_up_fails(self):
+		ctl = dict(scale_up_ctl(), stats=stats(3, proxied=[0, 0, 5]))
+		self.assertFailsCheck(self.row, scenario(self.phases, ctl=ctl, watch=self.watch), "no-proxy-hop", step="scale-up")
+
+	def test_new_node_serving_nothing_fails(self):
+		ctl = dict(scale_up_ctl(), stats=stats(3, writes=[4096, 4096, 0], reads=[4096, 4096, 0]))
+		self.assertFailsCheck(self.row, scenario(self.phases, ctl=ctl, watch=self.watch), "served-by-nodes", step="scale-up")
 
 	def test_tls_profile_skips(self):
 		self.profile = "tls"

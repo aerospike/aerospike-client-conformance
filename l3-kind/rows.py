@@ -312,6 +312,15 @@ def serve_direct(env, drv, step, expected):
 		reads=reads, partitions=l5.PARTITIONS)
 
 
+def caught_up(drv, step, expected):
+	"""A routed snapshot two tend intervals after settled, so a running driver serves with the partition map the
+	servers settled on."""
+	_, start = drv.mark()
+	snapshot, waited = drv.wait(lambda m: m if m["type"] == "snapshot" and m["t"] - start >= 2 * TEND_INTERVAL_MS and
+		l5.routed(m, expected) else None, ROUTING_WAIT_MS)
+	check("caught-up", snapshot is not None, step=step, expected=sorted(expected), waitedMs=waited, boundMs=ROUTING_WAIT_MS)
+
+
 def routes_every_pod(env, step, pods, expected, seed=None):
 	"""Once no partition migrates, a driver seeded once holds one node per pod at its expected address, nothing
 	unowned, and serve writes and reads every partition, each at a node that holds it."""
@@ -423,7 +432,8 @@ def clock_offset(drv, rounds=3):
 def row_scale_up(env):
 	"""The pod the operator adds is usable by the running driver within two tend intervals of the later of the
 	peers-generation bump it causes and its first answer to a login and info request from the driver's network, at the endpoint hostname and its own Service
-	NodePort, with no driver restart or reseed; every node is held and every partition served afterwards."""
+	NodePort, with no driver restart or reseed; afterwards every node is held, and once migrations end the
+	same driver serves every partition with each node serving writes and reads itself and no proxy hop."""
 	_, pods, host = shared_expected(env, "scale-up-before")
 	size = len(pods)
 	prefix = pods[-1]["pod"].rpartition("-")[0]
@@ -480,7 +490,9 @@ def row_scale_up(env):
 			assert_nodes_at(env, "scale-up-after", snapshot, {p["node"]: (host, p["nodePort"]) for p in after})
 			kept(drv, "scale-up", since, [p["node"] for p in pods])
 			never_empty(drv, "scale-up", since)
-			l5.serve(drv, "scale-up")
+			settled(env, "scale-up-after")
+			caught_up(drv, "scale-up-after", [p["node"] for p in after])
+			serve_direct(env, drv, "scale-up", [p["node"] for p in after])
 	finally:
 		if join is not None:
 			l5.kill_group(join[0])
