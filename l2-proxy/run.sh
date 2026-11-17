@@ -35,6 +35,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ALL_PROFILES="default reachable pass-through-names pass-through-ports port-map-range port-range low-mtu idle-reset cn-only"
 SHARED_WORKFLOWS_COMMIT=318e453bea7f3c068ead24057dab07312a7fe62e
 ACTION_PATH=.github/actions/setup-discovery-topology
+DNS_ACTION_PATH=.github/actions/setup-dns-server
 TOXIPROXY_IMAGE=ghcr.io/shopify/toxiproxy:2.12.0
 CURL_IMAGE=curlimages/curl:8.11.1
 BUILD_IMAGE=public.ecr.aws/amazonlinux/amazonlinux:2023
@@ -161,6 +162,7 @@ describe_profile() {
 		low-mtu) echo "  namespace      max-record-size 8M" ;;
 		*) echo "  advertises     private address only" ;;
 	esac
+	echo "  dns            $PREFIX-dns on $CLIENT_NETWORK: $ENDPOINT_HOSTNAME A at Toxiproxy, _aerospike._tcp.$ENDPOINT_HOSTNAME SRV per clear listener"
 	echo "  control        $CTL_CONTAINER (curl on $NODE_NETWORK); new-node listeners from port $EXTRA_PORT_BASE"
 	echo "  node requests  node-server during L2_RUN, at $CONTROL_MOUNT in the client container$([ "$profile" = pass-through-ports ] && echo "; alternate-port advertises $PASS_THROUGH_HOSTNAME")"
 	echo "  driver         $PREFIX-driver-<pid> from $CLIENT_IMAGE on $CLIENT_NETWORK only"
@@ -295,13 +297,16 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for f in entrypoint.sh proxy_map.sh; do
+mkdir -p "$WORK/dns-action"
+for f in "$ACTION_PATH/entrypoint.sh:action" "$ACTION_PATH/proxy_map.sh:action" "$DNS_ACTION_PATH/entrypoint.sh:dns-action"; do
+	path="${f%:*}"
+	out="$WORK/${f##*:}/$(basename "$path")"
 	if [ -n "${SHARED_WORKFLOWS_DIR:-}" ]; then
-		git -C "$SHARED_WORKFLOWS_DIR" show "$SHARED_WORKFLOWS_COMMIT:$ACTION_PATH/$f" >"$WORK/action/$f" ||
-			die "$f not found at $SHARED_WORKFLOWS_COMMIT in $SHARED_WORKFLOWS_DIR"
+		git -C "$SHARED_WORKFLOWS_DIR" show "$SHARED_WORKFLOWS_COMMIT:$path" >"$out" ||
+			die "$path not found at $SHARED_WORKFLOWS_COMMIT in $SHARED_WORKFLOWS_DIR"
 	else
-		curl -sfL "https://raw.githubusercontent.com/aerospike/shared-workflows/$SHARED_WORKFLOWS_COMMIT/$ACTION_PATH/$f" \
-			-o "$WORK/action/$f" || die "cannot download $ACTION_PATH/$f at $SHARED_WORKFLOWS_COMMIT"
+		curl -sfL "https://raw.githubusercontent.com/aerospike/shared-workflows/$SHARED_WORKFLOWS_COMMIT/$path" \
+			-o "$out" || die "cannot download $path at $SHARED_WORKFLOWS_COMMIT"
 	fi
 done
 # setup-discovery-topology calls Toxiproxy's API with curl at its node network address.
@@ -475,7 +480,30 @@ write_values() {
 		echo "DISCOVERY_PROXY_PORT_RANGE=${PORT_RANGE:-}"
 		echo "DISCOVERY_IDLE_RESET=${IDLE_RESET:-}"
 		echo "DISCOVERY_CONTROL_DIR=$CONTROL_MOUNT"
+		echo "DISCOVERY_DNS_SERVER=${DNS_SERVER:-}"
 	} >"$state/values.env"
+}
+
+# A DNS server on the client network for the endpoint: an A record at Toxiproxy's client address and one
+# _aerospike._tcp SRV record per clear listener, as aerospike/shared-workflows setup-dns-server serves them.
+start_dns_server() {
+	local zone port ports
+	zone="\$ORIGIN $ENDPOINT_HOSTNAME.
+@ 3600 IN SOA ns.$ENDPOINT_HOSTNAME. admin.$ENDPOINT_HOSTNAME. 1 60 60 60 1
+@ 1 IN A $PROXY_CLIENT_ADDRESS"
+	IFS=, read -r -a ports <<<"$(output endpoint-ports)"
+	for port in "${ports[@]}"; do
+		zone+=$'\n'"_aerospike._tcp 1 IN SRV 10 10 $port $ENDPOINT_HOSTNAME."
+	done
+	NETWORK_NAME="$CLIENT_NETWORK" \
+		CONTAINER_NAME="$PREFIX-dns" \
+		ZONE_NAME="$ENDPOINT_HOSTNAME" \
+		ZONE_CONTENT="$zone" \
+		GITHUB_OUTPUT="$STATE/dns.out" \
+		bash "$WORK/dns-action/entrypoint.sh" >"$RES/dns.log" 2>&1 || { tail -30 "$RES/dns.log" >&2; return 1; }
+	DNS_SERVER="$(sed -n 's/^server-address=//p' "$STATE/dns.out")"
+	[ -n "$DNS_SERVER" ] || { echo "no DNS server address" >&2; return 1; }
+	echo "DNS server $PREFIX-dns at $DNS_SERVER on $CLIENT_NETWORK"
 }
 
 # Build one profile's topology into $STATE. Fails the profile on any error.
@@ -494,6 +522,7 @@ build_topology() {
 	CLIENT_HOSTS=""
 	ACCESS_HOSTNAME=""
 	ALTERNATE_HOSTNAME=""
+	DNS_SERVER=""
 	case "$profile" in
 		port-map-range) network_args=(--subnet "$SUBNET.0/24" --ip-range "$SUBNET.128/25") ;;
 		low-mtu)
@@ -571,6 +600,7 @@ build_topology() {
 	proxy_server_address="$(container_address "$PROXY" "$NODE_NETWORK")"
 	[ -n "$PROXY_CLIENT_ADDRESS" ] && [ -n "$proxy_server_address" ] || { echo "no Toxiproxy address" >&2; return 1; }
 	IFS=, read -r -a proxies <<<"$(output proxy-name-port-map)"
+	start_dns_server
 
 	case "$profile" in
 		reachable | pass-through-names | pass-through-ports)
