@@ -447,6 +447,11 @@ class PortMapCollisionTest(RowsTest):
 			"10.0.0.13:3000=as-endpoint.test:4902", flags[flags.index("--port-map") + 1])
 		self.assertEqual("strict", flags[flags.index("--on-miss") + 1])
 
+	def test_heavy_workers(self):
+		self.assertPasses(self.row, self.collision())
+		flags = self.driver_args()[-1]
+		self.assertEqual("64", flags[flags.index("--workers") + 1])
+
 	def test_colliding_node_held_fails(self):
 		self.assertFailsCheck(self.row, self.collision(later=three()[:2]), "never-held", node='["B1","C1"]')
 
@@ -466,6 +471,11 @@ class StrictMissTest(RowsTest):
 		self.assertPasses(self.row, scenario({"start": {"nodes": three()[:2], "unowned": 1365}}))
 		flags = self.driver_args()[0]
 		self.assertEqual("A1=as-endpoint.test:4901,B1=as-endpoint.test:4902", flags[flags.index("--port-map") + 1])
+
+	def test_heavy_workers(self):
+		self.assertPasses(self.row, scenario({"start": {"nodes": three()[:2]}}))
+		flags = self.driver_args()[0]
+		self.assertEqual("64", flags[flags.index("--workers") + 1])
 
 	def test_unmapped_node_held_later(self):
 		s = scenario({"start": {"nodes": three()[:2], "later": [{"after_ms": 2000, "nodes": three()}]}})
@@ -647,6 +657,11 @@ class ReachableTest(RowsTest):
 	def test_strict_passes(self):
 		self.assertPasses("strict-miss-never-holds-the-reachable-node", self.with_nodes(scenario({"start": {"nodes": three()[:2]}})))
 
+	def test_strict_heavy_workers(self):
+		self.assertPasses("strict-miss-never-holds-the-reachable-node", self.with_nodes(scenario({"start": {"nodes": three()[:2]}})))
+		flags = self.driver_args()[0]
+		self.assertEqual("64", flags[flags.index("--workers") + 1])
+
 	def test_strict_holding_reachable_fails(self):
 		s = self.with_nodes(scenario({"start": {"nodes": three()[:2], "later": [{"after_ms": 1000,
 			"nodes": three(C1={"host": "as-reachable.test"})}]}}))
@@ -655,6 +670,12 @@ class ReachableTest(RowsTest):
 	def test_alternate_passes(self):
 		at_alt = three(A1={"host": "as-reachable.test"}, B1={"host": PROXY})[:2]
 		self.assertPasses("alternate-list-holds-only-nodes-with-alternate", self.with_nodes(scenario({"start": {"nodes": at_alt}})))
+
+	def test_alternate_heavy_workers(self):
+		at_alt = three(A1={"host": "as-reachable.test"}, B1={"host": PROXY})[:2]
+		self.assertPasses("alternate-list-holds-only-nodes-with-alternate", self.with_nodes(scenario({"start": {"nodes": at_alt}})))
+		flags = self.driver_args()[0]
+		self.assertEqual("64", flags[flags.index("--workers") + 1])
 
 	def test_alternate_holding_reachable_fails(self):
 		s = self.with_nodes(scenario({"start": {"nodes": three(A1={"host": "as-reachable.test"}, B1={"host": PROXY})[:2],
@@ -772,6 +793,11 @@ class PassThroughPortsTest(RowsTest):
 		self.assertIn("stop-node c-5", log)
 		self.assertEqual("wait-cluster 3 --timeout 120", log[-1])
 		self.assertEqual("pass-through", self.driver_args()[-1][self.driver_args()[-1].index("--shape") + 1])
+
+	def test_colliding_alternate_heavy_workers(self):
+		self.assertPasses("colliding-alternate-nodes-never-held", self.colliding())
+		flags = self.driver_args()[-1]
+		self.assertEqual("64", flags[flags.index("--workers") + 1])
 
 	def test_colliding_alternate_held_fails(self):
 		s = self.colliding(later=three() + [node("D1", 4911, host="as-pass-through.test")])
