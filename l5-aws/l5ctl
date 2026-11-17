@@ -54,7 +54,8 @@
 #   endpoint-zone ADDRESS
 #       Print the AZ of the interface endpoint's network interface that has ADDRESS.
 #   experiment ID [--wait]
-#       Print an FIS experiment's state.
+#       Print an FIS experiment's state. --wait waits until it completes and also prints when its
+#       last action ended, as endMs (epoch milliseconds, - when FIS does not say).
 #   resolve-check [--expect-producer yes|no]
 #       Resolve the endpoint name on this host and from a pod in the producer VPC.
 #   verify
@@ -489,12 +490,24 @@ start_experiment() {
 	echo "L5-FIS action=$action experiment=$EXPERIMENT template=$id"
 }
 
+# Epoch milliseconds at which the last action of experiment ID ended, or - when FIS does not say.
+experiment_end_ms() {
+	local end ms last=-
+	for end in $(aws fis get-experiment --id "$1" --query 'experiment.actions.*.endTime' --output text); do
+		ms="$(date -d "$end" +%s%3N 2>/dev/null)" || continue
+		if [ "$last" = - ] || [ "$ms" -gt "$last" ]; then
+			last="$ms"
+		fi
+	done
+	echo "$last"
+}
+
 wait_experiment() {
 	local id="$1" status i
 	for i in $(seq 1 120); do
 		status="$(aws fis get-experiment --id "$id" --query 'experiment.state.status' --output text)"
 		case "$status" in
-			completed) echo "L5-FIS experiment=$id status=$status"; return 0 ;;
+			completed) echo "L5-FIS experiment=$id status=$status endMs=$(experiment_end_ms "$id")"; return 0 ;;
 			failed | stopped | cancelled)
 				aws fis get-experiment --id "$id" --query 'experiment.state.reason' --output text >&2
 				die "FIS experiment $id $status" ;;

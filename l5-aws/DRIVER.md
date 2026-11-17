@@ -94,7 +94,7 @@ Once, when the first load command has succeeded.
 }
 ```
 
-`epochMs` is the wall clock at `t`, for lining up with other logs only.
+`epochMs` is the wall clock at `t`, for lining up with other clocks only: W-5 uses it to put the outage end FIS reports on the driver's clock for a report, and no check uses it.
 
 ### `snapshot`
 

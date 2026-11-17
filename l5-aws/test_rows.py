@@ -303,6 +303,9 @@ class RowsTest(unittest.TestCase):
 		self.assertIn("L5-FAILED kind=contract", out)
 		self.assertIn(reason, out)
 
+	def failed_lines(self, out):
+		return [line for line in out.splitlines() if line.startswith("L5-FAILED ")]
+
 
 class UsageTest(RowsTest):
 	def test_missing_variable_is_named(self):
@@ -404,6 +407,29 @@ class W1Test(RowsTest):
 		s = w1()
 		s["ctl"]["resolve-check"] = {"exit": 1, "stderr": "ERROR: expected the producer VPC to resolve it: no, got: yes"}
 		self.assertFailsCheck(*self.run_row("W-1", s), "resolve-check")
+
+	def test_failure_recorded_before_driver_exit(self):
+		s = w1()
+		s["driver"]["phases"]["start"]["nodes"] = three_nodes(B1={"reachable": False})
+		s["driver"]["quit_exit"] = 1
+		code, out = self.run_row("W-1", s)
+		self.assertEqual(3, code, out)
+		failed = self.failed_lines(out)
+		self.assertEqual(2, len(failed), out)
+		self.assertTrue(failed[0].startswith("L5-FAILED kind=assertion reason=routing: "), failed)
+		self.assertTrue(failed[1].startswith("L5-FAILED kind=contract reason=driver exited with status 1 after quit"),
+			failed)
+
+	def test_failure_recorded_before_restore(self):
+		s = w1()
+		s["driver"]["phases"]["start"]["nodes"] = three_nodes(B1={"reachable": False})
+		s["ctl"]["pods"] = [pods_entry(), pods_entry(), {"exit": 1, "stderr": "ERROR: no cluster"}]
+		code, out = self.run_row("W-1", s)
+		self.assertEqual(1, code, out)
+		failed = self.failed_lines(out)
+		self.assertEqual(2, len(failed), out)
+		self.assertTrue(failed[0].startswith("L5-FAILED kind=assertion reason=routing: "), failed)
+		self.assertTrue(failed[1].startswith("L5-FAILED kind=assertion reason=pods: "), failed)
 
 
 class ContractTest(RowsTest):
@@ -681,9 +707,23 @@ class W3Test(RowsTest):
 
 
 class W5Test(RowsTest):
+	def recovered(self, out):
+		lines = [line for line in out.splitlines() if line.startswith("L5-OUTAGE-RECOVERED ")]
+		self.assertEqual(1, len(lines), out)
+		return dict(word.split("=", 1) for word in lines[0].split()[1:])
+
 	def test_passes(self):
 		code, out = self.run_row("W-5", w5())
 		self.assertPasses(code, out)
+		recovered = self.recovered(out)
+		self.assertEqual("zone-b", recovered["zone"])
+		self.assertEqual("poll", recovered["endBasis"])
+		self.assertEqual(recovered["seenEndT"], recovered["endT"])
+		self.assertEqual("15000", recovered["pollMs"])
+		self.assertEqual("false", recovered["routedThroughout"])
+		self.assertLessEqual(0, int(recovered["clientRecoveredMs"]))
+		self.assertLess(int(recovered["clientRecoveredMs"]), int(recovered["clusterReadyMs"]))
+		self.assertEqual(int(recovered["routedT"]) - int(recovered["endT"]), int(recovered["clientRecoveredMs"]))
 		log = self.ctl_log()
 		self.assertIn("az-outage zone-b --duration PT5M --wait-running", log)
 		self.assertEqual(21, log.count("experiment E5"))
@@ -732,11 +772,87 @@ class W5Test(RowsTest):
 		s["ctl"]["experiment"] = {"lines": ["L5-FIS experiment={1} status=running"]}
 		self.assertFailsCheck(*self.run_row("W-5", s), "outage-ended", boundMs=900000)
 		self.assertEqual(["experiment E5 --wait", "wait-ready --timeout 1200", "pods"], self.ctl_log()[-3:])
+		self.assertNotIn(" step=after ", self.output)
+		self.assertNotIn("L5-CHECK check=longest-unowned ", self.output)
+		self.assertNotIn("L5-OUTAGE-RECOVERED", self.output)
 
 	def test_longest_unowned(self):
 		s = w5()
 		s["driver"]["phases"]["outage"]["fields"]["longestUnownedMs"] = 30001
 		self.assertFailsCheck(*self.run_row("W-5", s), "longest-unowned", longestUnownedMs=30001)
+
+	def test_two_deferred_failures(self):
+		s = w5()
+		s["driver"]["phases"]["outage"]["fields"].update({"longestUnownedMs": 30001, "maxLatencyMs": 33001})
+		code, out = self.run_row("W-5", s)
+		self.assertEqual(1, code, out)
+		self.assertIn("L5-CHECK check=longest-unowned unownedReported=true longestUnownedMs=30001 boundMs=30000 "
+			"outcome=fail", out)
+		self.assertIn("L5-CHECK check=max-latency maxLatencyMs=33001 boundMs=33000 outcome=fail", out)
+		self.assertRegex(out, r"L5-CHECK check=routing step=after .* outcome=pass")
+		self.assertRegex(out, r"L5-CHECK check=serve step=after .* outcome=pass")
+		failed = self.failed_lines(out)
+		self.assertEqual(2, len(failed), out)
+		self.assertTrue(failed[0].startswith("L5-FAILED kind=assertion reason=longest-unowned: "), failed)
+		self.assertTrue(failed[1].startswith("L5-FAILED kind=assertion reason=max-latency: "), failed)
+		self.assertEqual(1, self.ctl_log().count("experiment E5 --wait"))
+
+	def test_recovered_from_fis_end(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"epochMs": 1000000}
+		s["ctl"]["experiment --wait"] = {"lines": ["L5-FIS experiment={1} status=completed endMs=1250000"]}
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		recovered = self.recovered(out)
+		self.assertEqual("fis", recovered["endBasis"])
+		self.assertEqual("250000", recovered["endT"])
+		self.assertNotEqual(recovered["seenEndT"], recovered["endT"])
+		self.assertEqual(int(recovered["routedT"]) - 250000, int(recovered["clientRecoveredMs"]))
+
+	def test_recovered_from_poll_when_fis_does_not_say(self):
+		s = w5()
+		s["ctl"]["experiment --wait"] = {"lines": ["L5-FIS experiment={1} status=completed endMs=-"]}
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		recovered = self.recovered(out)
+		self.assertEqual("poll", recovered["endBasis"])
+		self.assertEqual(recovered["seenEndT"], recovered["endT"])
+
+	def test_routed_throughout(self):
+		s = w5()
+		s["driver"]["phases"]["outage"]["nodes"] = three_nodes(C1={"address": "10.0.0.2"})
+		s["driver"]["phases"]["outage"]["later"][0]["nodes"] = three_nodes(A1={"address": "10.0.0.2"},
+			B1={"address": "10.0.0.2"}, C1={"address": "10.0.0.2"})
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		recovered = self.recovered(out)
+		self.assertEqual("true", recovered["routedThroughout"])
+		self.assertEqual("null", recovered["clientRecoveredMs"])
+		self.assertEqual("null", recovered["routedT"])
+
+	def test_deferred_then_routing_after(self):
+		s = w5()
+		s["driver"]["phases"]["outage"]["fields"]["longestUnownedMs"] = 30001
+		s["driver"]["phases"]["after"]["nodes"] = three_nodes(B1={"active": False})
+		code, out = self.run_row("W-5", s)
+		self.assertEqual(1, code, out)
+		self.assertNotIn("L5-OUTAGE-RECOVERED", out)
+		failed = self.failed_lines(out)
+		self.assertEqual(2, len(failed), out)
+		self.assertTrue(failed[0].startswith("L5-FAILED kind=assertion reason=longest-unowned: "), failed)
+		self.assertTrue(failed[1].startswith("L5-FAILED kind=assertion reason=routing: step=after "), failed)
+
+	def test_deferred_then_contract_break(self):
+		s = w5()
+		s["driver"]["phases"]["outage"]["fields"]["longestUnownedMs"] = 30001
+		s["driver"]["refuse"] = ["serve"]
+		code, out = self.run_row("W-5", s)
+		self.assertEqual(3, code, out)
+		failed = self.failed_lines(out)
+		self.assertEqual(2, len(failed), out)
+		self.assertTrue(failed[0].startswith("L5-FAILED kind=assertion reason=longest-unowned: "), failed)
+		self.assertTrue(failed[1].startswith("L5-FAILED kind=contract "), failed)
+		self.assertIn("L5-ROW-RESULT row=W-5 exit=3", out)
 
 	def test_max_latency(self):
 		s = w5()
@@ -754,6 +870,31 @@ class W5Test(RowsTest):
 		s = w5()
 		del s["driver"]["phases"]["outage"]["later"]
 		self.assertFailsCheck(*self.run_row("W-5", s), "moved-off-zone", address="10.0.0.1", afterRunningMs="null")
+		self.assertSkippedAfterMove(self.output)
+		self.assertRegex(self.output, r"L5-CHECK check=routing step=after .* outcome=pass")
+		self.assertRegex(self.output, r"L5-CHECK check=serve step=after .* outcome=pass")
+		self.assertRegex(self.recovered(self.output)["clientRecoveredMs"], r"^-?\d+$")
+		failed = self.failed_lines(self.output)
+		self.assertEqual(1, len(failed), self.output)
+		self.assertTrue(failed[0].startswith("L5-FAILED kind=assertion reason=moved-off-zone: "), failed)
+		self.assertIn("L5-ROW-RESULT row=W-5 exit=1", self.output.splitlines())
+		self.assertEqual(1, self.ctl_log().count("experiment E5 --wait"))
+
+	def test_moved_off_zone_never_contract_3(self):
+		s = w5()
+		s["driver"]["ready_fields"] = {"contract": 3}
+		del s["driver"]["phases"]["outage"]["later"]
+		self.assertFailsCheck(*self.run_row("W-5", s), "moved-off-zone", address="10.0.0.1")
+		self.assertSkippedAfterMove(self.output)
+
+	def assertSkippedAfterMove(self, out):
+		lines = out.splitlines()
+		moved = [i for i, line in enumerate(lines) if line.startswith("L5-CHECK check=moved-off-zone ")][0]
+		for name in ("stays-off-zone", "no-failures-after-move"):
+			checks = [line for line in lines if line.startswith("L5-CHECK check=%s " % name)]
+			skipped = "L5-CHECK check=%s outcome=skip reason=no-move" % name
+			self.assertEqual([skipped], checks)
+			self.assertLess(moved, lines.index(skipped))
 
 	def test_moved_off_zone_late(self):
 		s = w5()
@@ -786,6 +927,9 @@ class W5Test(RowsTest):
 		self.assertPasses(code, out)
 		self.assertIn("L5-CHECK check=stays-off-zone address=10.0.0.1 t=null afterRunningMs=null nodes=null untilT=",
 			out)
+		recovered = self.recovered(out)
+		self.assertEqual("poll", recovered["endBasis"])
+		self.assertLess(int(recovered["clientRecoveredMs"]), 0)
 
 	def test_no_failures_after_move(self):
 		s = w5()
