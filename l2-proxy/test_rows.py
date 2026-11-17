@@ -926,18 +926,33 @@ class PortRangeTest(RowsTest):
 
 	def test_waits_for_source_ports_before_low_load(self):
 		s = self.exhausted()
-		s["ctl"]["proxy-ports"] = [{"lines": [ports(10)]}, {"lines": [ports(0)]}]
+		s["ctl"]["proxy-ports"] = [{"lines": [ports(0)]}, {"lines": [ports(10)]}, {"lines": [ports(0)]}]
 		with mock.patch.object(rows, "PORTS_POLL_S", 0):
 			self.assertPasses(self.row, s)
-		self.assertEqual(2, self.ctl_log().count("proxy-ports"))
+		self.assertEqual(3, self.ctl_log().count("proxy-ports"))
 
 	def test_source_ports_never_free_fails(self):
 		s = self.exhausted()
-		s["ctl"]["proxy-ports"] = {"lines": [ports(10)]}
+		s["ctl"]["proxy-ports"] = [{"lines": [ports(0)]}, {"lines": [ports(10)]}]
 		with mock.patch.object(rows, "PORTS_FREE_WAIT_MS", 0):
-			self.assertFailsCheck(self.row, s, "proxy-ports-free", used=10, timeWait=10)
+			self.assertFailsCheck(self.row, s, "proxy-ports-free", step="low-load", used=10, timeWait=10)
 		sets = [args[args.index("--set") + 1] for args in self.driver_args()]
 		self.assertNotIn("l2-source-ports-low", sets)
+
+	def test_waits_for_source_ports_before_exhausting(self):
+		s = self.exhausted()
+		s["ctl"]["proxy-ports"] = [{"lines": [ports(10)]}, {"lines": [ports(0)]}]
+		with mock.patch.object(rows, "PORTS_POLL_S", 0):
+			self.assertPasses(self.row, s)
+		self.assertEqual(3, self.ctl_log().count("proxy-ports"))
+
+	def test_source_ports_busy_before_fails(self):
+		s = self.exhausted()
+		s["ctl"]["proxy-ports"] = {"lines": [ports(10)]}
+		with mock.patch.object(rows, "PORTS_FREE_WAIT_MS", 0):
+			self.assertFailsCheck(self.row, s, "proxy-ports-free", step="before", used=10, timeWait=10)
+		sets = [args[args.index("--set") + 1] for args in self.driver_args()]
+		self.assertNotIn("l2-source-ports", sets)
 
 	def test_older_driver_skips(self):
 		self.assertOlderDriverSkips(self.row, self.exhausted(), 3)

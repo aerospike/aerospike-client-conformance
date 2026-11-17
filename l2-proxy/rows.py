@@ -879,13 +879,15 @@ def parse_peers(value):
 
 
 def row_source_ports(env):
-	"""More concurrent commands than Toxiproxy has source ports for: every failed attempt fails within the
-	timeout, and at low load every node is held and served again."""
+	"""More concurrent commands than Toxiproxy has free source ports for: every failed attempt fails within
+	the timeout, and once Toxiproxy holds none of those ports, at low load every node is held and served
+	again."""
 	first, last = env.value("DISCOVERY_PROXY_PORT_RANGE").split()
 	reading = env.ctl.ok("proxy-port-range").first("L2-PORT-RANGE")
 	check("proxy-port-range", (reading["first"], reading["last"]) == (first, last), first=reading["first"],
 		last=reading["last"], expected="%s-%s" % (first, last))
 	nodes = env.topology()
+	await_proxy_ports_free(env, "before")
 	with env.driver("l2-source-ports", port_map=port_map_by_name(env, nodes), workers=HEAVY_WORKERS) as drv:
 		since = drv.mark()
 		base = drv.latest() or {}
@@ -906,8 +908,9 @@ def row_source_ports(env):
 
 
 def await_proxy_ports_free(env, step):
-	"""Wait until Toxiproxy holds no socket on its source ports: the exhausted run's sockets stay in
-	TIME_WAIT for a minute after it closes them, and until then a new client cannot connect at all."""
+	"""Wait until Toxiproxy holds no socket on its source ports: the sockets of an earlier driver, the
+	previous row's or the exhausted run's, stay in TIME_WAIT for a minute after it closes them, and until
+	then a new client cannot connect at all."""
 	bound_ms = PORTS_FREE_WAIT_MS
 	start = time.monotonic()
 	while True:
