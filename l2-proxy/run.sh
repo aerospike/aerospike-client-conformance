@@ -629,6 +629,14 @@ for PROFILE in "${PROFILE_LIST[@]}"; do
 		grep -m1 '^ERROR' "$RES/rows.log" | sed "s/^/PROFILE $PROFILE /" | tee -a "$RESULTS/rows.txt" || true
 	fi
 	if [ -n "$L2_RUN" ]; then
+		# The rows leave Toxiproxy's capped source ports in TIME_WAIT, and until they free a new client cannot connect.
+		if [ "$PROFILE" = port-range ]; then
+			for _ in $(seq 18); do
+				"$L2_CTL" proxy-ports | grep -q ' used=0 ' && break
+				sleep 5
+			done
+			"$L2_CTL" proxy-ports | tee -a "$RES/l2-run-ports.txt"
+		fi
 		echo "Running L2_RUN (l2-run.log)"
 		IFS=, read -r -a entries <<<"${CLIENT_HOSTS:-}"
 		run_hosts=()
