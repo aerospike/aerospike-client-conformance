@@ -297,6 +297,8 @@ class Driver:
 		if kind is None:
 			self.close()
 		else:
+			if isinstance(error, (ContractError, RowFailure)):
+				self.outcome.record(error)
 			self._close_quietly()
 		return False
 
@@ -465,6 +467,11 @@ class Outcome:
 		self.status = 0
 
 	def record(self, error):
+		"""Each failure once, as it happens, so the first L5-FAILED line is the first failure and not one
+		from the cleanup after it."""
+		if getattr(error, "recorded", False):
+			return
+		error.recorded = True
 		status = 3 if isinstance(error, ContractError) else 1
 		self.status = max(self.status, status)
 		emit(TAG + "-FAILED", kind="contract" if status == 3 else "assertion", reason=str(error))
@@ -664,6 +671,9 @@ def row_w1(env):
 		env.ctl.ok(VERIFY_TIMEOUT_MS, "verify")
 		expect = "yes" if env.control == "resolvable" else "no"
 		env.ctl.ok(CTL_TIMEOUT_MS, "resolve-check", "--expect-producer", expect)
+	except (RowFailure, ContractError) as e:
+		env.outcome.record(e)
+		raise
 	finally:
 		env.outcome.guard(env.restore_size, found)
 
@@ -702,6 +712,9 @@ def row_w2(env):
 				"--wait")
 			_, pods = env.pods()
 			recover(env, drv, "rollout", [p["pod"] for p in pods], ROLLOUT_WAIT_MS, "rollout", "all", "--wait")
+	except (RowFailure, ContractError) as e:
+		env.outcome.record(e)
+		raise
 	finally:
 		env.outcome.guard(env.restore_size, found)
 
@@ -802,6 +815,9 @@ def row_w3(env):
 
 			await_routing(drv, "served", existing + [node], ROUTING_WAIT_MS)
 			serve(drv, "served")
+	except (RowFailure, ContractError) as e:
+		env.outcome.record(e)
+		raise
 	finally:
 		restore_w3(env, found, state)
 
@@ -834,6 +850,24 @@ def log_resolved(env, when, snapshot):
 	emit("L5-RESOLVED", when=when, t=snapshot["t"], name=env.endpoint, addresses=addresses or "unresolved",
 		clientHosts=client_hosts(snapshot))
 	return addresses
+
+
+def deferred_check(deferred, name, ok, **fields):
+	try:
+		check(name, ok, **fields)
+	except RowFailure as e:
+		deferred.append(e)
+
+
+def outage_end(drv, ended, seen):
+	"""The end of the outage on the driver's clock, and its basis: fis when experiment --wait printed when
+	the experiment's last action ended, lined up through the driver's ready epochMs; else poll, the snapshot
+	at which the harness saw the experiment end, up to STATUS_POLL_MS late."""
+	lines = ended.tagged("L5-FIS")
+	end_ms = lines[-1].fields.get("endMs", "") if lines else ""
+	if end_ms.isdigit() and is_number(drv.ready["epochMs"]):
+		return drv.ready["t"] + int(end_ms) - drv.ready["epochMs"], "fis"
+	return seen["t"], "poll"
 
 
 def row_w5(env):
@@ -928,38 +962,67 @@ def row_w5(env):
 				addresses=seen["resolved"])
 			check("outage-ended", end is not None, experiment=experiment, status=seen["status"], observedMs=observed,
 				boundMs=OUTAGE_WAIT_MS, pollMs=STATUS_POLL_MS)
-			check("longest-unowned", not seen["unowned"] or seen["longestUnownedMs"] <= OWNERSHIP_GAP_MS,
-				unownedReported=seen["unowned"], longestUnownedMs=seen["longestUnownedMs"], boundMs=OWNERSHIP_GAP_MS)
-			check("max-latency", seen["maxLatencyMs"] <= COMMAND_BOUND_MS, maxLatencyMs=seen["maxLatencyMs"],
-				boundMs=COMMAND_BOUND_MS)
+			deferred = []
+			deferred_check(deferred, "longest-unowned",
+				not seen["unowned"] or seen["longestUnownedMs"] <= OWNERSHIP_GAP_MS, unownedReported=seen["unowned"],
+				longestUnownedMs=seen["longestUnownedMs"], boundMs=OWNERSHIP_GAP_MS)
+			deferred_check(deferred, "max-latency", seen["maxLatencyMs"] <= COMMAND_BOUND_MS,
+				maxLatencyMs=seen["maxLatencyMs"], boundMs=COMMAND_BOUND_MS)
 			moved = seen["moved"]
 			moved_ms = moved and moved["t"] - running_t
-			check("moved-off-zone", moved is not None and moved_ms <= OWNERSHIP_GAP_MS, address=address,
-				afterRunningMs=moved_ms, boundMs=OWNERSHIP_GAP_MS, clientHosts=client_hosts(moved or last),
+			deferred_check(deferred, "moved-off-zone", moved is not None and moved_ms <= OWNERSHIP_GAP_MS,
+				address=address, afterRunningMs=moved_ms, boundMs=OWNERSHIP_GAP_MS, clientHosts=client_hosts(moved or last),
 				failedWhileOnZone=(moved or last)["failed"] - failed_at_running)
-			back = seen["back"] or {}
-			check("stays-off-zone", not back, address=address, t=back.get("t"),
-				afterRunningMs=back["t"] - running_t if back else None, nodes=back.get("nodes"), untilT=until_t)
-			if drv.contract >= 3:
-				first = seen["firstStartAfterMove"]
-				check("no-failures-after-move", first is None, failedAtMove=moved["failed"], failedAtEnd=last["failed"],
-					basis="start", startedBeforeMove=seen["startedBeforeMove"], startedAfterMove=seen["startedAfterMove"],
-					firstStartAfterRunningMs=first and first["startedAt"] - running_t, message=first and first["message"],
-					lastError=last["lastError"], untilT=until_t)
+			if moved is None:
+				emit(TAG + "-CHECK", check="stays-off-zone", outcome="skip", reason="no-move")
+				emit(TAG + "-CHECK", check="no-failures-after-move", outcome="skip", reason="no-move")
 			else:
-				rise = seen["rise"]
-				check("no-failures-after-move", rise is None, failedAtMove=moved["failed"], failedAtEnd=last["failed"],
-					basis="completion", firstRiseAfterRunningMs=rise and rise["t"] - running_t, lastError=last["lastError"],
-					untilT=until_t)
+				back = seen["back"] or {}
+				deferred_check(deferred, "stays-off-zone", not back, address=address, t=back.get("t"),
+					afterRunningMs=back["t"] - running_t if back else None, nodes=back.get("nodes"), untilT=until_t)
+				if drv.contract >= 3:
+					first = seen["firstStartAfterMove"]
+					deferred_check(deferred, "no-failures-after-move", first is None, failedAtMove=moved["failed"],
+						failedAtEnd=last["failed"], basis="start", startedBeforeMove=seen["startedBeforeMove"],
+						startedAfterMove=seen["startedAfterMove"],
+						firstStartAfterRunningMs=first and first["startedAt"] - running_t,
+						message=first and first["message"], lastError=last["lastError"], untilT=until_t)
+				else:
+					rise = seen["rise"]
+					deferred_check(deferred, "no-failures-after-move", rise is None, failedAtMove=moved["failed"],
+						failedAtEnd=last["failed"], basis="completion",
+						firstRiseAfterRunningMs=rise and rise["t"] - running_t, lastError=last["lastError"],
+						untilT=until_t)
 
-			env.ctl.ok(EXPERIMENT_WAIT_MS, "experiment", experiment, "--wait", name="experiment-wait")
-			state["ended"] = True
-			env.wait_ready()
-			env.wait_healthy()
-			_, pods = env.pods()
-			after = await_routing(drv, "after", [p["node"] for p in pods], RECOVERY_MS)
-			log_resolved(env, "after", after)
-			serve(drv, "after")
+			try:
+				ended = env.ctl.ok(EXPERIMENT_WAIT_MS, "experiment", experiment, "--wait", name="experiment-wait")
+				state["ended"] = True
+				env.wait_ready()
+				env.wait_healthy()
+				ready_t = drv.mark()[1]
+				_, pods = env.pods()
+				expected = [p["node"] for p in pods]
+				after = await_routing(drv, "after", expected, RECOVERY_MS)
+				end_t, basis = outage_end(drv, ended, end)
+				recovered = after
+				for snapshot in reversed(drv.between(reset["_index"], after["_index"])):
+					if not routed(snapshot, expected):
+						break
+					recovered = snapshot
+				else:
+					recovered = None
+				emit("L5-OUTAGE-RECOVERED", zone=zone, endT=end_t, endBasis=basis, seenEndT=end["t"],
+					pollMs=STATUS_POLL_MS, clusterReadyMs=ready_t - end_t,
+					clientRecoveredMs=recovered and recovered["t"] - end_t, routedT=recovered and recovered["t"],
+					routedThroughout=recovered is None)
+				log_resolved(env, "after", after)
+				serve(drv, "after")
+			finally:
+				for failure in deferred:
+					env.outcome.record(failure)
+	except (RowFailure, ContractError) as e:
+		env.outcome.record(e)
+		raise
 	finally:
 		restore_w5(env, found, state)
 
