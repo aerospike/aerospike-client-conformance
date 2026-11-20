@@ -1,11 +1,16 @@
 kind: collision
 description: >-
   Translation collisions. input is every peer advertised in one peers reply, in order; each is
-  translated with the row's config. Peers that translate to the same host and port become no
-  node, and each collision is reported with both node names, the shared host and port and the
-  translator. An expected error with two nodeNames needs that pair reported; one with a single
-  name needs that peer reported in some collision on that host and port, paired with any other
-  peer. expect.nodes is the node names that become nodes.
+  translated with the row's config. A peer has one host (host and port) or several (hosts, in
+  advertised order). Addresses are compared exactly on host and port after translation, and every
+  shared address of the reply is found before any is removed. A shared address is never used. A
+  peer that still has an address of its own is created through it; a peer whose every address is
+  shared becomes no node and is reported in a collision with both node names, the shared host and
+  port and the translator. A peer with several shared addresses is reported on its first shared
+  address in advertised order. An expected error with two nodeNames needs that pair reported; one
+  with a single name needs that peer reported in some collision on that host and port, paired with
+  any other peer. expect.nodes is the node names that become nodes; expect.errors lists only
+  collided peers, though a created peer can appear in another peer's collision message.
 rows:
   - case: static-map-two-hosts-one-target
     because: Two hosts mapped to one host on the same port create neither node, and a peer with its own mapping is still created.
@@ -260,3 +265,258 @@ rows:
           sourceList: standard,
         },
       ]
+
+  - case: partial-overlap-keeps-own-addresses
+    because: A peer keeps its own addresses when another peer shares one of them. A client that rejects a peer on any shared address fails this row.
+    config:
+      translation: { provider: pass-through }
+    input:
+      [
+        {
+          nodeName: BB9020011AC4202,
+          tlsName: db1.example.com,
+          hosts:
+            [
+              { host: as.priv.example.com, port: 31001 },
+              { host: as.priv.example.com, port: 31002 },
+            ],
+          sourceList: alternate,
+        },
+        {
+          nodeName: BB9030011AC4202,
+          tlsName: db2.example.com,
+          hosts:
+            [
+              { host: as.priv.example.com, port: 31001 },
+              { host: as.priv.example.com, port: 31003 },
+            ],
+          sourceList: alternate,
+        },
+      ]
+    expect:
+      nodes: [BB9020011AC4202, BB9030011AC4202]
+      errors: []
+
+  - case: port-map-partial-overlap
+    because: Two addresses mapped to one target are shared, but each peer keeps its other address, so both peers are created. A client that rejects a peer on any shared address fails this row.
+    config:
+      translation:
+        provider: port-map
+        port_map:
+          {
+            "10.0.0.1:3000": lb.example.com:30001,
+            "10.0.0.2:3000": lb.example.com:30001,
+            "10.0.0.3:3000": lb.example.com:30003,
+            "10.0.0.4:3000": lb.example.com:30004,
+          }
+    input:
+      [
+        {
+          nodeName: BB9020011AC4202,
+          tlsName: db1.example.com,
+          hosts:
+            [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.3, port: 3000 }],
+          sourceList: standard,
+        },
+        {
+          nodeName: BB9030011AC4202,
+          tlsName: db2.example.com,
+          hosts:
+            [{ host: 10.0.0.2, port: 3000 }, { host: 10.0.0.4, port: 3000 }],
+          sourceList: standard,
+        },
+      ]
+    expect:
+      nodes: [BB9020011AC4202, BB9030011AC4202]
+      errors: []
+
+  - case: static-map-one-side-overlap
+    because: Only the peer left with no address of its own is reported; the peer that keeps an address is created.
+    config:
+      translation:
+        {
+          provider: static-map,
+          static_map:
+            {
+              "10.0.0.1": 203.0.113.1,
+              "10.0.0.2": 203.0.113.1,
+              "10.0.0.3": 203.0.113.3,
+            },
+        }
+    input:
+      [
+        {
+          nodeName: BB9020011AC4202,
+          tlsName: db1.example.com,
+          hosts:
+            [{ host: 10.0.0.1, port: 3000 }, { host: 10.0.0.3, port: 3000 }],
+          sourceList: standard,
+        },
+        {
+          nodeName: BB9030011AC4202,
+          tlsName: db2.example.com,
+          hosts: [{ host: 10.0.0.2, port: 3000 }],
+          sourceList: standard,
+        },
+      ]
+    expect:
+      nodes: [BB9020011AC4202]
+      errors:
+        - category: translation-collision
+          messageContains:
+            {
+              nodeNames: [BB9030011AC4202],
+              host: 203.0.113.1,
+              port: 3000,
+              translator: static-map,
+            }
+
+  - case: shared-found-before-removal
+    because: B shares one address with A and the other with C, so B and C have no address of their own while A keeps 31003. Removing shared addresses one peer at a time, in reply order, would create all three. C uses host and port, so the row also mixes both peer forms.
+    config:
+      translation: { provider: pass-through }
+    input:
+      [
+        {
+          nodeName: BB9020011AC4202,
+          tlsName: db1.example.com,
+          hosts:
+            [
+              { host: as.priv.example.com, port: 31001 },
+              { host: as.priv.example.com, port: 31003 },
+            ],
+          sourceList: alternate,
+        },
+        {
+          nodeName: BB9030011AC4202,
+          tlsName: db2.example.com,
+          hosts:
+            [
+              { host: as.priv.example.com, port: 31001 },
+              { host: as.priv.example.com, port: 31002 },
+            ],
+          sourceList: alternate,
+        },
+        {
+          nodeName: BB9040011AC4202,
+          tlsName: db3.example.com,
+          host: as.priv.example.com,
+          port: 31002,
+          sourceList: alternate,
+        },
+      ]
+    expect:
+      nodes: [BB9020011AC4202]
+      errors:
+        - category: translation-collision
+          messageContains:
+            {
+              nodeNames: [BB9030011AC4202],
+              host: as.priv.example.com,
+              port: 31001,
+              translator: pass-through,
+            }
+        - category: translation-collision
+          messageContains:
+            {
+              nodeNames: [BB9040011AC4202],
+              host: as.priv.example.com,
+              port: 31002,
+              translator: pass-through,
+            }
+
+  - case: shared-chain
+    because: Each peer shares an address with the next, so every address is shared and no peer is created. B is reported on its first shared address, :31001.
+    config:
+      translation: { provider: pass-through }
+    input:
+      [
+        {
+          nodeName: BB9020011AC4202,
+          tlsName: db1.example.com,
+          hosts: [{ host: as.priv.example.com, port: 31001 }],
+          sourceList: alternate,
+        },
+        {
+          nodeName: BB9030011AC4202,
+          tlsName: db2.example.com,
+          hosts:
+            [
+              { host: as.priv.example.com, port: 31001 },
+              { host: as.priv.example.com, port: 31002 },
+            ],
+          sourceList: alternate,
+        },
+        {
+          nodeName: BB9040011AC4202,
+          tlsName: db3.example.com,
+          hosts: [{ host: as.priv.example.com, port: 31002 }],
+          sourceList: alternate,
+        },
+      ]
+    expect:
+      nodes: []
+      errors:
+        - category: translation-collision
+          messageContains:
+            {
+              nodeNames: [BB9020011AC4202],
+              host: as.priv.example.com,
+              port: 31001,
+              translator: pass-through,
+            }
+        - category: translation-collision
+          messageContains:
+            {
+              nodeNames: [BB9030011AC4202],
+              host: as.priv.example.com,
+              port: 31001,
+              translator: pass-through,
+            }
+        - category: translation-collision
+          messageContains:
+            {
+              nodeNames: [BB9040011AC4202],
+              host: as.priv.example.com,
+              port: 31002,
+              translator: pass-through,
+            }
+
+  - case: every-host-shared
+    because: Two peers advertising the same set of addresses have no address of their own, so neither is created and the pair is reported on the first shared address.
+    config:
+      translation: { provider: pass-through }
+    input:
+      [
+        {
+          nodeName: BB9020011AC4202,
+          tlsName: db1.example.com,
+          hosts:
+            [
+              { host: as.priv.example.com, port: 31001 },
+              { host: as.priv.example.com, port: 31002 },
+            ],
+          sourceList: alternate,
+        },
+        {
+          nodeName: BB9030011AC4202,
+          tlsName: db2.example.com,
+          hosts:
+            [
+              { host: as.priv.example.com, port: 31001 },
+              { host: as.priv.example.com, port: 31002 },
+            ],
+          sourceList: alternate,
+        },
+      ]
+    expect:
+      nodes: []
+      errors:
+        - category: translation-collision
+          messageContains:
+            {
+              nodeNames: [BB9020011AC4202, BB9030011AC4202],
+              host: as.priv.example.com,
+              port: 31001,
+              translator: pass-through,
+            }
