@@ -77,12 +77,28 @@ both.
   `port`, `tlsName`), or `error`. `tlsName` is in every input and every expected endpoint, so
   every row checks that translation never changes it.
 - **collision**: `config` is as in translate and sets `translation`. `input` is the ordered list of
-  peers advertised in one peers reply, each an advertised endpoint as in translate, with distinct
-  `nodeName`s. The runner translates every peer with the row's config and runs the collision check
-  on the results. `expect.nodes` is the `nodeName`s that become nodes, in any order, and
-  `expect.errors` is every collision reported, in any order: one `translation-collision` error per
-  pair of peers that translate to the same host and port, or `[]` when none do. Every input peer is
-  either in `nodes` or in a collision.
+  peers advertised in one peers reply, with distinct `nodeName`s. A peer is an advertised endpoint
+  as in translate (`host`, `port`), or has `hosts`, a non-empty list of `{host, port}` in advertised
+  order, in place of `host` and `port`; giving both or neither is invalid, and a peer does not
+  repeat a host and port. The runner translates every address of every peer with the row's config
+  and runs the collision check on the results. Two addresses are the same when their host and port
+  match after translation, with hostnames compared case-insensitively and no DNS resolution
+  (FR-46), and all shared addresses of the reply are found before any is removed. A shared address
+  is never used. A peer that still has an address of its own is created through it; a peer whose
+  every address is shared creates no node and is reported once as a collision. Its message names
+  the peer, every shared address of the peer as the peer advertised it after translation with the
+  node that owns each (the first three, then "and N more"), and the translator. `expect.nodes` is
+  the `nodeName`s that become nodes, in any order, and `expect.errors` is every collision reported,
+  in any order, or `[]` when none are. An error with one name is satisfied by any reported
+  collision naming that peer on that host and port; an error with two names needs that pair. An
+  expected error gives the peer's first shared address in advertised order, which is always among
+  the three listed. A created peer can appear in another peer's collision message, but
+  `expect.errors` lists only collided peers. Every input peer is either in `nodes` or in a
+  collision. An address that answers as another node after connect (FR-47) needs a real
+  connection, so collision rows do not cover it; each client tests it itself. A runtime that moves
+  its pin past the commit that added `hosts` needs its collision runner to read `hosts`, and
+  declares `fail` with a reason any row its collision rule does not meet yet. No lockstep is
+  needed, because each client pins by commit.
 - **merge**: `config.seeds` are the static seeds, `input.discoveryResults` are applied in order
   (the first at client initialization, each later one as a refresh) and `expect.snapshots[i]` is
   the exact seed list after result `i`. Seeds compare by host and port.
