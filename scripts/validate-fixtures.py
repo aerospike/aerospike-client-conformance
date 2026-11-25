@@ -95,6 +95,11 @@ def check_collision_row(row):
     names = [peer["nodeName"] for peer in row["input"]]
     if len(names) != len(set(names)):
         errors.append("duplicate nodeName in input")
+    for peer in row["input"]:
+        hosts = peer["hosts"] if "hosts" in peer else [peer]
+        addresses = [(h["host"].lower(), h["port"]) for h in hosts]
+        if len(addresses) != len(set(addresses)):
+            errors.append(f"input peer {peer['nodeName']} repeats a host and port")
     if "expect" not in row:
         return errors
     nodes = row["expect"]["nodes"]
