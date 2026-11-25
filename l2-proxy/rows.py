@@ -326,7 +326,7 @@ def serve_direct(env, drv, step, expected):
 def collision_never_held(env, set_name, step, colliding, **flags):
 	"""Neither colliding node is held for MISS_WINDOW_MS, or the client exits 3 and holds nothing. Whether the
 	client must keep serving the other nodes is not decided, so that check is reported as skipped."""
-	drv = env.start(set_name, **flags)
+	drv = env.start(set_name, workers=HEAVY_WORKERS, **flags)
 	try:
 		try:
 			drv.await_ready()
@@ -445,7 +445,7 @@ def row_port_map_by_address(env):
 def subset_row(env, step, mapped, missed, on_miss):
 	"""A port-map for some nodes only: the mapped nodes are held at their listeners, the missed one is never
 	held, and the partitions the held nodes master are served."""
-	with env.driver("l2-" + step, port_map=port_map_by_name(env, mapped), on_miss=on_miss) as drv:
+	with env.driver("l2-" + step, port_map=port_map_by_name(env, mapped), on_miss=on_miss, workers=HEAVY_WORKERS) as drv:
 		snapshot = await_held(drv, step, [n["node"] for n in mapped])
 		assert_nodes_at(env, step, snapshot, {n["node"]: (env.endpoint, n["port"]) for n in mapped})
 		end = assert_never_held(drv, step, missed["node"])
@@ -648,7 +648,7 @@ def row_alternate_with_alternate(env):
 	host = env.value("L2_ACCESS_HOSTNAME")
 	check("alternate-advertised", all(n["alt"] == env.address(n["port"], host) for n in with_alt) and not reachable["alt"],
 		alternates={n["container"]: n["alt"] for n in with_alt + [reachable]})
-	with env.driver("l2-alternate", shape="pass-through") as drv:
+	with env.driver("l2-alternate", shape="pass-through", workers=HEAVY_WORKERS) as drv:
 		snapshot = await_held(drv, "alternate", [n["node"] for n in with_alt])
 		assert_nodes_at(env, "alternate", snapshot, {n["node"]: (host, n["port"]) for n in with_alt})
 		end = assert_never_held(drv, "alternate", reachable["node"])
