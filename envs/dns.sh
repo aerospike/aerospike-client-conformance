@@ -6,7 +6,8 @@
 # reachable only as advertised. Node B is published on ENV_HOST:ENV_PORT_BASE+1 and reached on its
 # address through a TCP forwarder on the host, because rootless podman cannot publish one port on
 # two host addresses. Node C is a cluster of its own. CoreDNS serves zone dns.test from DNS_ZONE_FILE
-# and reloads it every second. Clients get no static seed.
+# and reloads it every second. CoreDNS logs every query; down prints that log to stderr. Clients get
+# no static seed.
 #
 # Zone dns.test:
 #   seeds            A NODE_A_HOST, A NODE_B_HOST
@@ -94,6 +95,7 @@ dns.test:53 {
         reload 1s
     }
     errors
+    log
 }
 EOF
 	write_zone 1 "$host_b" "$port_c" node-a node-b
@@ -136,6 +138,12 @@ EOF
 	put DNS_SERVER "$ENV_HOST:$dns_port"
 	put DNS_ZONE_FILE "$ZONE"
 	put CLIENT_CONFIG "$WORK_DIR/client.yaml"
+}
+
+env_before_down() {
+	rt inspect "$NAME-coredns" >/dev/null 2>&1 || return 0
+	log "CoreDNS log of $NAME-coredns:"
+	rt logs --timestamps "$NAME-coredns" >&2 || true
 }
 
 verb_stop-dns() {

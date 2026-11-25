@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # Shared by the environment scripts in this directory, which source it after setting ENV_NAME
 # (the environment's name) and PORT_OFFSET (the first port of its block above ENV_PORT_BASE), and
-# defining env_up. See README.md for the options, the verbs and the values file.
+# defining env_up and optionally env_before_down, which down runs before removing anything. See
+# README.md for the options, the verbs and the values file.
 
 set -euo pipefail
 
@@ -360,6 +361,7 @@ env_main() {
 		up) env_start "$@" ;;
 		down)
 			require_runtime
+			! declare -F env_before_down >/dev/null || env_before_down
 			env_down
 			;;
 		"" | -h | --help) sed -n '/^# Usage:/,/^$/p' "$CTL" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
