@@ -73,7 +73,7 @@ A node is five keys under a prefix such as `NODE_A` or `CONTROL_NODE_B`:
 
 ### dns
 
-Node A is on `ENV_HOST`, node B on the second host address, both on `ENV_PORT_BASE`, each advertising that address as its alternate access address. Node C is a cluster of its own on `ENV_PORT_BASE+2`. CoreDNS serves zone `dns.test` and reloads it every second:
+Node A is on `ENV_HOST`, node B on the second host address, both on `ENV_PORT_BASE`, each advertising that address as its alternate access address. Node C is a cluster of its own on `ENV_PORT_BASE+2`. CoreDNS serves zone `dns.test`, reloads it every second and logs every query with its client address, query id, type, name, rcode and duration. `down` prints that log, with timestamps, to stderr before removing the containers:
 
 | Name                         | Records                                                         |
 | ---------------------------- | --------------------------------------------------------------- |
