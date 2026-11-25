@@ -222,6 +222,32 @@
 				"sourceList": { "enum": ["standard", "alternate"] }
 			}
 		},
+		"peer": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["nodeName", "tlsName", "sourceList"],
+			"properties": {
+				"nodeName": { "type": "string" },
+				"tlsName": { "type": ["string", "null"] },
+				"sourceList": { "enum": ["standard", "alternate"] },
+				"host": { "type": "string" },
+				"port": { "$ref": "#/$defs/port" },
+				"hosts": {
+					"type": "array",
+					"minItems": 1,
+					"items": { "$ref": "#/$defs/seed" }
+				}
+			},
+			"oneOf": [
+				{ "required": ["host", "port"], "not": { "required": ["hosts"] } },
+				{
+					"required": ["hosts"],
+					"not": {
+						"anyOf": [{ "required": ["host"] }, { "required": ["port"] }]
+					}
+				}
+			]
+		},
 		"translateRow": {
 			"$ref": "#/$defs/row",
 			"unevaluatedProperties": false,
@@ -294,7 +320,7 @@
 				"input": {
 					"type": "array",
 					"minItems": 2,
-					"items": { "$ref": "#/$defs/endpoint" }
+					"items": { "$ref": "#/$defs/peer" }
 				},
 				"expect": {
 					"type": "object",
