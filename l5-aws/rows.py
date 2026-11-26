@@ -16,6 +16,7 @@ import argparse
 import contextlib
 import json
 import os
+import random
 import shlex
 import signal
 import socket
@@ -73,6 +74,7 @@ EXPERIMENT_WAIT_MS = 25 * 60000
 STATUS_POLL_MS = 15000
 RECOVERY_MS = 120000
 SEED_ATTEMPTS = 10
+SEED_RNG = random.Random()
 
 REQUIRED_ENV = ("L5_CONTROL", "L5_ENDPOINT_NAME", "L5_SEED_PORT", "L5_CTL", "L5_KUBECONFIG",
 	"AEROSPIKE_ADMIN_PASSWORD", "L5_NODEGROUPS", "L5_RUNNER_AZ", "L5_STACK", "AWS_REGION")
@@ -872,19 +874,14 @@ def outage_end(drv, ended, seen):
 	return seen["t"], "poll"
 
 
-def seed_port_for(pods, zone, seed_in_cut):
-	"""The lowest NodePort of a pod in zone when seed_in_cut, else of a pod outside it; None when there is none."""
-	ports = sorted(p["nodePort"] for p in pods if (p["zone"] == zone) == seed_in_cut)
-	return ports[0] if ports else None
-
-
 @contextlib.contextmanager
 def outage_driver(env, pods, seed_in_cut):
 	"""A routed pass-through driver, the endpoint address most of its nodes use and that address's zone, the
-	zone to cut. The client picks its address as it starts, so the seed pod is chosen against the zone the
+	zone to cut. The client picks its address as it starts, so the seed pod is checked against the zone the
 	client is seen to use: when the seed pod is not in it (seed_in_cut) or is in it (not seed_in_cut), the
-	driver is restarted seeded at the NodePort of a pod that is, up to SEED_ATTEMPTS drivers, and seed-zone
-	fails if the last one still misses."""
+	driver is restarted seeded at the NodePort of a pod chosen at random, up to SEED_ATTEMPTS drivers, and
+	seed-zone fails if the last one still misses. The zone a restarted client uses is not independent of the
+	one it used before, so the seed is not chosen from that zone."""
 	seed_port = env.seed_port
 	for attempt in range(1, SEED_ATTEMPTS + 1):
 		with env.driver("l5-az-outage", seed_port=seed_port) as drv:
@@ -900,16 +897,15 @@ def outage_driver(env, pods, seed_in_cut):
 				rackZones=rack_zones, runnerAz=env.runner_az)
 			seed = next((p for p in pods if p["nodePort"] == seed_port), {})
 			met = bool(seed) and (seed["zone"] == zone) == seed_in_cut
-			retry_port = seed_port_for(pods, zone, seed_in_cut)
 			fields = {"seedPort": seed_port, "seedPod": seed.get("pod"), "seedNode": seed.get("node"),
 				"seedZone": seed.get("zone"), "cutZone": zone, "address": address,
 				"expected": "seed-in-cut-zone" if seed_in_cut else "seed-outside-cut-zone"}
 			emit("L5-OUTAGE-SEED", attempt=attempt, **fields, met=met)
-			if met or attempt == SEED_ATTEMPTS or retry_port is None:
+			if met or attempt == SEED_ATTEMPTS:
 				check("seed-zone", met, **fields, attempts=attempt, maxAttempts=SEED_ATTEMPTS)
 				yield drv, address, zone, seed
 				return
-		seed_port = retry_port
+		seed_port = SEED_RNG.choice(sorted(p["nodePort"] for p in pods))
 
 
 def row_w5(env):
