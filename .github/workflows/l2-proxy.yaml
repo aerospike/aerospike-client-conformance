@@ -119,7 +119,7 @@ jobs:
       - name: Set up JFrog CLI
         id: jfrog
         if: ${{ inputs.registry != '' }}
-        uses: step-security/setup-jfrog-cli@a6b41f8338bea0983ddff6bd4ede7d2dcd81e1fa # v4.8.1
+        uses: step-security/setup-jfrog-cli@9d5fe0e81fc593a6c0c39bf83ad9a7b45587eed0 # v5.3.1
         env:
           JF_URL: ${{ inputs.jfrog-platform-url }}
         with:
