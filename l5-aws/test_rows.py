@@ -1037,7 +1037,7 @@ class W5SeedZoneTest(RowsTest):
 		self.assertPasses(code, out)
 		self.assertEqual(["127.0.0.1:31001"], self.seeds())
 		self.assertIn("L5-CHECK check=seed-zone seedPort=31001 seedPod=aerospike-0-0 seedNode=A1 seedZone=zone-a "
-			"cutZone=zone-b address=10.0.0.1 expected=seed-outside-cut-zone attempts=1 maxAttempts=3 outcome=pass", out)
+			"cutZone=zone-b address=10.0.0.1 expected=seed-outside-cut-zone attempts=1 maxAttempts=10 outcome=pass", out)
 		self.assertIn("L5-OUTAGE zone=zone-b seedNode=A1 seedZone=zone-a ", out)
 
 	def test_w5_reseeds_outside_cut_zone(self):
@@ -1049,16 +1049,29 @@ class W5SeedZoneTest(RowsTest):
 		self.assertIn("L5-OUTAGE-SEED attempt=1 seedPort=31001 seedPod=aerospike-0-0 seedNode=A1 seedZone=zone-a "
 			"cutZone=zone-a address=10.0.0.1 expected=seed-outside-cut-zone met=false", out)
 		self.assertIn("L5-CHECK check=seed-zone seedPort=31002 seedPod=aerospike-1-0 seedNode=B1 seedZone=zone-b "
-			"cutZone=zone-a address=10.0.0.1 expected=seed-outside-cut-zone attempts=2 maxAttempts=3 outcome=pass", out)
+			"cutZone=zone-a address=10.0.0.1 expected=seed-outside-cut-zone attempts=2 maxAttempts=10 outcome=pass", out)
 		self.assertIn("az-outage zone-a --duration PT5M --wait-running", self.ctl_log())
 
 	def test_w5_seed_in_cut_zone_fails(self):
 		s = w5()
-		s["ctl"]["endpoint-zone"] = zones("zone-a", "zone-b", "zone-a")
-		self.assertFailsCheck(*self.run_row("W-5", s), "seed-zone", seedPort=31001, seedZone="zone-a",
-			cutZone="zone-a", expected="seed-outside-cut-zone", attempts=3)
-		self.assertEqual(["127.0.0.1:31001", "127.0.0.1:31002", "127.0.0.1:31001"], self.seeds())
+		s["ctl"]["endpoint-zone"] = zones(*["zone-a", "zone-b"] * (rows.SEED_ATTEMPTS // 2 + 1))
+		self.assertFailsCheck(*self.run_row("W-5", s), "seed-zone", seedPort=31002, seedZone="zone-b",
+			cutZone="zone-b", expected="seed-outside-cut-zone", attempts=rows.SEED_ATTEMPTS,
+			maxAttempts=rows.SEED_ATTEMPTS)
+		self.assertEqual(["127.0.0.1:31001", "127.0.0.1:31002"] * (rows.SEED_ATTEMPTS // 2), self.seeds())
 		self.assertNotIn("az-outage", " ".join(self.ctl_log()))
+
+	def test_w5_reseeds_after_third_attempt(self):
+		s = w5()
+		s["ctl"]["endpoint-zone"] = zones("zone-a", "zone-b", "zone-a", "zone-c")
+		code, out = self.run_row("W-5", s)
+		self.assertPasses(code, out)
+		self.assertEqual(["127.0.0.1:31001", "127.0.0.1:31002", "127.0.0.1:31001", "127.0.0.1:31002"], self.seeds())
+		self.assertIn("L5-OUTAGE-SEED attempt=3 seedPort=31001 seedPod=aerospike-0-0 seedNode=A1 seedZone=zone-a "
+			"cutZone=zone-a address=10.0.0.1 expected=seed-outside-cut-zone met=false", out)
+		self.assertIn("L5-CHECK check=seed-zone seedPort=31002 seedPod=aerospike-1-0 seedNode=B1 seedZone=zone-b "
+			"cutZone=zone-c address=10.0.0.1 expected=seed-outside-cut-zone attempts=4 maxAttempts=10 outcome=pass", out)
+		self.assertIn("az-outage zone-c --duration PT5M --wait-running", self.ctl_log())
 
 	def test_seed_variant_reseeds_in_cut_zone(self):
 		code, out = self.run_row("W-5-seed", w5())
@@ -1067,7 +1080,7 @@ class W5SeedZoneTest(RowsTest):
 		self.assertIn("L5-OUTAGE-SEED attempt=1 seedPort=31001 seedPod=aerospike-0-0 seedNode=A1 seedZone=zone-a "
 			"cutZone=zone-b address=10.0.0.1 expected=seed-in-cut-zone met=false", out)
 		self.assertIn("L5-CHECK check=seed-zone seedPort=31002 seedPod=aerospike-1-0 seedNode=B1 seedZone=zone-b "
-			"cutZone=zone-b address=10.0.0.1 expected=seed-in-cut-zone attempts=2 maxAttempts=3 outcome=pass", out)
+			"cutZone=zone-b address=10.0.0.1 expected=seed-in-cut-zone attempts=2 maxAttempts=10 outcome=pass", out)
 		self.assertIn("L5-OUTAGE zone=zone-b seedNode=B1 seedZone=zone-b ", out)
 		self.assertIn("az-outage zone-b --duration PT5M --wait-running", self.ctl_log())
 		self.assertIn("L5-ROW-RESULT row=W-5-seed exit=0", out)
@@ -1077,21 +1090,36 @@ class W5SeedZoneTest(RowsTest):
 		self.assertPasses(code, out)
 		self.assertEqual(["127.0.0.1:31002"], self.seeds())
 		self.assertIn("L5-CHECK check=seed-zone seedPort=31002 seedPod=aerospike-1-0 seedNode=B1 seedZone=zone-b "
-			"cutZone=zone-b address=10.0.0.1 expected=seed-in-cut-zone attempts=1 maxAttempts=3 outcome=pass", out)
+			"cutZone=zone-b address=10.0.0.1 expected=seed-in-cut-zone attempts=1 maxAttempts=10 outcome=pass", out)
 
-	def test_seed_variant_seed_outside_cut_zone_fails(self):
+	def test_seed_variant_zone_changes_every_restart_fails(self):
 		s = w5()
-		s["ctl"]["endpoint-zone"] = zones("zone-b", "zone-c", "zone-a")
-		self.assertFailsCheck(*self.run_row("W-5-seed", s), "seed-zone", seedPort=31003, seedZone="zone-c",
-			cutZone="zone-a", expected="seed-in-cut-zone", attempts=3)
-		self.assertEqual(["127.0.0.1:31001", "127.0.0.1:31002", "127.0.0.1:31003"], self.seeds())
+		s["ctl"]["endpoint-zone"] = zones(*["zone-b", "zone-c", "zone-a"] * (rows.SEED_ATTEMPTS // 3 + 1))
+		code, out = self.run_row("W-5-seed", s)
+		self.assertFailsCheck(code, out, "seed-zone", seedPort=31001, seedZone="zone-a", cutZone="zone-b",
+			expected="seed-in-cut-zone", attempts=rows.SEED_ATTEMPTS, maxAttempts=rows.SEED_ATTEMPTS)
+		ports = ["127.0.0.1:31001", "127.0.0.1:31002", "127.0.0.1:31003"]
+		self.assertEqual([ports[i % 3] for i in range(rows.SEED_ATTEMPTS)], self.seeds())
+		self.assertEqual(rows.SEED_ATTEMPTS, out.count("L5-OUTAGE-SEED "))
+		self.assertNotIn("met=true", out)
 		self.assertNotIn("az-outage", " ".join(self.ctl_log()))
+
+	def test_seed_variant_reseeds_after_third_attempt(self):
+		s = w5()
+		s["ctl"]["endpoint-zone"] = zones("zone-b", "zone-c", "zone-a", "zone-a")
+		code, out = self.run_row("W-5-seed", s)
+		self.assertPasses(code, out)
+		self.assertEqual(["127.0.0.1:31001", "127.0.0.1:31002", "127.0.0.1:31003", "127.0.0.1:31001"], self.seeds())
+		self.assertIn("L5-CHECK check=seed-zone seedPort=31001 seedPod=aerospike-0-0 seedNode=A1 seedZone=zone-a "
+			"cutZone=zone-a address=10.0.0.1 expected=seed-in-cut-zone attempts=4 maxAttempts=10 outcome=pass", out)
+		self.assertIn("L5-OUTAGE zone=zone-a seedNode=A1 seedZone=zone-a ", out)
+		self.assertIn("az-outage zone-a --duration PT5M --wait-running", self.ctl_log())
 
 	def test_seed_variant_seed_port_without_pod_fails_after_attempts(self):
 		s = w5()
-		s["ctl"]["endpoint-zone"] = zones("zone-b", "zone-c", "zone-a")
+		s["ctl"]["endpoint-zone"] = zones(*["zone-b", "zone-c", "zone-a"] * (rows.SEED_ATTEMPTS // 3 + 1))
 		code, out = self.run_row("W-5-seed", s, L5_SEED_PORT="31999")
-		self.assertFailsCheck(code, out, "seed-zone", seedPort=31003, cutZone="zone-a")
+		self.assertFailsCheck(code, out, "seed-zone", seedPort=31001, cutZone="zone-b", attempts=rows.SEED_ATTEMPTS)
 		self.assertIn("L5-OUTAGE-SEED attempt=1 seedPort=31999 seedPod=null seedNode=null seedZone=null ", out)
 
 
