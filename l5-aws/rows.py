@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# One L5 row (W-1, W-2, W-3 or W-5) through a client's driver (DRIVER.md, contract version 1 to 5).
+# One L5 row (W-1, W-2, W-3, W-5 or W-5-seed) through a client's driver (DRIVER.md, contract version 1 to 5).
 # run.sh runs it on the runner from the client checkout with the row environment of the README. It
 # starts the driver with bash -c from the current directory, sends it commands, reads its JSON lines
 # and makes every pass/fail call; it drives the cluster through $L5_CTL. Every interval it asserts on is
@@ -10,9 +10,10 @@
 # Exit status: 0 every assertion holds, 1 one failed, 2 bad usage or environment, 3 a driver broke
 # the contract.
 #
-# Usage: rows.py --row W-1|W-2|W-3|W-5 --driver "<L5_DRIVER>"
+# Usage: rows.py --row W-1|W-2|W-3|W-5|W-5-seed --driver "<L5_DRIVER>"
 
 import argparse
+import contextlib
 import json
 import os
 import shlex
@@ -71,6 +72,7 @@ OUTAGE_WAIT_MS = OUTAGE_DURATION_MS + 10 * 60000
 EXPERIMENT_WAIT_MS = 25 * 60000
 STATUS_POLL_MS = 15000
 RECOVERY_MS = 120000
+SEED_ATTEMPTS = 3
 
 REQUIRED_ENV = ("L5_CONTROL", "L5_ENDPOINT_NAME", "L5_SEED_PORT", "L5_CTL", "L5_KUBECONFIG",
 	"AEROSPIKE_ADMIN_PASSWORD", "L5_NODEGROUPS", "L5_RUNNER_AZ", "L5_STACK", "AWS_REGION")
@@ -542,8 +544,8 @@ class Env:
 			self.ctl.ok(CTL_TIMEOUT_MS, "scale", str(size))
 			self.wait_ready()
 
-	def driver(self, set_name, shape="pass-through", port_map=None):
-		flags = ["--seed", self.address(self.seed_port), "--shape", shape]
+	def driver(self, set_name, shape="pass-through", port_map=None, seed_port=None):
+		flags = ["--seed", self.address(seed_port or self.seed_port), "--shape", shape]
 		if port_map is not None:
 			flags += ["--port-map", ",".join("%s=%s" % kv for kv in sorted(port_map.items())), "--on-miss", "strict"]
 		flags += ["--user", USER, "--tend-interval", str(TEND_INTERVAL_MS), "--timeout", str(TIMEOUT_MS),
@@ -870,14 +872,22 @@ def outage_end(drv, ended, seen):
 	return seen["t"], "poll"
 
 
-def row_w5(env):
-	"""Five minutes without traffic in or out of the zone of the endpoint address most of the driver's
-	nodes use, under one pass-through driver."""
-	found = env.start()
-	state = {"experiment": None, "ended": False}
-	try:
-		_, pods = env.pods()
-		with env.driver("l5-az-outage") as drv:
+def seed_port_for(pods, zone, seed_in_cut):
+	"""The lowest NodePort of a pod in zone when seed_in_cut, else of a pod outside it; None when there is none."""
+	ports = sorted(p["nodePort"] for p in pods if (p["zone"] == zone) == seed_in_cut)
+	return ports[0] if ports else None
+
+
+@contextlib.contextmanager
+def outage_driver(env, pods, seed_in_cut):
+	"""A routed pass-through driver, the endpoint address most of its nodes use and that address's zone, the
+	zone to cut. The client picks its address as it starts, so the seed pod is chosen against the zone the
+	client is seen to use: when the seed pod is not in it (seed_in_cut) or is in it (not seed_in_cut), the
+	driver is restarted seeded at the NodePort of a pod that is, up to SEED_ATTEMPTS drivers, and seed-zone
+	fails if the last one still misses."""
+	seed_port = env.seed_port
+	for attempt in range(1, SEED_ATTEMPTS + 1):
+		with env.driver("l5-az-outage", seed_port=seed_port) as drv:
 			start = await_routing(drv, "start", [p["node"] for p in pods], ROUTING_WAIT_MS)
 			log_resolved(env, "before", start)
 			by_address = {}
@@ -888,7 +898,38 @@ def row_w5(env):
 			rack_zones = sorted({p["zone"] for p in pods})
 			check("outage-zone", zone in rack_zones, zone=zone, address=address, nodesByAddress=by_address,
 				rackZones=rack_zones, runnerAz=env.runner_az)
+			seed = next((p for p in pods if p["nodePort"] == seed_port), {})
+			met = bool(seed) and (seed["zone"] == zone) == seed_in_cut
+			retry_port = seed_port_for(pods, zone, seed_in_cut)
+			fields = {"seedPort": seed_port, "seedPod": seed.get("pod"), "seedNode": seed.get("node"),
+				"seedZone": seed.get("zone"), "cutZone": zone, "address": address,
+				"expected": "seed-in-cut-zone" if seed_in_cut else "seed-outside-cut-zone"}
+			emit("L5-OUTAGE-SEED", attempt=attempt, **fields, met=met)
+			if met or attempt == SEED_ATTEMPTS or retry_port is None:
+				check("seed-zone", met, **fields, attempts=attempt, maxAttempts=SEED_ATTEMPTS)
+				yield drv, address, zone, seed
+				return
+		seed_port = retry_port
 
+
+def row_w5(env):
+	"""The outage with the seed node's pod outside the cut zone."""
+	outage_row(env, False)
+
+
+def row_w5_seed(env):
+	"""The outage with the seed node's pod in the cut zone."""
+	outage_row(env, True)
+
+
+def outage_row(env, seed_in_cut):
+	"""Five minutes without traffic in or out of the zone of the endpoint address most of the driver's
+	nodes use, under one pass-through driver."""
+	found = env.start()
+	state = {"experiment": None, "ended": False}
+	try:
+		_, pods = env.pods()
+		with outage_driver(env, pods, seed_in_cut) as (drv, address, zone, seed):
 			until_t = drv.mark()[1] + OUTAGE_DURATION_MS
 			started = env.ctl(CTL_TIMEOUT_MS + RUNNING_WAIT_MS, "az-outage", zone, "--duration", OUTAGE_DURATION,
 				"--wait-running")
@@ -953,10 +994,10 @@ def row_w5(env):
 
 			end, observed = drv.wait(during, OUTAGE_WAIT_MS, since=(reset["_index"] + 1, running_t))
 			last = end or drv.latest()
-			emit("L5-OUTAGE", zone=zone, experiment=experiment, status=seen["status"], observedMs=observed,
-				durationMs=OUTAGE_DURATION_MS, unownedReported=seen["unowned"], longestUnownedMs=seen["longestUnownedMs"],
-				maxLatencyMs=seen["maxLatencyMs"], failed=last["failed"], succeeded=last["succeeded"],
-				lastError=last["lastError"])
+			emit("L5-OUTAGE", zone=zone, seedNode=seed["node"], seedZone=seed["zone"], experiment=experiment,
+				status=seen["status"], observedMs=observed, durationMs=OUTAGE_DURATION_MS, unownedReported=seen["unowned"],
+				longestUnownedMs=seen["longestUnownedMs"], maxLatencyMs=seen["maxLatencyMs"], failed=last["failed"],
+				succeeded=last["succeeded"], lastError=last["lastError"])
 			emit("L5-OUTAGE-DNS", when="during", name=env.endpoint, address=address,
 				resolvesToCut=None if seen["resolved"] is None else address in seen["resolved"],
 				addresses=seen["resolved"])
@@ -1038,7 +1079,7 @@ def restore_w5(env, found, state):
 	env.outcome.guard(env.restore_size, found)
 
 
-ROWS = {"W-1": row_w1, "W-2": row_w2, "W-3": row_w3, "W-5": row_w5}
+ROWS = {"W-1": row_w1, "W-2": row_w2, "W-3": row_w3, "W-5": row_w5, "W-5-seed": row_w5_seed}
 
 
 def main(argv=None):
