@@ -20,7 +20,7 @@
 # --keep is given again.
 #
 # Required environment:
-#   AWS_PROFILE               operator credentials
+#   AWS_PROFILE               operator credentials; unset uses the environment's, such as a CI role's
 #   AWS_REGION                region of the stack
 #   AWS_PERMISSIONS_BOUNDARY  ARN of the permissions boundary set on every role
 #   FEATURES_CONF_PATH        Enterprise feature-key file, copied to the runner and never printed
@@ -120,7 +120,7 @@ if [ "$CONTROL" = "resolvable" ]; then
 	EXPECT_PRODUCER=yes
 fi
 
-for name in AWS_PROFILE AWS_REGION AWS_PERMISSIONS_BOUNDARY FEATURES_CONF_PATH; do
+for name in AWS_REGION AWS_PERMISSIONS_BOUNDARY FEATURES_CONF_PATH; do
 	[ -n "${!name:-}" ] || die "$name is not set"
 done
 [ -r "$FEATURES_CONF_PATH" ] || die "FEATURES_CONF_PATH is not readable"
@@ -131,12 +131,14 @@ for f in stack.yaml l5ctl rows.py aerospike-cluster.yaml teardown.sh; do
 	[ -f "$SCRIPT_DIR/$f" ] || die "$SCRIPT_DIR/$f is missing"
 done
 export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION" AWS_PAGER=""
+CREDENTIALS="${AWS_PROFILE:+profile $AWS_PROFILE}"
+CREDENTIALS="${CREDENTIALS:-the credentials in the environment}"
 
 STACK="${EXISTING_STACK:-l5-aws-$(date -u +%Y%m%d-%H%M%S)}"
 [[ "$STACK" =~ ^l5-aws-[0-9]{8}-[0-9]{6}$ ]] || die "--stack must be l5-aws-YYYYmmdd-HHMMSS"
 if [ "$PLAN" = "1" ]; then
 	echo "Plan, no AWS call made:"
-	echo "  stack          $STACK in $AWS_REGION, profile $AWS_PROFILE, template $SCRIPT_DIR/stack.yaml"
+	echo "  stack          $STACK in $AWS_REGION, ${AWS_PROFILE:+profile $AWS_PROFILE, }template $SCRIPT_DIR/stack.yaml"
 	echo "  creates        producer VPC (EKS $(sed -n '/^  KubernetesVersion:/,/Default:/s/^ *Default: *//p' "$SCRIPT_DIR/stack.yaml" | tr -d '"'), one system and three Aerospike node groups (Spot in zone A, on-demand in B and C), internal NLB, endpoint service),"
 	echo "                 consumer VPC (interface endpoint, private hosted zone, runner with an Elastic IP), IAM roles for EKS, nodes, FIS and the runner"
 	echo "  boundary       $AWS_PERMISSIONS_BOUNDARY"
@@ -162,7 +164,7 @@ if [ "$PLAN" = "1" ]; then
 fi
 
 identity="$(aws sts get-caller-identity --query '[Account,Arn]' --output text)" ||
-	die "aws sts get-caller-identity failed for profile $AWS_PROFILE"
+	die "aws sts get-caller-identity failed for $CREDENTIALS"
 read -r ACCOUNT CALLER <<<"$identity"
 OPERATOR_IP="$(curl -sf -m 10 https://checkip.amazonaws.com | tr -d '[:space:]')" || die "cannot determine the operator's public IP"
 [[ "$OPERATOR_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "unexpected public IP '$OPERATOR_IP'"
@@ -269,13 +271,13 @@ cleanup() {
 	if [ "$STACK_CREATED" = "1" ]; then
 		if [ "$KEEP" = "1" ]; then
 			echo "Stack $STACK kept. Delete it with:"
-			echo "  AWS_PROFILE=$AWS_PROFILE AWS_REGION=$AWS_REGION $SCRIPT_DIR/teardown.sh $STACK"
+			echo "  ${AWS_PROFILE:+AWS_PROFILE=$AWS_PROFILE }AWS_REGION=$AWS_REGION $SCRIPT_DIR/teardown.sh $STACK"
 		else
 			"$SCRIPT_DIR/teardown.sh" "$STACK" 2>&1 | tee "$RESULTS/cleanup.txt"
 			if [ "${PIPESTATUS[0]}" -ne 0 ]; then
 				rc=1
 				echo "Teardown failed; the stack may still exist. Once the credentials work, run it again with:"
-				echo "  AWS_PROFILE=$AWS_PROFILE AWS_REGION=$AWS_REGION $SCRIPT_DIR/teardown.sh $STACK"
+				echo "  ${AWS_PROFILE:+AWS_PROFILE=$AWS_PROFILE }AWS_REGION=$AWS_REGION $SCRIPT_DIR/teardown.sh $STACK"
 			fi
 		fi
 	fi
@@ -484,7 +486,7 @@ credentials_fail() {
 	local err
 	err="$(aws sts get-caller-identity --query Account --output text 2>&1 >/dev/null | sed '/^$/d' | paste -sd' ' -)" &&
 		return 1
-	echo "AWS credentials of profile $AWS_PROFILE stopped working ($err); run aws sso login, then rerun the row with --stack $STACK"
+	echo "AWS $CREDENTIALS stopped working ($err); renew them (aws sso login for an SSO profile), then rerun the row with --stack $STACK"
 }
 
 failed=0

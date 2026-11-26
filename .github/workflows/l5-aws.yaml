@@ -1,0 +1,161 @@
+name: L5 AWS run
+
+# One l5-aws/run.sh run from a GitHub-hosted runner. The runner assumes role-to-assume through
+# GitHub OIDC, so the account needs the token.actions.githubusercontent.com identity provider and a
+# role that trusts the calling repository, may create what stack.yaml creates under
+# permissions-boundary, and has a maximum session duration of at least 4 hours.
+
+on:
+  workflow_call:
+    inputs:
+      client-repository:
+        description: Client repository on GitHub, owner/name
+        type: string
+        required: true
+      commit:
+        description: Client commit to build and run
+        type: string
+        required: true
+      manifest:
+        description: Manifest path in the client repository (l5-aws/README.md)
+        type: string
+        required: true
+      server-image:
+        description: Aerospike Enterprise server image
+        type: string
+        required: true
+      rows:
+        description: Comma-separated rows, in run order
+        type: string
+        required: false
+        default: W-1,W-3,W-2,W-5
+      ako-version:
+        description: AKO chart version, or latest
+        type: string
+        required: false
+        default: latest
+      ako-helm-repo:
+        description: Helm repository of the AKO chart; empty uses run.sh's default
+        type: string
+        required: false
+        default: ""
+      alternate-access:
+        description: configured-ip or nlb
+        type: string
+        required: false
+        default: configured-ip
+      aws-region:
+        description: Region of the stack
+        type: string
+        required: false
+        default: us-east-2
+      role-to-assume:
+        description: ARN of the role the runner assumes
+        type: string
+        required: true
+      permissions-boundary:
+        description: ARN of the permissions boundary run.sh sets on every role it creates
+        type: string
+        required: true
+      conformance-ref:
+        description: Ref of aerospike/aerospike-client-conformance to run l5-aws from
+        type: string
+        required: false
+        default: main
+    secrets:
+      FEATURES_CONF:
+        description: Enterprise feature-key file content
+        required: true
+      REGISTRY_AUTH:
+        description: Docker config JSON for pulling server-image, when its registry needs credentials
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: l5-aws-${{ inputs.client-repository }}
+  cancel-in-progress: false
+
+jobs:
+  l5:
+    name: L5 AWS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - name: Checkout the harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: aerospike/aerospike-client-conformance
+          ref: ${{ inputs.conformance-ref }}
+          path: conformance
+          persist-credentials: false
+
+      - name: Assume the AWS role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+          role-duration-seconds: 14400
+          role-session-name: l5-aws-${{ github.run_id }}
+
+      - name: Write the feature key and registry credentials
+        env:
+          FEATURES_CONF: ${{ secrets.FEATURES_CONF }}
+          REGISTRY_AUTH: ${{ secrets.REGISTRY_AUTH }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${FEATURES_CONF}" ]]; then
+            echo "::error::the FEATURES_CONF secret is empty"
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "${FEATURES_CONF}" > "${RUNNER_TEMP}/features.conf"
+          if [[ -n "${REGISTRY_AUTH}" ]]; then
+            printf '%s\n' "${REGISTRY_AUTH}" > "${RUNNER_TEMP}/registry-auth.json"
+          fi
+
+      - name: Run L5
+        env:
+          CLIENT_REPOSITORY: ${{ inputs.client-repository }}
+          COMMIT: ${{ inputs.commit }}
+          MANIFEST: ${{ inputs.manifest }}
+          SERVER_IMAGE: ${{ inputs.server-image }}
+          ROWS: ${{ inputs.rows }}
+          AKO_VERSION: ${{ inputs.ako-version }}
+          AKO_HELM_REPO: ${{ inputs.ako-helm-repo }}
+          ALTERNATE_ACCESS: ${{ inputs.alternate-access }}
+          AWS_PERMISSIONS_BOUNDARY: ${{ inputs.permissions-boundary }}
+        run: |
+          set -euo pipefail
+          args=(
+            --client-repo "https://github.com/${CLIENT_REPOSITORY}"
+            --commit "${COMMIT}"
+            --manifest "${MANIFEST}"
+            --server-image "${SERVER_IMAGE}"
+            --rows "${ROWS}"
+            --ako-version "${AKO_VERSION}"
+            --alternate-access "${ALTERNATE_ACCESS}"
+          )
+          [[ -z "${AKO_HELM_REPO}" ]] || args+=(--ako-helm-repo "${AKO_HELM_REPO}")
+          [[ ! -f "${RUNNER_TEMP}/registry-auth.json" ]] || args+=(--registry-auth "${RUNNER_TEMP}/registry-auth.json")
+          export FEATURES_CONF_PATH="${RUNNER_TEMP}/features.conf"
+          conformance/l5-aws/run.sh "${args[@]}"
+
+      - name: Remove the feature key and registry credentials
+        if: ${{ always() }}
+        run: rm -f "${RUNNER_TEMP}/features.conf" "${RUNNER_TEMP}/registry-auth.json"
+
+      - name: Upload results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: l5-aws-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: conformance/l5-aws/results
+          if-no-files-found: warn
