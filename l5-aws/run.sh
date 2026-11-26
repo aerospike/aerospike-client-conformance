@@ -26,7 +26,7 @@
 #   FEATURES_CONF_PATH        Enterprise feature-key file, copied to the runner and never printed
 #
 # Usage: l5-aws/run.sh --client-repo <https url> --commit <sha> --manifest <path in the client repo>
-#                      --server-image <image> [--rows W-1,W-3,W-2,W-5] [--registry-auth <file>]
+#                      --server-image <image> [--rows W-1,W-3,W-2,W-5,W-5-seed] [--registry-auth <file>]
 #                      [--ako-version <chart version>|latest] [--ako-helm-repo <url>]
 #                      [--alternate-access configured-ip|nlb] [--one-pod-per-host]
 #                      [--control resolvable|unresolvable] [--stack <kept stack>] [--keep] [--plan]
@@ -38,7 +38,7 @@ RUN_TAG=l5-aws-run
 OPERATOR_TAG=l5-aws-operator
 KUBECTL_VERSION=v1.33.0
 HELM_VERSION=v3.16.4
-ALL_ROWS="W-1 W-2 W-3 W-5"
+ALL_ROWS="W-1 W-2 W-3 W-5 W-5-seed"
 
 die() {
 	echo "ERROR: $*" >&2
@@ -54,7 +54,7 @@ CLIENT_REPO=""
 COMMIT=""
 MANIFEST=""
 SERVER_IMAGE=""
-ROWS="W-1,W-3,W-2,W-5"
+ROWS="W-1,W-3,W-2,W-5,W-5-seed"
 REGISTRY_AUTH=""
 AKO_VERSION=latest
 AKO_HELM_REPO=https://aerospike.github.io/aerospike-kubernetes-operator
